@@ -15,20 +15,25 @@
 #      vertical rate) and colour airline logos (layout = full).
 
 import configparser
+import csv
 import datetime
 import getopt
+import io
 import json
 import math
 import os
 import random
 import re
 import shutil
+import struct
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+import zlib
 from dataclasses import dataclass, field
 
 E_SUCCESS = 0
@@ -36,8 +41,8 @@ E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-REVISION   = "1.1"
-USER_AGENT = "flightwall/1.1 (personal, non-commercial)"
+REVISION   = "1.2"
+USER_AGENT = "flightwall/1.2 (personal, non-commercial)"
 
 OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
                      "opensky-network/protocol/openid-connect/token")
@@ -47,6 +52,9 @@ FLIGHTWALL_CDN    = "https://cdn.theflightwall.com"
 ADSB_FEEDS        = ["https://api.airplanes.live/v2",
                      "https://api.adsb.lol/v2"]
 ADSBDB_BASE_URL   = "https://api.adsbdb.com/v0"
+OURAIRPORTS_URL   = ("https://davidmegginson.github.io/ourairports-data/"
+                     "airports.csv")
+GEONAMES_URL      = "https://download.geonames.org/export/dump/cities1000.zip"
 
                                # mirrors the firmware's config/*.h files;
                                # written out on first run for editing
@@ -96,13 +104,18 @@ route_codes = icao
 show_unidentified = no
 # half: LED matrix with half-block pixels | text: plain lines
 style = half
-# full: the firmware's card with the airline's badge, then pages of
-#       ADS-B readings (altitude, speed, track, climb) and, when the
-#       route is known, progress to the destination
-# classic: the firmware's three-line card only
-layout = full
-# airline badge (its code on a coloured disc): yes | no
+# wall: logo, flight, route and %, aircraft, green progress bar with
+#       takeoff/landing times, altitude/speed, track/climb, and what
+#       the plane is doing, on a panel_size panel (128x64 needs a
+#       terminal of about 128 x 33)
+# classic: the firmware's three-line card on the [hardware] panel
+layout     = wall
+panel_size = 128x64
+# airline logo in colour: yes | no. {iata} and {icao} are replaced by
+# the airline's codes; a PNG in a "logos" folder beside this script
+# named <ICAO>.png or <IATA>.png is used first, if there is one
 show_logo = yes
+logo_url  = https://images.kiwi.com/airlines/64/{iata}.png
 # units: speed kt|mph|kmh|mps|mach, altitude ft|m,
 # vertical rate fpm|mps, track deg|card|both
 speed_unit         = kt
@@ -112,6 +125,7 @@ track_unit         = both
 
 [hardware]
 # HardwareConfiguration.h: tile size and arrangement -> 160 x 32
+# (used by layout = classic)
 tile_pixel_w = 16
 tile_pixel_h = 16
 tiles_x      = 10
@@ -143,6 +157,15 @@ FONT_5X7 = bytes.fromhex(
    "0008364100000077000000413608000201020402"
    )
                                # glcdfont's cp437 glyphs 248, 24 and 25
+                               # 3x5 digits for the progress bar's times,
+                               # rows top to bottom, 3 pixels a row
+TINY_3X5 = {"0": "111101101101111", "1": "010110010010111",
+            "2": "111001111100111", "3": "111001111001111",
+            "4": "101101111001001", "5": "111100111001111",
+            "6": "111100111101111", "7": "111001010010010",
+            "8": "111101111101111", "9": "111101111001111",
+            "A": "010101111101101", "P": "110101110100100"}
+
 FONT_EXTRA = {"°": bytes.fromhex("060f090f06"),
               "↑": bytes.fromhex("08047e0408"),
               "↓": bytes.fromhex("10207e2010")}
@@ -267,6 +290,10 @@ class FlightInfo:
    progress    : float       = math.nan
    eta         : float       = 0.0
    missing     : bool        = False
+                               # takeoff time (epoch, 0 = unknown) and the
+                               # town beneath the plane ("Over Erie, PA")
+   off_time    : float       = 0.0
+   where       : str         = ""
 
 ###########################################################################
 ###
@@ -347,6 +374,214 @@ class TtlCache:
    def put(self, key, value, ttl):
       with self.lock:
          self.items[key] = (time.time() + ttl, value)
+
+###########################################################################
+###
+### r e f e r e n c e    d a t a
+###
+###########################################################################
+
+def data_path(name):
+   """
+      post: returns the path of a data file kept beside this script
+   """
+   return(os.path.join(os.path.dirname(os.path.abspath(__file__)), name))
+
+###########################################################################
+
+def ensure_download(url, path, max_age_days):
+   """
+      use:  downloads url to path unless a copy younger than max_age_days
+            is already there
+      post: returns True when path is usable (a stale copy counts when
+            the download fails)
+   """
+   if (os.path.isfile(path) and
+       (time.time() - os.path.getmtime(path) < max_age_days * 86400)):
+      return(True)
+   Log.line(f"downloading {url}")
+   request = urllib.request.Request(url, headers = {
+                "User-Agent": USER_AGENT})
+   partial = path + ".part"
+   try:
+      with urllib.request.urlopen(request, timeout = 60) as reply, \
+           open(partial, "wb") as handle:
+         shutil.copyfileobj(reply, handle)
+      os.replace(partial, path)
+      return(True)
+   except (urllib.error.URLError, OSError) as error:
+      Log.line(f"download of {url} failed: {error}")
+      try:
+         os.remove(partial)
+      except OSError:
+         pass
+      return(os.path.isfile(path))
+
+###########################################################################
+
+class AirportDB:
+   """
+      name: AirportDB
+      use:  airport codes, names and positions from OurAirports
+            (public domain), downloaded once beside the script and
+            refreshed every 90 days
+      imp:  loaded on first use; about 12 MB to download, a second or
+            two to read
+   """
+   lock    = threading.Lock()
+   by_iata = None
+   by_icao = None
+   RANK    = {"large_airport": 0, "medium_airport": 1,
+              "small_airport": 2, "seaplane_base": 3, "heliport": 4}
+
+   @classmethod
+   def _load(cls):
+      with cls.lock:
+         if (cls.by_iata is not None):
+            return(bool(cls.by_iata))
+         cls.by_iata = {}
+         cls.by_icao = {}
+         path = data_path("airports.csv")
+         if (not ensure_download(OURAIRPORTS_URL, path, 90)):
+            return(False)
+         try:
+            with open(path, "r", encoding = "utf-8", newline = "") as f:
+               for row in csv.DictReader(f):
+                  rank = cls.RANK.get(row.get("type"), 9)
+                  if (rank > 4):
+                     continue
+                  try:
+                     info = {"name": row.get("name") or "",
+                             "lat" : float(row["latitude_deg"]),
+                             "lon" : float(row["longitude_deg"]),
+                             "elev": float(row.get("elevation_ft") or 0),
+                             "iata": (row.get("iata_code") or "").upper(),
+                             "icao": (row.get("icao_code") or
+                                      row.get("gps_code") or
+                                      row.get("ident") or "").upper(),
+                             "sched": row.get("scheduled_service") ==
+                                      "yes",
+                             "rank": rank}
+                  except (KeyError, ValueError):
+                     continue
+                  if (info["iata"]):
+                               # one code, several rows: the airport
+                               # with airline service wins
+                     old = cls.by_iata.get(info["iata"])
+                     if ((old is None) or
+                         ((not info["sched"], info["rank"]) <
+                          (not old["sched"], old["rank"]))):
+                        cls.by_iata[info["iata"]] = info
+                  for code in {info["icao"],
+                               (row.get("ident") or "").upper()}:
+                     if (code and (code not in cls.by_icao)):
+                        cls.by_icao[code] = info
+         except (OSError, csv.Error) as error:
+            Log.line(f"AirportDB: cannot read {path}: {error}")
+         return(bool(cls.by_iata))
+
+   ########################################################################
+
+   @classmethod
+   def icao(cls, code):
+      return(cls.by_icao.get(code.upper()) if (cls._load()) else None)
+
+###########################################################################
+
+                               # GeoNames admin1 codes for Canada are
+                               # numbers; show the usual abbreviations
+CANADA_PROVINCES = {"01": "AB", "02": "BC", "03": "MB", "04": "NB",
+                    "05": "NL", "07": "NS", "08": "ON", "09": "PE",
+                    "10": "QC", "11": "SK", "12": "YT", "13": "NT",
+                    "14": "NU"}
+
+class PlaceIndex:
+   """
+      name: PlaceIndex
+      use:  "Over <town>": nearest town of 1,000+ people from GeoNames'
+            cities1000 list (CC BY 4.0), downloaded once beside the
+            script; looked up offline, so no geocoding service is asked
+            about aircraft positions
+   """
+   lock  = threading.Lock()
+   cells = None
+
+   @classmethod
+   def _load(cls):
+      with cls.lock:
+         if (cls.cells is not None):
+            return(bool(cls.cells))
+         cls.cells = {}
+         path = data_path("cities1000.zip")
+         if (not ensure_download(GEONAMES_URL, path, 180)):
+            return(False)
+         try:
+            with zipfile.ZipFile(path) as archive:
+               with archive.open("cities1000.txt") as raw:
+                  for line in io.TextIOWrapper(raw, encoding = "utf-8"):
+                     p = line.rstrip("\n").split("\t")
+                     if (len(p) < 15):
+                        continue
+                     try:
+                        lat = float(p[4])
+                        lon = float(p[5])
+                     except ValueError:
+                        continue
+                     cc     = p[8]
+                     region = (     p[10]  if (cc == "US")
+                               else CANADA_PROVINCES.get(p[10], cc)
+                                           if (cc == "CA")
+                               else cc)
+                     key    = (int(math.floor(lat)), int(math.floor(lon)))
+                     cls.cells.setdefault(key, []).append(
+                        (lat, lon, p[2] or p[1], region))
+         except (OSError, zipfile.BadZipFile, KeyError) as error:
+            Log.line(f"PlaceIndex: cannot read {path}: {error}")
+         return(bool(cls.cells))
+
+   ########################################################################
+
+   @classmethod
+   def nearest(cls, lat, lon):
+      """
+         post: returns (name, region, distance km) of the closest town,
+               or None when there is none within about 100 km
+      """
+      if (not cls._load()):
+         return(None)
+      best = None
+      cy   = int(math.floor(lat))
+      cx   = int(math.floor(lon))
+      for dy in (-1, 0, 1):
+         for dx in (-1, 0, 1):
+            for plat, plon, name, region in cls.cells.get(
+                                               (cy + dy, cx + dx), ()):
+               d = haversine_km(lat, lon, plat, plon)
+               if ((best is None) or (d < best[2])):
+                  best = (name, region, d)
+      return(best)
+
+   ########################################################################
+
+   @classmethod
+   def describe(cls, lat, lon):
+      """
+         post: returns "Over Moon Township, PA", "Near Erie, PA" or ""
+      """
+      hit = cls.nearest(lat, lon)
+      if (hit is None):
+         return("")
+      name, region, dist = hit
+      name = (name.replace(" Township", " Twp")
+                  .replace("Saint ", "St. ")
+                  .replace("Mount ", "Mt. "))
+      if (dist <= 8):
+         return(f"Over {name}, {region}")
+      if (dist <= 40):
+         return(f"Near {name}, {region}")
+      return("")
+
+###########################################################################
 
 ###########################################################################
 ###
@@ -607,6 +842,8 @@ class AeroAPIFetcher:
                 progress      = (     float(progress)
                                  if (isinstance(progress, (int, float)))
                                  else math.nan),
+                off_time      = when(f.get("actual_off") or
+                                     f.get("estimated_off")),
                 eta           = when(f.get("actual_on") or
                                      f.get("estimated_on") or
                                      f.get("scheduled_on"))))
@@ -748,38 +985,233 @@ class FlightWallFetcher:
 ###########################################################################
 
 LOGO_SIZE = 26
-                               # badge colours for some airlines; others
-                               # get one made from their code
-BADGE_COLORS = {"AA": (150, 160, 175), "AS": (20, 110, 60),
-                "B6": (30, 60, 140),   "DL": (200, 30, 50),
-                "F9": (20, 110, 70),   "NK": (230, 200, 20),
-                "UA": (40, 60, 170),   "WN": (240, 140, 40)}
+GREEN     = (40, 230, 70)
+DIM_GREEN = (20, 80, 30)
 
-def badge_color(code):
+def png_decode(data):
    """
-      post: the badge colour for an airline code, the same every time
+      use:  minimal PNG reader so no imaging package is needed
+      post: returns (width, height, rows of (r, g, b, a) tuples)
+      imp:  handles every non-interlaced colour type and bit depth;
+            raises ValueError for interlaced or damaged files
    """
-   if (code in BADGE_COLORS):
-      return(BADGE_COLORS[code])
-   n = sum(ord(ch) * (i + 7) for i, ch in enumerate(code))
-   return((60 + n * 37 % 160, 60 + n * 61 % 160, 60 + n * 89 % 160))
+   if (data[:8] != b"\x89PNG\r\n\x1a\n"):
+      raise(ValueError("not a PNG"))
+   pos    = 8
+   idat   = []
+   plte   = b""
+   trns   = None
+   header = None
+   while (pos + 8 <= len(data)):
+      length = struct.unpack(">I", data[pos:pos + 4])[0]
+      kind   = data[pos + 4:pos + 8]
+      body   = data[pos + 8:pos + 8 + length]
+      pos   += 12 + length
+      if (kind == b"IHDR"):
+         header = struct.unpack(">IIBBBBB", body)
+      elif (kind == b"PLTE"):
+         plte = body
+      elif (kind == b"tRNS"):
+         trns = body
+      elif (kind == b"IDAT"):
+         idat.append(body)
+      elif (kind == b"IEND"):
+         break
+   if (header is None):
+      raise(ValueError("no IHDR"))
+   width, height, depth, ctype, comp, filt, interlace = header
+   if (interlace or (ctype not in (0, 2, 3, 4, 6)) or
+       (depth not in (1, 2, 4, 8, 16))):
+      raise(ValueError("unsupported PNG layout"))
+   channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+   bits     = channels * depth
+   bpp      = max(1, bits // 8)
+   stride   = (width * bits + 7) // 8
+   raw      = zlib.decompress(b"".join(idat))
+   if (len(raw) < height * (stride + 1)):
+      raise(ValueError("truncated PNG"))
+   prev = bytearray(stride)
+   rows = []
+   for y in range(height):
+      start = y * (stride + 1)
+      ftype = raw[start]
+      line  = bytearray(raw[start + 1:start + 1 + stride])
+                               # undo the per-row filter
+      for i in range(stride):
+         a = line[i - bpp] if (i >= bpp) else 0
+         b = prev[i]
+         c = prev[i - bpp] if (i >= bpp) else 0
+         if (ftype == 1):
+            line[i] = (line[i] + a) & 255
+         elif (ftype == 2):
+            line[i] = (line[i] + b) & 255
+         elif (ftype == 3):
+            line[i] = (line[i] + ((a + b) >> 1)) & 255
+         elif (ftype == 4):
+            p  = a + b - c
+            pa = abs(p - a)
+            pb = abs(p - b)
+            pc = abs(p - c)
+            line[i] = (line[i] + (     a if ((pa <= pb) and (pa <= pc))
+                                  else b if (pb <= pc)
+                                  else c)) & 255
+      prev = line
+                               # split into samples, scaled to 0..255
+      if (depth == 16):
+         samples = [line[i] for i in range(0, stride, 2)]
+      elif (depth == 8):
+         samples = list(line)
+      else:
+         mask    = (1 << depth) - 1
+         samples = [(line[i * depth // 8] >>
+                     (8 - depth - (i * depth) % 8)) & mask
+                    for i in range(width * channels)]
+         if (ctype == 0):
+            samples = [s * 255 // mask for s in samples]
+      pixels = []
+      for x in range(width):
+         s = samples[x * channels:(x + 1) * channels]
+         if (ctype == 3):
+            idx   = s[0]
+            rgb   = tuple(plte[idx * 3:idx * 3 + 3]) or (0, 0, 0)
+            alpha = (     trns[idx] if (trns and (idx < len(trns)))
+                     else 255)
+            pixels.append(rgb + (alpha,))
+         elif (ctype == 0):
+            pixels.append((s[0], s[0], s[0], 255))
+         elif (ctype == 4):
+            pixels.append((s[0], s[0], s[0], s[1]))
+         elif (ctype == 2):
+            pixels.append((s[0], s[1], s[2], 255))
+         else:
+            pixels.append(tuple(s))
+      rows.append(pixels)
+   return(width, height, rows)
 
 ###########################################################################
 
-def badge(code, color = None, size = LOGO_SIZE):
+def logo_pixels(width, height, rows, size = LOGO_SIZE):
    """
-      use:  the airline's badge: its two-letter code on a coloured disc
-      post: rows of (r, g, b) or None for an unlit LED
+      use:  shrinks an image to size x size LEDs by averaging, on black
+      post: rows of (r, g, b), or None where the LED would be (near) off
    """
+   scale = max(width, height) / float(size)
+   out   = []
+   for ty in range(size):
+      line = []
+      for tx in range(size):
+         x0 = int(tx * scale)
+         x1 = max(x0 + 1, int((tx + 1) * scale))
+         y0 = int(ty * scale)
+         y1 = max(y0 + 1, int((ty + 1) * scale))
+         r = g = b = n = 0
+         for y in range(y0, min(y1, height)):
+            for x in range(x0, min(x1, width)):
+               pr, pg, pb, pa = rows[y][x]
+               r += pr * pa
+               g += pg * pa
+               b += pb * pa
+               n += 1
+         if (n == 0):
+            line.append(None)
+            continue
+         rgb = (r // (n * 255), g // (n * 255), b // (n * 255))
+         line.append(rgb if (max(rgb) >= 24) else None)
+      out.append(line)
+   return(out)
+
+###########################################################################
+
+class LogoFetcher:
+   """
+      name: LogoFetcher
+      use:  airline logos, from the "logos" folder beside the script or
+            the logo_url template, decoded and shrunk for the panel
+   """
+   def __init__(self, url_template, folder):
+      self.url_template = url_template
+      self.folder       = folder
+      self.cache        = TtlCache()
+
+   ########################################################################
+
+   def get(self, info):
+      icao = info.operator_icao.upper()
+      iata = info.operator_iata.upper()
+      key  = icao or iata
+      if (not key):
+         return(None)
+      hit, value = self.cache.get(key)
+      if (hit):
+         return(value)
+      data = None
+      for code in (icao, iata):
+         path = os.path.join(self.folder, code + ".png")
+         if (code and os.path.isfile(path)):
+            with open(path, "rb") as handle:
+               data = handle.read()
+            break
+      ok = True
+      if ((data is None) and self.url_template and
+          ((iata or "{iata}" not in self.url_template) and
+           (icao or "{icao}" not in self.url_template))):
+         url = (self.url_template.replace("{iata}", iata)
+                                 .replace("{icao}", icao))
+         request = urllib.request.Request(url, headers = {
+                      "User-Agent": USER_AGENT})
+         try:
+            with urllib.request.urlopen(request, timeout = 8) as reply:
+               data = reply.read()
+         except urllib.error.HTTPError:
+            pass
+         except (urllib.error.URLError, OSError) as error:
+            Log.line(f"LogoFetcher: {error}")
+            ok = False
+      value = None
+      if (data):
+         try:
+            value = logo_pixels(*png_decode(data))
+         except (ValueError, zlib.error, struct.error,
+                 IndexError) as error:
+            Log.line(f"LogoFetcher: {key}: {error}")
+      self.cache.put(key, value, (     7 * 86400 if (value)
+                                  else 86400     if (ok)
+                                  else 300))
+      return(value)
+
+###########################################################################
+
+def demo_logo(color, style):
+   """
+      use:  invented logo art for demo mode (no real airline's logo)
+   """
+   size = LOGO_SIZE
    art  = Matrix(size, size)
    half = (size - 1) / 2.0
    for y in range(size):
       for x in range(size):
-         if (math.hypot(x - half, y - half) <= half + 0.3):
-            art.pixel(x, y, color or badge_color(code))
-   code = code[:2]
-   art.draw_text((size - 6 * len(code) + 1) // 2, (size - 7) // 2, code,
-                 (255, 255, 255))
+         if (style == 0):
+                               # tail fin on a white tile
+            inside = (min(x, size - 1 - x, y, size - 1 - y) >= 0)
+            corner = (math.hypot(max(0, abs(x - half) - 9),
+                                 max(0, abs(y - half) - 9)) > 3.5)
+            if (inside and not corner):
+               art.pixel(x, y, (255, 255, 255))
+            if ((5 <= y <= 22) and (x >= 6 + (22 - y) * 0.5) and
+                (x <= 12 + (22 - y) * 0.6)):
+               art.pixel(x, y, color)
+            if ((9 <= y <= 15) and
+                (abs(x - (11 + (22 - y) * 0.55)) < 1.2)):
+               art.pixel(x, y, (250, 180, 20))
+         else:
+                               # disc with light arcs
+            r = math.hypot(x - half, y - half)
+            if (r <= half + 0.3):
+               art.pixel(x, y, color)
+               for arc in (6.5, 9.5, 12.5):
+                  if ((abs(math.hypot(x - half, y - half - 6) - arc)
+                       < 0.8) and (y < half + 2)):
+                     art.pixel(x, y, (230, 245, 245))
    return(art.pixels)
 
 ###########################################################################
@@ -814,6 +1246,20 @@ DEMO = [
     (40, 60, 170), 0, "departing"),
    ("N512GA",  "",    "",   "", "GLF5", "G550", None, None, None, 0,
     "cruise")]
+
+DEMO_PLACES = ["Over Davenport, IA", "Over Moon Twp, PA",
+               "Near Erie, PA", "Over Mansfield, OH", "Over Peoria, IL"]
+
+class DemoPlaces:
+   """
+      name: DemoPlaces
+      use:  made-up "Over <town>" text for demo mode
+   """
+   @staticmethod
+   def describe(lat, lon):
+      return(DEMO_PLACES[int(abs(lat * 7 + lon * 3)) % len(DEMO_PLACES)])
+
+###########################################################################
 
 class DemoFetcher:
    """
@@ -885,6 +1331,8 @@ class DemoFetcher:
          if ((row[0] == state.callsign) and row[1]):
             org, dst = row[6], row[7]
             ap = lambda a: AirportInfo(a[0], a[1], a[2], a[3], a[4])
+            flown = {"cruise": 120, "departing": 6, "approach": 130,
+                     "landing": 75, "landed": 140}[row[10]]
             return(FlightInfo(
                       ident = row[0], ident_icao = row[0],
                       ident_iata = row[2] + row[0][3:],
@@ -894,7 +1342,8 @@ class DemoFetcher:
                       aircraft_display_name_short = row[5],
                       origin      = ap(org),
                       destination = ap(dst),
-                      logo        = badge(row[2], row[8])))
+                      off_time    = time.time() - flown * 60,
+                      logo        = demo_logo(row[8], row[9])))
       return(None)
 
 ###########################################################################
@@ -909,12 +1358,16 @@ class FlightDataFetcher:
       use:  core/FlightDataFetcher: state vectors -> flight info ->
             display names
    """
-   def __init__(self, states, flights, cdn, settings, resolver = None):
+   def __init__(self, states, flights, cdn, settings, logos = None,
+                resolver = None, places = None, airports = None):
       self.states   = states
       self.flights  = flights
       self.cdn      = cdn
       self.settings = settings
+      self.logos    = logos
       self.resolver = resolver
+      self.places   = places
+      self.airports = airports
 
    ########################################################################
 
@@ -990,10 +1443,20 @@ class FlightDataFetcher:
             name = self.cdn.aircraft_name(info.aircraft_code)
             if (name):
                info.aircraft_display_name_short = name
-      if ((info.logo is None) and self.settings["show_logo"] and
-          (self.settings["layout"] == "full") and
-          (info.operator_iata or info.operator_icao)):
-         info.logo = badge(info.operator_iata or info.operator_icao)
+      if (self.logos and (info.logo is None)):
+         info.logo = self.logos.get(info)
+      if (self.airports):
+                               # AeroAPI gives codes only; positions and
+                               # elevations come from OurAirports
+         for ap in (info.origin, info.destination):
+            if (math.isnan(ap.lat) and ap.code_icao):
+               found = self.airports.icao(ap.code_icao)
+               if (found):
+                  ap.lat     = found["lat"]
+                  ap.lon     = found["lon"]
+                  ap.elev_ft = found["elev"]
+      if (self.places and (not math.isnan(s.lat))):
+         info.where = self.places.describe(s.lat, s.lon)
       self._progress(info)
       return(info)
 
@@ -1082,9 +1545,36 @@ class Matrix:
 
    ########################################################################
 
+   def draw_tiny(self, x, y, text, color):
+      """
+         use:  3x5 font for the takeoff/landing times beside the bar
+         usage: digits, ":", "A" and "P" only
+      """
+      for ch in text:
+         if (ch == ":"):
+            self.pixel(x, y + 1, color)
+            self.pixel(x, y + 3, color)
+            x += 2
+            continue
+         bits = TINY_3X5.get(ch)
+         if (bits):
+            for row in range(5):
+               for col in range(3):
+                  if (bits[row * 3 + col] == "1"):
+                     self.pixel(x + col, y + row, color)
+         x += 4
+
+   ########################################################################
+
+   @staticmethod
+   def tiny_width(text):
+      return(sum(2 if (ch == ":") else 4 for ch in text) - 1)
+
+   ########################################################################
+
    def draw_image(self, x, y, rows):
       """
-         usage: rows of (r, g, b) or None (unlit), as badge() gives
+         usage: rows of (r, g, b) or None (unlit), as logo_pixels gives
       """
       for j, line in enumerate(rows):
          for i, color in enumerate(line):
@@ -1114,8 +1604,8 @@ class NeoMatrixDisplay:
    """
       name: NeoMatrixDisplay
       use:  adapters/NeoMatrixDisplay: the firmware's bordered
-            three-line card, the pages of layout = full, plus loading
-            screen and one-line messages
+            three-line card (layout = classic) or the 128x64 wall layout,
+            plus loading screen and one-line messages
    """
    def __init__(self, width, height, color, settings):
       self.matrix   = Matrix(width, height)
@@ -1131,7 +1621,13 @@ class NeoMatrixDisplay:
       """
       airline = (f.airline_display_name_full or f.operator_iata or
                  f.operator_icao or f.operator_code or f.ident)
-      route    = self.route_text(f)
+      if (self.settings["route_codes"] == "iata"):
+         org = f.origin.code_iata or f.origin.code_icao
+         dst = f.destination.code_iata or f.destination.code_icao
+      else:
+         org = f.origin.code_icao
+         dst = f.destination.code_icao
+      route    = (org + ">" + dst) if (org or dst) else ""
       aircraft = f.aircraft_display_name_short or f.aircraft_code
       return([airline, route, aircraft])
 
@@ -1198,6 +1694,17 @@ class NeoMatrixDisplay:
 
    ########################################################################
 
+   @staticmethod
+   def lr(left, right, width):
+      """
+         post: left and right ends of one line, padded to width
+      """
+      left = left[:max(0, width - len(right) - 1)] if (right) else left
+      return(left + " " * max(1, width - len(left) - len(right)) + right
+             if (right) else left[:width])
+
+   ########################################################################
+
    def code(self, ap):
       """
          post: an airport code in the configured style (KPIT or PIT)
@@ -1208,91 +1715,124 @@ class NeoMatrixDisplay:
 
    ########################################################################
 
+   def flight_label(self, f):
+      """
+         post: the flight number (UA1179) if known, else the callsign,
+               else the airline
+      """
+      return(f.ident_iata or f.ident or f.ident_icao or
+             f.airline_display_name_full or f.state.registration)
+
+   ########################################################################
+
    def route_text(self, f):
       org = self.code(f.origin)
       dst = self.code(f.destination)
-      return((org + ">" + dst) if (org or dst) else "")
+      return(f"{org}>{dst}" if (org and dst) else "")
 
    ########################################################################
 
    @staticmethod
-   def arrival(eta):
+   def clock(epoch):
       """
-         post: "ARR 8:25PM 56M"-style arrival time and time to go, or ""
+         post: "6:52P"-style local time, or "" when unknown
       """
-      if (not eta):
+      if (not epoch):
          return("")
-      t    = time.localtime(eta)
-      left = max(0, int((eta - time.time()) // 60))
-      togo = (     f"{left // 60}H{left % 60:02d}M" if (left >= 60)
-              else f"{left}M")
-      return(f"ARR {t.tm_hour % 12 or 12}:{t.tm_min:02d}"
-             f"{'AM' if (t.tm_hour < 12) else 'PM'} {togo}")
+      t = time.localtime(epoch)
+      return(f"{t.tm_hour % 12 or 12}:{t.tm_min:02d}"
+             f"{'A' if (t.tm_hour < 12) else 'P'}")
+
+   ########################################################################
+
+   def phase(self, f):
+      """
+         use:  what the plane is doing, for the bottom line
+         post: returns (text, green); green for approaching, landing
+               and landed
+      """
+      s   = f.state
+      org = f.origin
+      dst = f.destination
+      vr  = 0.0 if (math.isnan(s.vertical_rate)) else s.vertical_rate
+      to_dst = (     None if (math.isnan(dst.lat) or math.isnan(s.lat))
+                else haversine_km(s.lat, s.lon, dst.lat, dst.lon))
+      to_org = (     None if (math.isnan(org.lat) or math.isnan(s.lat))
+                else haversine_km(s.lat, s.lon, org.lat, org.lon))
+      if (s.on_ground):
+         if ((to_dst is not None) and (to_dst <= 8)):
+            return(f"Landed at {self.code(dst)}", True)
+         if ((to_org is not None) and (to_org <= 8)):
+            return(f"At {self.code(org)}", False)
+         return("On the ground", False)
+      if (to_dst is not None):
+                               # height above the destination's runways
+         agl = (     None if (math.isnan(s.baro_altitude))
+                else s.baro_altitude / 0.3048 - dst.elev_ft)
+         if ((to_dst <= 15) and (agl is not None) and (agl <= 3000) and
+             (vr <= 0.5)):
+            return(f"Landing at {self.code(dst)}", True)
+                               # descending faster than ~200 ft/min
+         if ((to_dst <= 60) and (vr < -1.0)):
+            return(f"Approaching {self.code(dst)}", True)
+      if ((to_org is not None) and (to_org <= 40) and (vr > 1.0)):
+         return(f"Departing {self.code(org)}", False)
+      if (f.where):
+         return(f.where, False)
+      if (to_dst is not None):
+         return(f"En route to {self.code(dst)}", False)
+      return("", False)
 
    ########################################################################
 
    def pages(self, f):
       """
-         post: the pages shown for flight f: "card", then for
-               layout = full "readings" and (route known) "progress";
-               "missing" for a tracked flight that was not found
+         post: the pages shown for flight f: "wall" (the 128x64 layout),
+               "card" (the firmware's) or "missing"
       """
       if (f.missing):
          return(["missing"])
-      if (self.settings["layout"] == "classic"):
-         return(["card"])
-      pages = ["card", "readings"]
-      if (not math.isnan(f.progress)):
-         pages.append("progress")
-      return(pages)
-
-   ########################################################################
-
-   def page_lines(self, f, page):
-      """
-         post: the three lines of a page; None marks the progress bar
-      """
-      if (page == "readings"):
-         r = self.readings(f)
-         return(["ALT " + r["alt"],
-                 f"SPD {r['spd']} TRK {r['trk']}",
-                 ("VR " + r["vr"]) if (r["vr"]) else ""])
-      if (page == "progress"):
-         return([f"{self.route_text(f)}  {f.progress:.0f}%", None,
-                 self.arrival(f.eta)])
-      return(self.card_lines(f))
+      return(["card"] if (self.settings["layout"] == "classic")
+             else ["wall"])
 
    ########################################################################
 
    def text_lines(self, f):
       """
          use:  the flight as plain text, for -o and the text style
-         post: the card's three lines, then (layout = full) the readings
-               and progress
+         post: the first three lines are the top lines (any may be ""),
+               then readings, times and what the plane is doing
       """
       if (f.missing):
          return([f.ident, "not airborne or not found", ""])
-      lines = self.card_lines(f)
-      if (self.settings["layout"] == "full"):
-         r = self.readings(f)
-         lines.append((f"{r['alt']}  {r['spd']}  {r['trk']}  {r['vr']}")
-                         .replace("↑", "+").replace("↓", "-")
-                         .replace("°", "").strip())
-         if (not math.isnan(f.progress)):
-            lines.append((f"{f.progress:.0f}%  " +
-                          self.arrival(f.eta)).strip())
+      if (self.settings["layout"] == "classic"):
+         return(self.card_lines(f))
+      r     = self.readings(f)
+      pct   = "" if (math.isnan(f.progress)) else f" {f.progress:.0f}%"
+      route = self.route_text(f)
+      lines = [self.flight_label(f),
+               (route + pct) if (route) else "Route unknown",
+               f.aircraft_display_name_short or f.aircraft_code,
+               (f"{r['alt']}  {r['spd']}  {r['trk']}  {r['vr']}")
+                  .replace("↑", "+").replace("↓", "-")
+                  .replace("°", "").strip()]
+      off = self.clock(f.off_time)
+      on  = self.clock(f.eta)
+      if (route and (off or on)):
+         lines.append(f"OFF {off or '--'}  ON {on or '--'}")
+      lines.append(self.phase(f)[0])
       return(lines)
 
    ########################################################################
 
-   def show_flight(self, f, page = "card"):
+   def show_flight(self, f, page = "wall"):
       m = self.matrix
       w = m.width
       h = m.height
       m.fill_screen()
       m.draw_rect(0, 0, w, h, self.color)
-      if ((page != "missing") and (self.settings["layout"] == "full")):
-         self.show_full(f, page)
+      if (page == "wall"):
+         self.show_wall(f)
          return
       padding  = 2
       inner_w  = w - 2 - 2 * padding
@@ -1310,40 +1850,69 @@ class NeoMatrixDisplay:
 
    ########################################################################
 
-   def show_full(self, f, page):
+   def show_wall(self, f):
       """
-         use:  a page of layout = full: the airline's badge at the left,
-               the page's three lines beside it
+         use:  the 128x64 layout: logo, flight / route and % / aircraft
+               beside it; green progress bar with takeoff and landing
+               times; altitude and speed; track and vertical rate; what
+               the plane is doing
       """
       m = self.matrix
+      w = m.width
       x = 3
       if (self.settings["show_logo"] and f.logo):
          m.draw_image(3, 3, f.logo)
-         x = 3 + LOGO_SIZE + 4
-      cols = (m.width - 3 - x) // 6
-      for i, line in enumerate(self.page_lines(f, page)):
-         y = 3 + 9 * i
-         if (line is None):
-            self.draw_bar(x, y, m.width - 4 - x, f.progress)
-         else:
-            m.draw_text(x, y, truncate_to_columns(line, cols), self.color)
+         x = 3 + LOGO_SIZE + 3
+      cols  = (w - 3 - x) // 6
+      route = self.route_text(f)
+      pct   = "" if (math.isnan(f.progress)) else f"{f.progress:.0f}%"
+      lines = [self.flight_label(f),
+               self.lr(route, pct, cols) if (route) else "Route unknown",
+               f.aircraft_display_name_short or f.aircraft_code]
+      for i, line in enumerate(lines):
+         m.draw_text(x, 3 + 9 * i, truncate_to_columns(line, cols),
+                     self.color)
+      if (route):
+         self.draw_bar(32, f)
+      full = (w - 6) // 6
+      r    = self.readings(f)
+      text, green = self.phase(f)
+      m.draw_text(3, 36, self.lr(r["alt"], r["spd"], full), self.color)
+      m.draw_text(3, 45, self.lr(r["trk"], r["vr"], full), self.color)
+      m.draw_text(3, 54, truncate_to_columns(text, full),
+                  GREEN if (green) else self.color)
 
    ########################################################################
 
-   def draw_bar(self, x, y, w, progress):
+   def draw_bar(self, y, f):
       """
-         use:  outlined progress bar, filled to progress %, with a
-               marker for the plane
+         use:  3 px progress bar: dim green track, green flown part, a
+               3x3 marker for the plane; small takeoff and landing
+               times at the ends when known (room is kept for them so
+               the bar is the same length on every flight)
       """
-      m = self.matrix
-      m.draw_rect(x, y, w, 7, self.color)
-      fill = int((w - 4) * max(0.0, min(100.0, progress)) / 100.0)
-      for j in range(y + 2, y + 5):
-         for i in range(x + 2, x + 2 + fill):
-            m.pixel(i, j, self.color)
-      for j in range(y + 1, y + 6):
-         for i in range(x + 1 + fill, x + 3 + fill):
-            m.pixel(i, j, self.color)
+      m   = self.matrix
+      off = self.clock(f.off_time)
+      on  = self.clock(f.eta)
+      x0  = 3
+      x1  = m.width - 4
+      if (off or on):
+         x0 += 22
+         x1 -= 22
+      if (off):
+         m.draw_tiny(3, y - 2, off, self.color)
+      if (on):
+         m.draw_tiny(m.width - 4 - m.tiny_width(on), y - 2, on, self.color)
+      for i in range(x0, x1 + 1):
+         m.pixel(i, y, DIM_GREEN)
+      if (math.isnan(f.progress)):
+         return
+      fill = int((x1 - x0 - 2) * max(0.0, min(100.0, f.progress)) / 100.0)
+      for i in range(x0, x0 + fill):
+         m.pixel(i, y, GREEN)
+      for j in range(y - 1, y + 2):
+         for i in range(x0 + fill, x0 + fill + 3):
+            m.pixel(i, j, GREEN)
 
    ########################################################################
 
@@ -1533,12 +2102,15 @@ where options are:
    -cFILE       settings file (default flightwall.ini beside the
                 script; created with defaults on first run)
    -sSTYLE      half (LED matrix, default) or text (plain lines)
-   -gWxH        panel size in pixels, e.g. -g160x48
+   -gWxH        panel size in pixels, e.g. -g128x64
    -lFILE       write the firmware's serial log to FILE
    -o           fetch once, print the flights as text and exit
    -d           demo data, no network needed
    -v           verbose log; more -v for more verbosity
    -h           help
+
+"Over <town>" uses GeoNames (CC BY 4.0) and airport positions
+OurAirports, both downloaded once beside the script.
 
 Ctrl+C stops it.""")
 
@@ -1590,9 +2162,13 @@ Ctrl+C stops it.""")
             "route_codes"      : dsp.get("route_codes").strip().lower(),
             "show_unidentified": dsp.getboolean("show_unidentified"),
             "style"            : dsp.get("style").strip().lower(),
+                               # "full" was the 1.1 name of the new layout
             "layout"           : self.choice(dsp, "layout",
-                                             ("full", "classic")),
+                                             ("wall", "classic", "full")
+                                             ).replace("full", "wall"),
+            "panel_size"       : self.size(dsp.get("panel_size")),
             "show_logo"        : dsp.getboolean("show_logo"),
+            "logo_url"         : dsp.get("logo_url").strip(),
             "speed_unit"       : self.choice(dsp, "speed_unit",
                                              ("kt", "mph", "kmh", "mps",
                                               "mach")),
@@ -1639,9 +2215,12 @@ Ctrl+C stops it.""")
    ########################################################################
 
    def build_fetcher(self, st, demo):
+      wall = (st["layout"] == "wall")
       if (demo):
          fake = DemoFetcher()
-         return(FlightDataFetcher(fake, fake, None, st, fake), "demo")
+         return(FlightDataFetcher(fake, fake, None, st, None, fake,
+                                  DemoPlaces if (wall) else None),
+                "demo")
       want = st["state_source"]
       if (st["mode"] == "track"):
                                # OpenSky can only find a callsign by
@@ -1673,8 +2252,18 @@ Ctrl+C stops it.""")
       else:
          flights = AdsbdbFetcher()
          names.append("adsbdb")
-      cdn = FlightWallFetcher() if (st["use_cdn"]) else None
-      return(FlightDataFetcher(states, flights, cdn, st, AdsbdbFetcher()),
+      cdn   = FlightWallFetcher() if (st["use_cdn"]) else None
+      logos = None
+      if (st["show_logo"] and wall):
+         logos = LogoFetcher(st["logo_url"],
+                             os.path.join(os.path.dirname(
+                                os.path.abspath(__file__)), "logos"))
+                               # town names and airport positions for the
+                               # bottom line (wall layout only)
+      return(FlightDataFetcher(states, flights, cdn, st, logos,
+                               AdsbdbFetcher(),
+                               PlaceIndex if (wall) else None,
+                               AirportDB  if (wall) else None),
              "+".join(names))
 
    ########################################################################
@@ -1769,8 +2358,11 @@ Ctrl+C stops it.""")
 
       st = self.load_settings(ini_path)
       st.update(override)
+                               # -g, else the layout's own panel size
       if ("size" in st):
          st["width"], st["height"] = st["size"]
+      elif (st["layout"] == "wall"):
+         st["width"], st["height"] = st["panel_size"]
       if (len(st["track"]) > 5):
          raise(ExceptionClass("track at most 5 flights", self.self_name,
                               E_USAGE))
@@ -1792,6 +2384,22 @@ Ctrl+C stops it.""")
          Log.handle = sys.stderr if (Log.verbose) else None
 
       fetcher, source = self.build_fetcher(st, demo)
+      if ((st["layout"] == "wall") and (not demo)):
+                               # one-time downloads, done now rather than
+                               # inside the first fetch behind the panel
+         for what, path, loader, needed in (
+                ("town list (GeoNames, about 10 MB)", "cities1000.zip",
+                 PlaceIndex._load, True),
+                ("airport list (OurAirports, about 12 MB)", "airports.csv",
+                 AirportDB._load, ("aeroapi" in source))):
+            if (not needed):
+               continue
+            if (not os.path.isfile(data_path(path))):
+               print(f"{self.self_name}: downloading the {what}, once",
+                     file = sys.stderr)
+            if (not loader()):
+               print(f"{self.self_name}: no {what}; the bottom line will "
+                     "say less", file = sys.stderr)
       display         = NeoMatrixDisplay(st["width"], st["height"],
                                          color, st)
       Log.line(     f"FlightWall {source} tracking "
