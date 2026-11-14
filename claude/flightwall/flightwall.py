@@ -2280,11 +2280,11 @@ class NeoMatrixDisplay:
       """
          use:  the wall layout on a 128x72 panel, 5x7 font:
                   logo 26x26 | flight number / route  % / aircraft
+                  altitude                          speed
+                  track                    climb/descent
+                  what the plane is doing (red when arriving)
                   takeoff time ---- green progress bar ---- landing time
                                 time flown | time to go (under the marker)
-                  ALT altitude                SPD speed
-                  TRK track                    VR climb/descent
-                  what the plane is doing (green when arriving)
       """
       m = self.matrix
       w = m.width
@@ -2311,8 +2311,8 @@ class NeoMatrixDisplay:
          m.draw_text(x, 3 + 9 * i, truncate_to_columns(line, cols),
                      self.color)
       if (route):
-         self.draw_bar(32, f, self.phase(f)[1])
-         self.draw_flight_times(36, f, self.phase(f)[1])
+         self.draw_bar(60, f, self.phase(f)[1])
+         self.draw_flight_times(64, f, self.phase(f)[1])
       full = (w - 6) // 6
       r    = self.readings(f)
                                # no ALT/SPD/TRK/VR labels: they only fit
@@ -2320,12 +2320,12 @@ class NeoMatrixDisplay:
                                # the climb rate's unit goes if it must
       vr_short = re.sub(r"(FPM|M/S)$", "", r["vr"])
       text, state = self.phase(f)
-      m.draw_text(3, 44, self.pair([(r["alt"], r["spd"])], full),
+      m.draw_text(3, 30, self.pair([(r["alt"], r["spd"])], full),
                   self.color)
-      m.draw_text(3, 53, self.pair([(r["trk"], r["vr"]),
+      m.draw_text(3, 39, self.pair([(r["trk"], r["vr"]),
                                     (r["trk"], vr_short)], full),
                   self.color)
-      m.draw_text(3, 62, truncate_to_columns(text, full),
+      m.draw_text(3, 48, truncate_to_columns(text, full),
                                # red as the flight ends, green while it
                                # waits at the origin, white otherwise
                   (     RED   if (state in ("approach", "landing",
