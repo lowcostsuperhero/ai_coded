@@ -28,7 +28,7 @@ Options
    -cFILE       settings file (default flightwall.ini)
    -sSTYLE      half (LED panel, default) or text (plain lines)
    -gWxH        panel size for layout = classic (the wall layout is
-                always 128x64)
+                always 128x72)
    -lFILE       write the log to FILE
    -o           fetch once, print the flights as text and exit
    -d           demo data, no network needed
@@ -45,13 +45,14 @@ A place on the command line (instead of -x) can be:
 
 The display (layout = wall)
 ---------------------------
-A 128 x 64 LED panel with the firmware's 5x7 font. At full size it
-needs a terminal of 128 columns by 33 rows.
+A 128 x 72 LED panel with the firmware's 5x7 font. At full size it
+needs a terminal of 128 columns by 37 rows.
 
    [logo]  flight number (UA1179), else callsign or airline
            route and % flown (KEWR>KDEN  48%)
            aircraft (Boeing 737-900 when it fits)
    takeoff time ---green progress bar--- landing time
+                   time flown | time to go
    altitude                          speed
    track (heading)        climb/descent rate
    what the plane is doing
@@ -63,7 +64,10 @@ Landed at are red; the rest are white. The progress bar is green, and
 turns red once the plane has landed. The
 climb rate's unit is dropped when the line would be too long.
 Takeoff and landing times sit at the ends of the bar, "--:--" when
-not known. With AeroAPI they are FlightAware's. With the free route
+not known. Below the bar's marker are the time flown so far and the
+time to go (hours:minutes, "-:--" when not known). Both start white;
+at takeoff the time flown turns green; once landed it shows the whole
+flight's time (still green) and the time to go is a red 0:00. With AeroAPI they are FlightAware's. With the free route
 data the landing time is estimated in the air, and flightwall notes
 the time it sees a plane take off (last seen on the ground, now in
 the air) and land (last seen in the air, now on the ground at its

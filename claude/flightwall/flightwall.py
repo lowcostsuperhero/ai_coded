@@ -9,7 +9,7 @@
 #      info (AeroAPI) -> display names (TheFlightWall CDN) -> card cycled
 #      on the panel. Without OpenSky/AeroAPI credentials the free
 #      airplanes.live and adsbdb.com services stand in for them.
-#      Beyond the firmware (layout = wall, a 128x64 panel): airline logo,
+#      Beyond the firmware (layout = wall, a 128x72 panel): airline logo,
 #      progress bar with takeoff/landing times, ADS-B readings (altitude,
 #      speed, track, vertical rate) and what the plane is doing.
 #      The 5x7 font is Adafruit GFX's classic glcdfont (BSD licence,
@@ -109,8 +109,8 @@ show_unidentified = no
 style = half
 # wall: logo, flight, route and %, aircraft, green progress bar with
 #       takeoff/landing times, altitude/speed, track/climb, and what
-#       the plane is doing, on a 128 x 64 panel (needs a terminal of
-#       128 x 33). The panel is never scaled (that would blur it): a
+#       the plane is doing, on a 128 x 72 panel (needs a terminal of
+#       128 x 37). The panel is never scaled (that would blur it): a
 #       smaller window cuts off its right and bottom
 # classic: the firmware's three-line card on the [hardware] panel
 layout = wall
@@ -1060,7 +1060,7 @@ class FlightWallFetcher:
 ###########################################################################
 
 LOGO_SIZE = 26
-WALL_SIZE = (128, 64)
+WALL_SIZE = (128, 72)
 GREEN     = (40, 230, 70)
 DIM_GREEN = (20, 80, 30)
 RED       = (255, 95, 85)
@@ -1657,6 +1657,9 @@ class DemoFetcher:
                       destination = ap(dst),
                       off_time    = (     time.time() - flown * 60
                                      if (flown)
+                                     else 0.0),
+                      eta         = (     time.time() - 4 * 60
+                                     if (row[10] == "landed")
                                      else 0.0))
             FlightDataFetcher.apply_logo(info, demo_logo_set(row[8],
                                                              row[9]))
@@ -1991,7 +1994,7 @@ class NeoMatrixDisplay:
    """
       name: NeoMatrixDisplay
       use:  adapters/NeoMatrixDisplay: the firmware's bordered
-            three-line card (layout = classic) or the 128x64 wall layout,
+            three-line card (layout = classic) or the 128x72 wall layout,
             plus loading screen and one-line messages
    """
    def __init__(self, width, height, color, settings):
@@ -2178,7 +2181,7 @@ class NeoMatrixDisplay:
 
    def pages(self, f):
       """
-         post: the pages shown for flight f: "wall" (the 128x64 layout),
+         post: the pages shown for flight f: "wall" (the 128x72 layout),
                "card" (the firmware's) or "missing"
       """
       if (f.missing):
@@ -2207,10 +2210,15 @@ class NeoMatrixDisplay:
                (f"{r['alt']}  {r['spd']}  {r['trk']}  {r['vr']}")
                   .replace("↑", "+").replace("↓", "-")
                   .replace("°", "").strip()]
-      off = self.clock(f.off_time)
-      on  = self.clock(f.eta)
-      if (route and (off or on)):
-         lines.append(f"OFF {off or '--'}  ON {on or '--'}")
+      off   = self.clock(f.off_time)
+      on    = self.clock(f.eta)
+      times = (     self.flight_times(f, self.phase(f)[1]) if (route)
+               else None)
+      if (route and (off or on or times)):
+         lines.append(f"OFF {off or '--'}  ON {on or '--'}" +
+                      (     f"  FLOWN {times[0][0]}  TO GO {times[1][0]}"
+                       if (times)
+                       else ""))
       lines.append(self.phase(f)[0])
       return(lines)
 
@@ -2270,9 +2278,10 @@ class NeoMatrixDisplay:
 
    def show_wall(self, f):
       """
-         use:  the wall layout on a 128x64 panel, 5x7 font:
+         use:  the wall layout on a 128x72 panel, 5x7 font:
                   logo 26x26 | flight number / route  % / aircraft
                   takeoff time ---- green progress bar ---- landing time
+                                time flown | time to go (under the marker)
                   ALT altitude                SPD speed
                   TRK track                    VR climb/descent
                   what the plane is doing (green when arriving)
@@ -2303,6 +2312,7 @@ class NeoMatrixDisplay:
                      self.color)
       if (route):
          self.draw_bar(32, f, self.phase(f)[1])
+         self.draw_flight_times(36, f, self.phase(f)[1])
       full = (w - 6) // 6
       r    = self.readings(f)
                                # no ALT/SPD/TRK/VR labels: they only fit
@@ -2310,12 +2320,12 @@ class NeoMatrixDisplay:
                                # the climb rate's unit goes if it must
       vr_short = re.sub(r"(FPM|M/S)$", "", r["vr"])
       text, state = self.phase(f)
-      m.draw_text(3, 36, self.pair([(r["alt"], r["spd"])], full),
+      m.draw_text(3, 44, self.pair([(r["alt"], r["spd"])], full),
                   self.color)
-      m.draw_text(3, 45, self.pair([(r["trk"], r["vr"]),
+      m.draw_text(3, 53, self.pair([(r["trk"], r["vr"]),
                                     (r["trk"], vr_short)], full),
                   self.color)
-      m.draw_text(3, 54, truncate_to_columns(text, full),
+      m.draw_text(3, 62, truncate_to_columns(text, full),
                                # red as the flight ends, green while it
                                # waits at the origin, white otherwise
                   (     RED   if (state in ("approach", "landing",
@@ -2331,6 +2341,75 @@ class NeoMatrixDisplay:
                room is kept at each end for the takeoff/landing times
       """
       return(3 + 25, self.matrix.width - 4 - 25)
+
+   ########################################################################
+
+   def marker_x(self, f):
+      """
+         post: the column at the centre of the bar's 3x3 marker, or None
+               when the progress isn't known
+      """
+      if (math.isnan(f.progress)):
+         return(None)
+      x0, x1 = self.bar_span()
+      fill   = int((x1 - x0 - 2) * max(0.0, min(100.0, f.progress)) / 100.0)
+      return(x0 + fill + 1)
+
+   ########################################################################
+
+   @staticmethod
+   def duration(seconds):
+      """
+         post: "1:42" (hours:minutes) for seconds, or "-:--" for None
+      """
+      if (seconds is None):
+         return("-:--")
+      minutes = max(0, int(round(seconds / 60.0)))
+      return(f"{minutes // 60}:{minutes % 60:02d}")
+
+   ########################################################################
+
+   def flight_times(self, f, state):
+      """
+         post: ((time flown, colour), (time to go, colour)) as text
+         imp:  before takeoff both are white (the text colour) and the
+               time flown is 0:00; once airborne the time flown turns
+               green; once landed it is the whole flight's time (still
+               green) and the time to go is a red 0:00
+      """
+      now = time.time()
+      if (state == "origin"):
+         return((self.duration(0), self.color),
+                (self.duration(f.eta - now if (f.eta) else None),
+                 self.color))
+      if (state == "landed"):
+         total = (     f.eta - f.off_time if (f.eta and f.off_time)
+                  else None)
+         return((self.duration(total), GREEN), (self.duration(0), RED))
+      return((self.duration(now - f.off_time if (f.off_time) else None),
+              GREEN),
+             (self.duration(f.eta - now if (f.eta) else None),
+              self.color))
+
+   ########################################################################
+
+   def draw_flight_times(self, y, f, state):
+      """
+         use:  time flown and time to go in the 3x5 font, either side of
+               the bar's marker; slid inward when the marker is near
+               either end of the bar
+      """
+      mx = self.marker_x(f)
+      if (mx is None):
+         return
+      m                      = self.matrix
+      (flown, fc), (rem, rc) = self.flight_times(f, state)
+      lw                     = m.tiny_width(flown)
+      rw                     = m.tiny_width(rem)
+      left                   = max(3, min(mx - 2 - lw,
+                                          m.width - 4 - (lw + 5 + rw)))
+      m.draw_tiny(left, y, flown, fc)
+      m.draw_tiny(left + lw + 5, y, rem, rc)
 
    ########################################################################
 
@@ -2414,8 +2493,8 @@ class TerminalRenderer:
    """
       name: TerminalRenderer
       use:  paints the matrix with "upper half block" characters: one
-            terminal cell = two vertically stacked LEDs, so a 128x64
-            panel needs 128 columns by 32 rows (plus a status line)
+            terminal cell = two vertically stacked LEDs, so a 128x72
+            panel needs 128 columns by 36 rows (plus a status line)
    """
    OFF = (22, 22, 22)
 
@@ -2589,7 +2668,7 @@ where options are:
                 script; created with defaults on first run)
    -sSTYLE      half (LED matrix, default) or text (plain lines)
    -gWxH        panel size in pixels for layout = classic, e.g. -g160x48
-                (the wall layout is always 128x64)
+                (the wall layout is always 128x72)
    -lFILE       write the firmware's serial log to FILE
    -o           fetch once, print the flights as text and exit
    -d           demo data, no network needed
