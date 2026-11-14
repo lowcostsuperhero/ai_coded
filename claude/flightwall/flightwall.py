@@ -2406,10 +2406,15 @@ class NeoMatrixDisplay:
       (flown, fc), (rem, rc) = self.flight_times(f, state)
       lw                     = m.tiny_width(flown)
       rw                     = m.tiny_width(rem)
-      left                   = max(3, min(mx - 2 - lw,
-                                          m.width - 4 - (lw + 5 + rw)))
+                                 # flown ends 2 px left of the marker,
+                                 # to go starts 1 px right of it; the
+                                 # extra pixel evens out the look since
+                                 # digits are drawn left-aligned in
+                                 # their cells
+      left                   = max(3, min(mx - 3 - lw,
+                                          m.width - 4 - (lw + 6 + rw)))
       m.draw_tiny(left, y, flown, fc)
-      m.draw_tiny(left + lw + 5, y, rem, rc)
+      m.draw_tiny(left + lw + 6, y, rem, rc)
 
    ########################################################################
 
