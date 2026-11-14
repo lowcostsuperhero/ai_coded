@@ -11,6 +11,8 @@
 #      free airplanes.live and adsbdb.com services stand in for them.
 #      The 5x7 font is Adafruit GFX's classic glcdfont (BSD licence,
 #      Copyright (c) 2012 Adafruit Industries), the font the panel uses.
+#      Beyond the firmware: live ADS-B readings (altitude, speed, track,
+#      vertical rate) and colour airline logos (layout = full).
 
 import configparser
 import getopt
@@ -33,8 +35,8 @@ E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-REVISION   = "1.0"
-USER_AGENT = "flightwall/1.0 (personal, non-commercial)"
+REVISION   = "1.1"
+USER_AGENT = "flightwall/1.1 (personal, non-commercial)"
 
 OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
                      "opensky-network/protocol/openid-connect/token")
@@ -86,6 +88,18 @@ route_codes = icao
 show_unidentified = no
 # half: LED matrix with half-block pixels | text: plain lines
 style = half
+# full: the firmware's card with the airline's badge, then pages of
+#       ADS-B readings (altitude, speed, track, climb)
+# classic: the firmware's three-line card only
+layout = full
+# airline badge (its code on a coloured disc): yes | no
+show_logo = yes
+# units: speed kt|mph|kmh|mps|mach, altitude ft|m,
+# vertical rate fpm|mps, track deg|card|both
+speed_unit         = kt
+altitude_unit      = ft
+vertical_rate_unit = fpm
+track_unit         = both
 
 [hardware]
 # HardwareConfiguration.h: tile size and arrangement -> 160 x 32
@@ -119,6 +133,11 @@ FONT_5X7 = bytes.fromhex(
    "04043f44243c4040207c1c2040201c3c4030403c44281028444c9090907c4464544c44"
    "0008364100000077000000413608000201020402"
    )
+                               # glcdfont's cp437 glyphs 248, 24 and 25
+FONT_EXTRA = {"°": bytes.fromhex("060f090f06"),
+              "↑": bytes.fromhex("08047e0408"),
+              "↓": bytes.fromhex("10207e2010")}
+
 ###########################################################################
 ###
 ### e x c e p t i o n s
@@ -230,6 +249,9 @@ class FlightInfo:
    origin      : AirportInfo = field(default_factory = AirportInfo)
    destination : AirportInfo = field(default_factory = AirportInfo)
    state       : StateVector = field(default_factory = StateVector)
+                               # not in the firmware: logo pixels, rows of
+                               # (r, g, b) or None for an unlit LED
+   logo        : object      = None
 
 ###########################################################################
 ###
@@ -667,6 +689,41 @@ class FlightWallFetcher:
 ###
 ###########################################################################
 
+LOGO_SIZE = 26
+                               # badge colours for some airlines; others
+                               # get one made from their code
+BADGE_COLORS = {"AA": (150, 160, 175), "AS": (20, 110, 60),
+                "B6": (30, 60, 140),   "DL": (200, 30, 50),
+                "F9": (20, 110, 70),   "NK": (230, 200, 20),
+                "UA": (40, 60, 170),   "WN": (240, 140, 40)}
+
+def badge_color(code):
+   """
+      post: the badge colour for an airline code, the same every time
+   """
+   if (code in BADGE_COLORS):
+      return(BADGE_COLORS[code])
+   n = sum(ord(ch) * (i + 7) for i, ch in enumerate(code))
+   return((60 + n * 37 % 160, 60 + n * 61 % 160, 60 + n * 89 % 160))
+
+###########################################################################
+
+def badge(code, color = None, size = LOGO_SIZE):
+   """
+      use:  the airline's badge: its two-letter code on a coloured disc
+      post: rows of (r, g, b) or None for an unlit LED
+   """
+   art  = Matrix(size, size)
+   half = (size - 1) / 2.0
+   for y in range(size):
+      for x in range(size):
+         if (math.hypot(x - half, y - half) <= half + 0.3):
+            art.pixel(x, y, color or badge_color(code))
+   code = code[:2]
+   art.draw_text((size - 6 * len(code) + 1) // 2, (size - 7) // 2, code,
+                 (255, 255, 255))
+   return(art.pixels)
+
 ###########################################################################
 ###
 ### d e m o
@@ -675,8 +732,7 @@ class FlightWallFetcher:
 
                                # callsign, airline ICAO, IATA, name, type,
                                # type name, origin, destination, colour,
-                               # (unused) logo style, what the flight is
-                               # doing
+                               # logo style, what the flight is doing
 DEMO = [
    ("UAL1179", "UAL", "UA", "United", "B38M", "737 MAX 8",
     ("KEWR", "EWR", 40.69, -74.17, 18), ("KDEN", "DEN", 39.86, -104.67,
@@ -765,7 +821,8 @@ class DemoFetcher:
                       airline_display_name_full   = row[3],
                       aircraft_display_name_short = row[5],
                       origin      = ap(org),
-                      destination = ap(dst)))
+                      destination = ap(dst),
+                      logo        = badge(row[2], row[8])))
       return(None)
 
 ###########################################################################
@@ -813,7 +870,7 @@ class FlightDataFetcher:
 
    def _enrich(self, info, s):
       """
-         use:  attaches the position and display names
+         use:  attaches the position, display names and badge
       """
       info.state = s
       if (self.cdn):
@@ -825,6 +882,10 @@ class FlightDataFetcher:
             name = self.cdn.aircraft_name(info.aircraft_code)
             if (name):
                info.aircraft_display_name_short = name
+      if ((info.logo is None) and self.settings["show_logo"] and
+          (self.settings["layout"] == "full") and
+          (info.operator_iata or info.operator_icao)):
+         info.logo = badge(info.operator_iata or info.operator_icao)
       return(info)
 
 ###########################################################################
@@ -875,14 +936,28 @@ class Matrix:
       """
       for ch in text:
          code = ord(ch)
-         if (not (32 <= code <= 126)):
-            code = ord("?")
-         glyph = FONT_5X7[(code - 32) * 5:(code - 32) * 5 + 5]
+         if (ch in FONT_EXTRA):
+            glyph = FONT_EXTRA[ch]
+         else:
+            if (not (32 <= code <= 126)):
+               code = ord("?")
+            glyph = FONT_5X7[(code - 32) * 5:(code - 32) * 5 + 5]
          for col, bits in enumerate(glyph):
             for row in range(8):
                if ((bits >> row) & 1):
                   self.pixel(x + col, y + row, color)
          x += 6
+
+   ########################################################################
+
+   def draw_image(self, x, y, rows):
+      """
+         usage: rows of (r, g, b) or None (unlit), as badge() gives
+      """
+      for j, line in enumerate(rows):
+         for i, color in enumerate(line):
+            if (color is not None):
+               self.pixel(x + i, y + j, color)
 
    ########################################################################
 
@@ -907,7 +982,8 @@ class NeoMatrixDisplay:
    """
       name: NeoMatrixDisplay
       use:  adapters/NeoMatrixDisplay: the firmware's bordered
-            three-line card, plus loading screen and one-line messages
+            three-line card, the pages of layout = full, plus loading
+            screen and one-line messages
    """
    def __init__(self, width, height, color, settings):
       self.matrix   = Matrix(width, height)
@@ -923,31 +999,126 @@ class NeoMatrixDisplay:
       """
       airline = (f.airline_display_name_full or f.operator_iata or
                  f.operator_icao or f.operator_code or f.ident)
-      if (self.settings["route_codes"] == "iata"):
-         org = f.origin.code_iata or f.origin.code_icao
-         dst = f.destination.code_iata or f.destination.code_icao
-      else:
-         org = f.origin.code_icao
-         dst = f.destination.code_icao
-      route    = (org + ">" + dst) if (org or dst) else ""
+      route    = self.route_text(f)
       aircraft = f.aircraft_display_name_short or f.aircraft_code
       return([airline, route, aircraft])
 
    ########################################################################
 
+   def readings(self, f):
+      """
+         post: returns {"alt", "spd", "trk", "vr"} as display strings in
+               the configured units; "--" when the feed has no value
+      """
+      s   = f.state
+      st  = self.settings
+      out = {}
+      if (s.on_ground):
+         out["alt"] = "GND"
+      elif (math.isnan(s.baro_altitude)):
+         out["alt"] = "--"
+      elif (st["altitude_unit"] == "m"):
+         out["alt"] = f"{s.baro_altitude:,.0f}M"
+      else:
+                               # ADS-B reports in 25 ft steps; rounding
+                               # hides the metres round trip (OpenSky)
+         feet       = round(s.baro_altitude / 0.3048 / 25.0) * 25
+         out["alt"] = f"{feet:,.0f}FT"
+      v    = s.velocity
+      unit = st["speed_unit"]
+      if (math.isnan(v)):
+         out["spd"] = "--"
+      elif (unit == "mach"):
+                               # sea-level speed of sound; close enough
+         out["spd"] = f"M{v / 340.29:.2f}"
+      else:
+         factor, label = {"kt" : (1.943844, "KT"),
+                          "mph": (2.236936, "MPH"),
+                          "kmh": (3.6,      "KM/H"),
+                          "mps": (1.0,      "M/S")}[unit]
+         out["spd"] = f"{v * factor:,.0f}{label}"
+      t = s.heading
+      if (math.isnan(t)):
+         out["trk"] = "--"
+      else:
+         card = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][
+                   int(((t % 360) + 22.5) // 45) % 8]
+         out["trk"] = {"deg" : f"{t % 360:03.0f}°",
+                       "card": card,
+                       "both": f"{t % 360:03.0f}° {card}"}[st["track_unit"]]
+      r = s.vertical_rate
+      if (s.on_ground):
+         out["vr"] = ""
+      elif (math.isnan(r)):
+         out["vr"] = "--"
+      else:
+                               # under ~64 ft/min is just noise: level
+         arrow = (     "↑" if (r > 0.33)
+                  else "↓" if (r < -0.33)
+                  else "")
+         if (not arrow):
+            out["vr"] = "LEVEL"
+         elif (st["vertical_rate_unit"] == "mps"):
+            out["vr"] = f"{arrow}{abs(r):.1f}M/S"
+         else:
+            out["vr"] = f"{arrow}{abs(r) * 196.8504:,.0f}FPM"
+      return(out)
+
+   ########################################################################
+
+   def code(self, ap):
+      """
+         post: an airport code in the configured style (KPIT or PIT)
+      """
+      if (self.settings["route_codes"] == "iata"):
+         return(ap.code_iata or ap.code_icao)
+      return(ap.code_icao or ap.code_iata)
+
+   ########################################################################
+
+   def route_text(self, f):
+      org = self.code(f.origin)
+      dst = self.code(f.destination)
+      return((org + ">" + dst) if (org or dst) else "")
+
+   ########################################################################
+
    def pages(self, f):
       """
-         post: the pages shown for flight f; the firmware has one card
+         post: the pages shown for flight f: "card", then for
+               layout = full "readings"
       """
-      return(["card"])
+      if (self.settings["layout"] == "classic"):
+         return(["card"])
+      return(["card", "readings"])
+
+   ########################################################################
+
+   def page_lines(self, f, page):
+      """
+         post: the three lines of a page
+      """
+      if (page == "readings"):
+         r = self.readings(f)
+         return(["ALT " + r["alt"],
+                 f"SPD {r['spd']} TRK {r['trk']}",
+                 ("VR " + r["vr"]) if (r["vr"]) else ""])
+      return(self.card_lines(f))
 
    ########################################################################
 
    def text_lines(self, f):
       """
          use:  the flight as plain text, for -o and the text style
+         post: the card's three lines, then (layout = full) the readings
       """
-      return(self.card_lines(f))
+      lines = self.card_lines(f)
+      if (self.settings["layout"] == "full"):
+         r = self.readings(f)
+         lines.append((f"{r['alt']}  {r['spd']}  {r['trk']}  {r['vr']}")
+                         .replace("↑", "+").replace("↓", "-")
+                         .replace("°", "").strip())
+      return(lines)
 
    ########################################################################
 
@@ -957,6 +1128,9 @@ class NeoMatrixDisplay:
       h = m.height
       m.fill_screen()
       m.draw_rect(0, 0, w, h, self.color)
+      if (self.settings["layout"] == "full"):
+         self.show_full(f, page)
+         return
       padding  = 2
       inner_w  = w - 2 - 2 * padding
       inner_h  = h - 2 - 2 * padding
@@ -967,6 +1141,23 @@ class NeoMatrixDisplay:
          m.draw_text(1 + padding, y, truncate_to_columns(line, max_cols),
                      self.color)
          y += 8 + 1
+
+   ########################################################################
+
+   def show_full(self, f, page):
+      """
+         use:  a page of layout = full: the airline's badge at the left,
+               the page's three lines beside it
+      """
+      m = self.matrix
+      x = 3
+      if (self.settings["show_logo"] and f.logo):
+         m.draw_image(3, 3, f.logo)
+         x = 3 + LOGO_SIZE + 4
+      cols = (m.width - 3 - x) // 6
+      for i, line in enumerate(self.page_lines(f, page)):
+         m.draw_text(x, 3 + 9 * i, truncate_to_columns(line, cols),
+                     self.color)
 
    ########################################################################
 
@@ -1205,6 +1396,18 @@ Ctrl+C stops it.""")
             "route_codes"      : dsp.get("route_codes").strip().lower(),
             "show_unidentified": dsp.getboolean("show_unidentified"),
             "style"            : dsp.get("style").strip().lower(),
+            "layout"           : self.choice(dsp, "layout",
+                                             ("full", "classic")),
+            "show_logo"        : dsp.getboolean("show_logo"),
+            "speed_unit"       : self.choice(dsp, "speed_unit",
+                                             ("kt", "mph", "kmh", "mps",
+                                              "mach")),
+            "altitude_unit"    : self.choice(dsp, "altitude_unit",
+                                             ("ft", "m")),
+            "vertical_rate_unit": self.choice(dsp, "vertical_rate_unit",
+                                              ("fpm", "mps")),
+            "track_unit"       : self.choice(dsp, "track_unit",
+                                             ("deg", "card", "both")),
             "width"            : (hw.getint("tile_pixel_w") *
                                   hw.getint("tiles_x")),
             "height"           : (hw.getint("tile_pixel_h") *
