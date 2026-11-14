@@ -2429,7 +2429,7 @@ class NeoMatrixDisplay:
          use:  the wall layout on a 128x72 panel, 5x7 font:
                   logo 26x26 | flight number (light blue) / route  % /
                                aircraft
-                  altitude                          speed
+                  speed                          altitude
                   track                    climb/descent
                   what the plane is doing (red when arriving)
                   takeoff time ---- green progress bar ---- landing time
@@ -2470,7 +2470,7 @@ class NeoMatrixDisplay:
                                # the climb rate's unit goes if it must
       vr_short = re.sub(r"(FPM|M/S)$", "", r["vr"])
       text, state = self.phase(f)
-      m.draw_text(3, 30, self.pair([(r["alt"], r["spd"])], full),
+      m.draw_text(3, 30, self.pair([(r["spd"], r["alt"])], full),
                   self.color)
       m.draw_text(3, 39, self.pair([(r["trk"], r["vr"]),
                                     (r["trk"], vr_short)], full),

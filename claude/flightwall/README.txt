@@ -51,7 +51,7 @@ needs a terminal of 128 columns by 37 rows.
    [logo]  flight number (UA1179), else callsign or airline
            route and % flown (KEWR>KDEN  48%)
            aircraft (Boeing 737-900 when it fits)
-   altitude                          speed
+   speed                          altitude
    track (heading)        climb/descent rate
    what the plane is doing
    takeoff time ---green progress bar--- landing time
