@@ -1,18 +1,20 @@
 #!/usr/bin/python
 # name: $Id$
 # use: Python re-implementation of TheFlightWall_OSS firmware
-#      (github.com/AxisNimble/TheFlightWall_OSS) that draws the 160x32 LED
-#      matrix in a terminal window instead of on WS2812B panels; no
-#      browser, no extra packages
+#      (github.com/AxisNimble/TheFlightWall_OSS) that draws an LED panel
+#      in a terminal window instead of on WS2812B panels; no browser, no
+#      extra packages
 # usage: python flightwall.py -h
 # imp: data flow is the firmware's: state vectors (OpenSky) -> flight
-#      info (AeroAPI) -> display names (TheFlightWall CDN) -> three-line
-#      card cycled on the matrix. Without OpenSky/AeroAPI credentials the
-#      free airplanes.live and adsbdb.com services stand in for them.
+#      info (AeroAPI) -> display names (TheFlightWall CDN) -> card cycled
+#      on the panel. Without OpenSky/AeroAPI credentials the free
+#      airplanes.live and adsbdb.com services stand in for them.
+#      Beyond the firmware (layout = wall, a 128x64 panel): airline logo,
+#      progress bar with takeoff/landing times, ADS-B readings (altitude,
+#      speed, track, vertical rate) and what the plane is doing.
 #      The 5x7 font is Adafruit GFX's classic glcdfont (BSD licence,
-#      Copyright (c) 2012 Adafruit Industries), the font the panel uses.
-#      Beyond the firmware: live ADS-B readings (altitude, speed, track,
-#      vertical rate) and colour airline logos (layout = full).
+#      Copyright (c) 2012 Adafruit Industries), the font the firmware's
+#      panel uses.
 
 import configparser
 import csv
@@ -41,8 +43,8 @@ E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-REVISION   = "1.2"
-USER_AGENT = "flightwall/1.2 (personal, non-commercial)"
+REVISION   = "1.3"
+USER_AGENT = "flightwall/1.3 (personal, non-commercial)"
 
 OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
                      "opensky-network/protocol/openid-connect/token")
@@ -107,15 +109,11 @@ show_unidentified = no
 style = half
 # wall: logo, flight, route and %, aircraft, green progress bar with
 #       takeoff/landing times, altitude/speed, track/climb, and what
-#       the plane is doing, on a panel_size panel (128x64 needs a
-#       terminal of about 128 x 33)
+#       the plane is doing, on a 128 x 64 panel (needs a terminal of
+#       128 x 33). The panel is never scaled (that would blur it): a
+#       smaller window cuts off its right and bottom
 # classic: the firmware's three-line card on the [hardware] panel
-layout     = wall
-panel_size = 128x64
-# a smaller window shrinks the panel to fit, down to this fraction of
-# its size (below about 0.75 the text becomes hard to read); smaller
-# still and the panel's right and bottom edges are cut off instead
-min_scale  = 0.75
+layout = wall
 # airline logo in colour: yes | no. {iata} and {icao} are replaced by
 # the airline's codes; a PNG in a "logos" folder beside this script
 # named <ICAO>.png or <IATA>.png is used first, if there is one
@@ -170,6 +168,12 @@ TINY_3X5 = {"0": "111101101101111", "1": "010110010010111",
             "6": "111100111101111", "7": "111001010010010",
             "8": "111101111101111", "9": "111101111001111",
             "A": "010101111101101", "P": "110101110100100"}
+
+FONT_EXTRA = {
+   "\u00b0": bytes.fromhex("00000000182424180000000000000000"),
+   "\u2191": bytes.fromhex("000000081c2a08080808080808000000"),
+   "\u2193": bytes.fromhex("000000080808080808082a1c08000000"),
+   }
 
 FONT_EXTRA = {"°": bytes.fromhex("060f090f06"),
               "↑": bytes.fromhex("08047e0408"),
@@ -284,6 +288,9 @@ class FlightInfo:
    aircraft_code               : str = ""
    airline_display_name_full   : str = ""
    aircraft_display_name_short : str = ""
+                               # not in the firmware: "Boeing 737-900",
+                               # shown when it fits
+   aircraft_display_name_full  : str = ""
    origin      : AirportInfo = field(default_factory = AirportInfo)
    destination : AirportInfo = field(default_factory = AirportInfo)
    state       : StateVector = field(default_factory = StateVector)
@@ -1029,6 +1036,11 @@ class FlightWallFetcher:
    def aircraft_name(self, code):
       return(self._get("aircraft", code).get("display_name_short") or "")
 
+   ########################################################################
+
+   def aircraft_full_name(self, code):
+      return(self._get("aircraft", code).get("display_name_full") or "")
+
 ###########################################################################
 ###
 ### l o g o s
@@ -1036,6 +1048,7 @@ class FlightWallFetcher:
 ###########################################################################
 
 LOGO_SIZE = 26
+WALL_SIZE = (128, 64)
 GREEN     = (40, 230, 70)
 DIM_GREEN = (20, 80, 30)
 
@@ -1298,6 +1311,10 @@ DEMO = [
    ("N512GA",  "",    "",   "", "GLF5", "G550", None, None, None, 0,
     "cruise")]
 
+DEMO_TYPES = {"B38M": "Boeing 737 MAX 8", "B739": "Boeing 737-900",
+              "B737": "Boeing 737-700",   "A320": "Airbus A320",
+              "GLF5": "Gulfstream G550"}
+
 DEMO_PLACES = ["Over Davenport, IA", "Over Moon Twp, PA",
                "Near Erie, PA", "Over Mansfield, OH", "Over Peoria, IL"]
 
@@ -1384,17 +1401,20 @@ class DemoFetcher:
             ap = lambda a: AirportInfo(a[0], a[1], a[2], a[3], a[4])
             flown = {"cruise": 120, "departing": 6, "approach": 130,
                      "landing": 75, "landed": 140}[row[10]]
-            return(FlightInfo(
+            info = FlightInfo(
                       ident = row[0], ident_icao = row[0],
                       ident_iata = row[2] + row[0][3:],
                       operator_code = row[1], operator_icao = row[1],
                       operator_iata = row[2], aircraft_code = row[4],
                       airline_display_name_full   = row[3],
                       aircraft_display_name_short = row[5],
+                      aircraft_display_name_full  = DEMO_TYPES.get(row[4],
+                                                                   ""),
                       origin      = ap(org),
                       destination = ap(dst),
-                      off_time    = time.time() - flown * 60,
-                      logo        = demo_logo(row[8], row[9])))
+                      off_time    = time.time() - flown * 60)
+            info.logo = demo_logo(row[8], row[9])
+            return(info)
       return(None)
 
 ###########################################################################
@@ -1494,6 +1514,9 @@ class FlightDataFetcher:
             name = self.cdn.aircraft_name(info.aircraft_code)
             if (name):
                info.aircraft_display_name_short = name
+            name = self.cdn.aircraft_full_name(info.aircraft_code)
+            if (name):
+               info.aircraft_display_name_full = name
       if (self.logos and (info.logo is None)):
          info.logo = self.logos.get(info)
       if (self.airports):
@@ -1863,7 +1886,7 @@ class NeoMatrixDisplay:
       route = self.route_text(f)
       lines = [self.flight_label(f),
                (route + pct) if (route) else "Route unknown",
-               f.aircraft_display_name_short or f.aircraft_code,
+               self.aircraft_text(f, 30),
                (f"{r['alt']}  {r['spd']}  {r['trk']}  {r['vr']}")
                   .replace("↑", "+").replace("↓", "-")
                   .replace("°", "").strip()]
@@ -1901,12 +1924,40 @@ class NeoMatrixDisplay:
 
    ########################################################################
 
+   def aircraft_text(self, f, cols):
+      """
+         post: the fullest aircraft name that fits in cols characters
+      """
+      for name in (f.aircraft_display_name_full,
+                   f.aircraft_display_name_short, f.aircraft_code):
+         if (name and (len(name) <= cols)):
+            return(name)
+      return(truncate_to_columns(f.aircraft_display_name_short or
+                                 f.aircraft_code, cols))
+
+   ########################################################################
+
+   def pair(self, choices, cols):
+      """
+         use:  first (left, right) pair that fits on one line, from
+               the most to the least descriptive
+      """
+                               # two spaces at least between the halves
+      for left, right in choices:
+         if (len(left) + 2 + len(right) <= cols):
+            return(self.lr(left, right, cols))
+      return(self.lr(*choices[-1], cols))
+
+   ########################################################################
+
    def show_wall(self, f):
       """
-         use:  the 128x64 layout: logo, flight / route and % / aircraft
-               beside it; green progress bar with takeoff and landing
-               times; altitude and speed; track and vertical rate; what
-               the plane is doing
+         use:  the wall layout on a 128x64 panel, 5x7 font:
+                  logo 26x26 | flight number / route  % / aircraft
+                  takeoff time ---- green progress bar ---- landing time
+                  ALT altitude                SPD speed
+                  TRK track                    VR climb/descent
+                  what the plane is doing (green when arriving)
       """
       m = self.matrix
       w = m.width
@@ -1919,7 +1970,7 @@ class NeoMatrixDisplay:
       pct   = "" if (math.isnan(f.progress)) else f"{f.progress:.0f}%"
       lines = [self.flight_label(f),
                self.lr(route, pct, cols) if (route) else "Route unknown",
-               f.aircraft_display_name_short or f.aircraft_code]
+               self.aircraft_text(f, cols)]
       for i, line in enumerate(lines):
          m.draw_text(x, 3 + 9 * i, truncate_to_columns(line, cols),
                      self.color)
@@ -1927,9 +1978,16 @@ class NeoMatrixDisplay:
          self.draw_bar(32, f)
       full = (w - 6) // 6
       r    = self.readings(f)
+                               # no ALT/SPD/TRK/VR labels: they only fit
+                               # some of the time on a 20-character line;
+                               # the climb rate's unit goes if it must
+      vr_short = re.sub(r"(FPM|M/S)$", "", r["vr"])
       text, green = self.phase(f)
-      m.draw_text(3, 36, self.lr(r["alt"], r["spd"], full), self.color)
-      m.draw_text(3, 45, self.lr(r["trk"], r["vr"], full), self.color)
+      m.draw_text(3, 36, self.pair([(r["alt"], r["spd"])], full),
+                  self.color)
+      m.draw_text(3, 45, self.pair([(r["trk"], r["vr"]),
+                                    (r["trk"], vr_short)], full),
+                  self.color)
       m.draw_text(3, 54, truncate_to_columns(text, full),
                   GREEN if (green) else self.color)
 
@@ -2011,58 +2069,6 @@ def enable_ansi():
 
 ###########################################################################
 
-def box_weights(n_src, n_dst):
-   """
-      post: for each of n_dst cells, [(source index, weight)] covering
-            its share of the n_src cells; weights add up to 1
-   """
-   ratio = n_src / float(n_dst)
-   out   = []
-   for t in range(n_dst):
-      a     = t * ratio
-      b     = (t + 1) * ratio
-      parts = []
-      i     = int(math.floor(a))
-      while ((i < b) and (i < n_src)):
-         w = min(b, i + 1) - max(a, i)
-         if (w > 1e-9):
-            parts.append((i, w / ratio))
-         i += 1
-      out.append(parts)
-   return(out)
-
-###########################################################################
-
-def shrink_pixels(pixels, width, height, new_width, new_height):
-   """
-      use:  scales a frame down by area-averaging, so thin strokes fade
-            rather than vanish; a mild boost keeps text bright
-      post: rows of (r, g, b), or None where the LED would be (near) off
-   """
-   wx  = box_weights(width, new_width)
-   wy  = box_weights(height, new_height)
-   out = []
-   for ty in range(new_height):
-      row = []
-      for tx in range(new_width):
-         r = g = b = 0.0
-         for sy, ay in wy[ty]:
-            line = pixels[sy]
-            for sx, ax in wx[tx]:
-               c = line[sx]
-               if (c is not None):
-                  k  = ay * ax
-                  r += c[0] * k
-                  g += c[1] * k
-                  b += c[2] * k
-         rgb = (min(255, int(r * 1.35)), min(255, int(g * 1.35)),
-                min(255, int(b * 1.35)))
-         row.append(rgb if (max(rgb) >= 20) else None)
-      out.append(row)
-   return(out)
-
-###########################################################################
-
 class TerminalRenderer:
    """
       name: TerminalRenderer
@@ -2072,10 +2078,9 @@ class TerminalRenderer:
    """
    OFF = (22, 22, 22)
 
-   def __init__(self, brightness, min_scale = 0.75):
-      self.scale     = max(0, min(255, brightness)) / 255.0
-      self.min_scale = max(0.1, min(1.0, min_scale))
-      self.last      = None
+   def __init__(self, brightness):
+      self.scale = max(0, min(255, brightness)) / 255.0
+      self.last  = None
 
    ########################################################################
 
@@ -2102,46 +2107,35 @@ class TerminalRenderer:
 
    def draw(self, matrix, status):
       """
-         use:  paints the panel centred in the terminal
-         imp:  a smaller window shrinks the panel to fit, keeping its
-               shape, but not below min_scale (where the text would
-               become unreadable); below that the panel sits at the top
-               left and its right and/or bottom edge is cut off. It never
-               grows past full size.
+         use:  paints the panel pixel for pixel, centred in the terminal
+         imp:  never scaled, since a bitmap font can't be resized and
+               stay crisp: a window smaller than the panel shows its top
+               left part, cutting off the right and/or bottom edge; a
+               larger one centres it at full size
       """
       size = shutil.get_terminal_size((80, 24))
       key  = (matrix.key(), status, size)
       if (key == self.last):
          return
       self.last = key
-                               # one row is kept for the status line; a
-                               # terminal row holds two LED rows
-      fit    = min(1.0, size.columns / matrix.width,
-                   2.0 * max(1, size.lines - 1) / matrix.height)
-      scale  = max(self.min_scale, fit)
-      width  = max(1, int(round(matrix.width * scale)))
-      height = max(2, int(round(matrix.height * scale)))
-      if ((width, height) == (matrix.width, matrix.height)):
-         pixels = matrix.pixels
-      else:
-         pixels = shrink_pixels(matrix.pixels, matrix.width,
-                                matrix.height, width, height)
-      rows  = (height + 1) // 2
-      left  = max(0, (size.columns - width) // 2)
+      rows      = (matrix.height + 1) // 2
+                               # one row below the panel for the status
+                               # line, when there is room for it
+      left  = max(0, (size.columns - matrix.width) // 2)
       top   = max(0, (size.lines - rows - 1) // 2)
       shown = min(rows, size.lines)
-      cols  = min(width, size.columns)
+      cols  = min(matrix.width, size.columns)
       out   = ["\x1b[0m\x1b[2J"]
       for r in range(shown):
          out.append(f"\x1b[{top + r + 1};{left + 1}H")
-         upper = pixels[2 * r]
-         lower = (     pixels[2 * r + 1]
-                  if (2 * r + 1 < height)
-                  else [None] * width)
+         upper = matrix.pixels[2 * r]
+         lower = (     matrix.pixels[2 * r + 1]
+                  if (2 * r + 1 < matrix.height)
+                  else [None] * matrix.width)
          prev  = None
          for x in range(cols):
             fg = self._rgb(upper[x])
-            bg = (     (0, 0, 0) if (2 * r + 1 >= height)
+            bg = (     (0, 0, 0) if (2 * r + 1 >= matrix.height)
                   else self._rgb(lower[x]))
             if ((fg, bg) != prev):
                out.append("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm"
@@ -2218,7 +2212,8 @@ where options are:
    -cFILE       settings file (default flightwall.ini beside the
                 script; created with defaults on first run)
    -sSTYLE      half (LED matrix, default) or text (plain lines)
-   -gWxH        panel size in pixels, e.g. -g128x64
+   -gWxH        panel size in pixels for layout = classic, e.g. -g160x48
+                (the wall layout is always 128x64)
    -lFILE       write the firmware's serial log to FILE
    -o           fetch once, print the flights as text and exit
    -d           demo data, no network needed
@@ -2289,8 +2284,6 @@ Ctrl+C stops it.""")
             "layout"           : self.choice(dsp, "layout",
                                              ("wall", "classic", "full")
                                              ).replace("full", "wall"),
-            "panel_size"       : self.size(dsp.get("panel_size")),
-            "min_scale"        : dsp.getfloat("min_scale"),
             "show_logo"        : dsp.getboolean("show_logo"),
             "logo_url"         : dsp.get("logo_url").strip(),
             "speed_unit"       : self.choice(dsp, "speed_unit",
@@ -2315,7 +2308,7 @@ Ctrl+C stops it.""")
    @staticmethod
    def size(text):
       """
-         post: returns (width, height) from "128x64"; raises ValueError
+         post: returns (width, height) from "160x48"; raises ValueError
       """
       w, h = [int(v) for v in text.strip().lower().split("x")]
       if (not ((24 <= w <= 1000) and (8 <= h <= 200))):
@@ -2519,11 +2512,12 @@ Ctrl+C stops it.""")
          st["lat"], st["lon"], label = self.locate(place)
          print(f"{self.self_name}: {place} = {label} "
                f"({st['lat']:.4f},{st['lon']:.4f})", file = sys.stderr)
-                               # -g, else the layout's own panel size
-      if ("size" in st):
+                               # the wall layout is drawn for one panel
+                               # size; -g sizes the classic one only
+      if (st["layout"] == "wall"):
+         st["width"], st["height"] = WALL_SIZE
+      elif ("size" in st):
          st["width"], st["height"] = st["size"]
-      elif (st["layout"] == "wall"):
-         st["width"], st["height"] = st["panel_size"]
       if (len(st["track"]) > 5):
          raise(ExceptionClass("track at most 5 flights", self.self_name,
                               E_USAGE))
@@ -2584,7 +2578,7 @@ Ctrl+C stops it.""")
          print(f"{self.self_name}: this console cannot show colours; "
                "using -stext", file = sys.stderr)
          st["style"] = "text"
-      renderer = (     TerminalRenderer(st["brightness"], st["min_scale"])
+      renderer = (     TerminalRenderer(st["brightness"])
                   if (st["style"] == "half")
                   else TextRenderer(display))
 

@@ -27,7 +27,8 @@ Options
                 flight numbers (UA1179) or tail numbers (N512GA)
    -cFILE       settings file (default flightwall.ini)
    -sSTYLE      half (LED panel, default) or text (plain lines)
-   -gWxH        panel size in pixels
+   -gWxH        panel size for layout = classic (the wall layout is
+                always 128x64)
    -lFILE       write the log to FILE
    -o           fetch once, print the flights as text and exit
    -d           demo data, no network needed
@@ -44,27 +45,30 @@ A place on the command line (instead of -x) can be:
 
 The display (layout = wall)
 ---------------------------
-A 128 x 64 panel; the terminal needs to be about 128 columns by 33
-rows (maximise it or make the font smaller).
+A 128 x 64 LED panel with the firmware's 5x7 font. At full size it
+needs a terminal of 128 columns by 33 rows.
 
    [logo]  flight number (UA1179), else callsign or airline
            route and % flown (KEWR>KDEN  48%)
-           aircraft type
+           aircraft (Boeing 737-900 when it fits)
    takeoff time ---green progress bar--- landing time
-   altitude                       speed
+   altitude                          speed
    track (heading)        climb/descent rate
    what the plane is doing
 
 The bottom line says Departing KPIT, Over <town>, Near <town>,
 Approaching KBOS, Landing at KBOS or Landed at KBOS. The last three
-are green. Takeoff and landing times show when known: both with
-AeroAPI; with the free route data only the estimated landing time.
-Private planes without a route show "Route unknown" and no bar.
+are green. The climb rate's unit is dropped when the line would be
+too long.
+Takeoff and landing times sit at the ends of the bar when known:
+both with AeroAPI; with the free route data only the estimated
+landing time. Private planes without a route show "Route unknown"
+and no bar.
 
-Window size: a smaller window shrinks the panel to fit, keeping its
-shape, down to min_scale of its size (0.75; below that the text gets
-hard to read). Smaller still, the panel's right and bottom edges are
-cut off instead. It never grows past full size.
+Window size: the panel is always drawn pixel for pixel, never
+scaled, because a bitmap font can't be resized and stay crisp. In a
+smaller window you see its top left part, with the right and/or
+bottom edge cut off; in a larger one it is centred at full size.
 
 layout = classic in the .ini gives the original firmware's three-line
 card on the [hardware] panel (160 x 32) instead.
@@ -73,7 +77,7 @@ Settings
 --------
 On first run the script writes flightwall.ini next to itself:
 location and radius, flights to follow, API keys and data sources,
-timing, brightness, text colour, units, logos and panel size.
+timing, brightness, text colour, units and logos.
 Command-line options override it for that run.
 
 Data sources
@@ -102,6 +106,11 @@ at most one request a second, an identifying User-Agent (the script
 sends one), results cached (they are), and no bulk, automatic or
 repeated lookups. The script only asks when you type a new place name.
 
+Font
+----
+Adafruit GFX classic 5x7 font, BSD licence, (c) 2012 Adafruit
+Industries: the firmware's own font.
+
 Differences from the firmware
 -----------------------------
 - AeroAPI answers are cached so you aren't billed again for every
@@ -111,5 +120,5 @@ Differences from the firmware
 - Flights cycle every display_cycle_seconds; the firmware only
   redraws after each 30 s fetch.
 - Aircraft are listed nearest first.
-- Logo, readings, progress, times and flight phase (layout = wall),
-  flight following (-f), and place-name lookup are additions.
+- The wall layout, flight following (-f) and place-name lookup are
+  additions.
