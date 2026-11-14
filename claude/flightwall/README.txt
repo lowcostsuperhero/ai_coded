@@ -10,6 +10,7 @@ Run
 ---
    python flightwall.py                         use the .ini
    python flightwall.py -a40.4914,-80.2328 -r15  around a position
+   python flightwall.py -tUAL1179,N512GA        track flights
    python flightwall.py -d                      demo, no network
    python flightwall.py -o                      print once, exit
    python flightwall.py -h                      all options
@@ -20,6 +21,9 @@ Options
 -------
    -aLAT,LON    centre of the area
    -rKM         radius in km
+   -tIDENTS     track up to 5 flights anywhere instead of an area:
+                callsigns (UAL1179), flight numbers (UA1179) or tail
+                numbers (N512GA)
    -cFILE       settings file (default flightwall.ini)
    -sSTYLE      half (LED panel, default) or text (plain lines)
    -gWxH        panel size in pixels
@@ -44,6 +48,13 @@ the airline's badge (its code on a coloured disc) at the left:
    readings   ALT altitude
               SPD speed TRK track
               VR climb or descent rate (an arrow shows which)
+   progress   origin>destination  % flown
+              progress bar
+              ARR arrival time and time to go
+
+The progress page shows when the route's airports and the plane's
+position are known (or AeroAPI gives them). A tracked flight that is
+not airborne, or can't be found, shows NOT FOUND OR NOT AIRBORNE.
 
 layout = classic shows the firmware's card only, without the badge.
 Speeds, altitudes, climb rates and tracks can be shown in other units
@@ -58,8 +69,9 @@ Settings
 --------
 On first run the script writes flightwall.ini next to itself, with
 the same settings as the firmware's config/*.h files: location and
-radius, API keys and data sources, timing, brightness, text colour,
-route codes (ICAO or IATA), layout, units and the panel's tiles.
+radius, flights to track ([tracking], instead of -t), API keys and
+data sources, timing, brightness, text colour, route codes (ICAO or
+IATA), layout, units and the panel's tiles.
 Command-line options override it for that run.
 
 Data sources
@@ -81,5 +93,7 @@ Differences from the firmware
 - Aircraft are listed nearest first.
 - Free stand-ins (airplanes.live, adsbdb.com) when there are no
   OpenSky/AeroAPI credentials, and a demo mode.
-- Airline badges and the ADS-B readings page (layout = full) are
-  additions.
+- Airline badges, the ADS-B readings and progress pages
+  (layout = full) and flight tracking (-t) are additions. Tracking
+  always uses the airplanes.live feed: OpenSky can only find a
+  callsign by downloading the whole world.
