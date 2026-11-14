@@ -60,9 +60,10 @@ needs a terminal of 128 columns by 37 rows.
 The line above the bar says At KPIT (on the ground, not yet departed),
 Departing KPIT, Over <town>, Near <town>, Approaching KBOS, Landing at
 KBOS or Landed at KBOS. "At" is green; Approaching, Landing at and
-Landed at are red; the rest are white. The progress bar is green, and
-turns red once the plane has landed. The climb rate's unit is
-dropped when the line would be too long.
+Landed at are red; the rest are white. The flight number is light
+blue; the climb arrow is light green and the descent arrow light red.
+The progress bar is green, and turns red once the plane has landed.
+The climb rate's unit is dropped when the line would be too long.
 Takeoff and landing times sit at the ends of the bar, "--:--" when
 not known. Below the bar's marker are the time flown so far and the
 time to go (hours:minutes, "-:--" when not known). Both start white;
