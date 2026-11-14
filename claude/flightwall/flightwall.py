@@ -112,6 +112,10 @@ style = half
 # classic: the firmware's three-line card on the [hardware] panel
 layout     = wall
 panel_size = 128x64
+# a smaller window shrinks the panel to fit, down to this fraction of
+# its size (below about 0.75 the text becomes hard to read); smaller
+# still and the panel's right and bottom edges are cut off instead
+min_scale  = 0.75
 # airline logo in colour: yes | no. {iata} and {icao} are replaced by
 # the airline's codes; a PNG in a "logos" folder beside this script
 # named <ICAO>.png or <IATA>.png is used first, if there is one
@@ -2007,6 +2011,58 @@ def enable_ansi():
 
 ###########################################################################
 
+def box_weights(n_src, n_dst):
+   """
+      post: for each of n_dst cells, [(source index, weight)] covering
+            its share of the n_src cells; weights add up to 1
+   """
+   ratio = n_src / float(n_dst)
+   out   = []
+   for t in range(n_dst):
+      a     = t * ratio
+      b     = (t + 1) * ratio
+      parts = []
+      i     = int(math.floor(a))
+      while ((i < b) and (i < n_src)):
+         w = min(b, i + 1) - max(a, i)
+         if (w > 1e-9):
+            parts.append((i, w / ratio))
+         i += 1
+      out.append(parts)
+   return(out)
+
+###########################################################################
+
+def shrink_pixels(pixels, width, height, new_width, new_height):
+   """
+      use:  scales a frame down by area-averaging, so thin strokes fade
+            rather than vanish; a mild boost keeps text bright
+      post: rows of (r, g, b), or None where the LED would be (near) off
+   """
+   wx  = box_weights(width, new_width)
+   wy  = box_weights(height, new_height)
+   out = []
+   for ty in range(new_height):
+      row = []
+      for tx in range(new_width):
+         r = g = b = 0.0
+         for sy, ay in wy[ty]:
+            line = pixels[sy]
+            for sx, ax in wx[tx]:
+               c = line[sx]
+               if (c is not None):
+                  k  = ay * ax
+                  r += c[0] * k
+                  g += c[1] * k
+                  b += c[2] * k
+         rgb = (min(255, int(r * 1.35)), min(255, int(g * 1.35)),
+                min(255, int(b * 1.35)))
+         row.append(rgb if (max(rgb) >= 20) else None)
+      out.append(row)
+   return(out)
+
+###########################################################################
+
 class TerminalRenderer:
    """
       name: TerminalRenderer
@@ -2016,9 +2072,10 @@ class TerminalRenderer:
    """
    OFF = (22, 22, 22)
 
-   def __init__(self, brightness):
-      self.scale = max(0, min(255, brightness)) / 255.0
-      self.last  = None
+   def __init__(self, brightness, min_scale = 0.75):
+      self.scale     = max(0, min(255, brightness)) / 255.0
+      self.min_scale = max(0.1, min(1.0, min_scale))
+      self.last      = None
 
    ########################################################################
 
@@ -2046,17 +2103,29 @@ class TerminalRenderer:
    def draw(self, matrix, status):
       """
          use:  paints the panel centred in the terminal
-         imp:  a window too small for the panel shows its top left
-               part; the rest is cut off
+         imp:  a smaller window shrinks the panel to fit, keeping its
+               shape, but not below min_scale (where the text would
+               become unreadable); below that the panel sits at the top
+               left and its right and/or bottom edge is cut off. It never
+               grows past full size.
       """
       size = shutil.get_terminal_size((80, 24))
       key  = (matrix.key(), status, size)
       if (key == self.last):
          return
       self.last = key
-      pixels = matrix.pixels
-      width  = matrix.width
-      height = matrix.height
+                               # one row is kept for the status line; a
+                               # terminal row holds two LED rows
+      fit    = min(1.0, size.columns / matrix.width,
+                   2.0 * max(1, size.lines - 1) / matrix.height)
+      scale  = max(self.min_scale, fit)
+      width  = max(1, int(round(matrix.width * scale)))
+      height = max(2, int(round(matrix.height * scale)))
+      if ((width, height) == (matrix.width, matrix.height)):
+         pixels = matrix.pixels
+      else:
+         pixels = shrink_pixels(matrix.pixels, matrix.width,
+                                matrix.height, width, height)
       rows  = (height + 1) // 2
       left  = max(0, (size.columns - width) // 2)
       top   = max(0, (size.lines - rows - 1) // 2)
@@ -2221,6 +2290,7 @@ Ctrl+C stops it.""")
                                              ("wall", "classic", "full")
                                              ).replace("full", "wall"),
             "panel_size"       : self.size(dsp.get("panel_size")),
+            "min_scale"        : dsp.getfloat("min_scale"),
             "show_logo"        : dsp.getboolean("show_logo"),
             "logo_url"         : dsp.get("logo_url").strip(),
             "speed_unit"       : self.choice(dsp, "speed_unit",
@@ -2514,7 +2584,7 @@ Ctrl+C stops it.""")
          print(f"{self.self_name}: this console cannot show colours; "
                "using -stext", file = sys.stderr)
          st["style"] = "text"
-      renderer = (     TerminalRenderer(st["brightness"])
+      renderer = (     TerminalRenderer(st["brightness"], st["min_scale"])
                   if (st["style"] == "half")
                   else TextRenderer(display))
 

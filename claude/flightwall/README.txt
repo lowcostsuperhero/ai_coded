@@ -61,8 +61,10 @@ are green. Takeoff and landing times show when known: both with
 AeroAPI; with the free route data only the estimated landing time.
 Private planes without a route show "Route unknown" and no bar.
 
-Window size: a window too small for the panel shows its top left
-part; the rest is cut off.
+Window size: a smaller window shrinks the panel to fit, keeping its
+shape, down to min_scale of its size (0.75; below that the text gets
+hard to read). Smaller still, the panel's right and bottom edges are
+cut off instead. It never grows past full size.
 
 layout = classic in the .ini gives the original firmware's three-line
 card on the [hardware] panel (160 x 32) instead.
