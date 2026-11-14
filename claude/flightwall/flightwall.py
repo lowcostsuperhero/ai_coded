@@ -52,6 +52,7 @@ FLIGHTWALL_CDN    = "https://cdn.theflightwall.com"
 ADSB_FEEDS        = ["https://api.airplanes.live/v2",
                      "https://api.adsb.lol/v2"]
 ADSBDB_BASE_URL   = "https://api.adsbdb.com/v0"
+NOMINATIM_URL     = "https://nominatim.openstreetmap.org"
 OURAIRPORTS_URL   = ("https://davidmegginson.github.io/ourairports-data/"
                      "airports.csv")
 GEONAMES_URL      = "https://download.geonames.org/export/dump/cities1000.zip"
@@ -70,7 +71,7 @@ radius_km  = 10.0
 
 [tracking]
 # not in the firmware: up to 5 flights to follow anywhere instead of
-# watching the area (-t on the command line), e.g.
+# watching the area (-f on the command line), e.g.
 # flights = UAL1179, DL402, N512GA
 # (callsign, airline flight number or tail number); blank = area mode
 flights =
@@ -483,6 +484,12 @@ class AirportDB:
    ########################################################################
 
    @classmethod
+   def iata(cls, code):
+      return(cls.by_iata.get(code.upper()) if (cls._load()) else None)
+
+   ########################################################################
+
+   @classmethod
    def icao(cls, code):
       return(cls.by_icao.get(code.upper()) if (cls._load()) else None)
 
@@ -582,6 +589,46 @@ class PlaceIndex:
       return("")
 
 ###########################################################################
+
+def geocode(query):
+   """
+      use:  turns a place name such as "brighton heights, pa" into a
+            position, using OpenStreetMap's Nominatim service
+      post: returns (lat, lon, label) or None when nothing matches
+      imp:  one lookup per run, started by the user, and the answer is
+            kept in flightwall_places.json so the same name is never
+            looked up twice; see the Nominatim usage policy at
+            https://operations.osmfoundation.org/policies/nominatim/
+            (at most 1 request a second, an identifying User-Agent, no
+            bulk or automatic lookups, credit OpenStreetMap)
+   """
+   key   = " ".join(query.lower().split())
+   path  = data_path("flightwall_places.json")
+   saved = {}
+   try:
+      with open(path, "r", encoding = "utf-8") as handle:
+         saved = json.load(handle)
+   except (OSError, ValueError):
+      pass
+   if (key in saved):
+      lat, lon, label = saved[key]
+      return(lat, lon, label)
+   url = (NOMINATIM_URL + "/search?" +
+          urllib.parse.urlencode({"q": query, "format": "jsonv2",
+                                  "limit": 1}))
+   status, reply = http_json(url)
+   if ((status != 200) or (not reply)):
+      return(None)
+   hit   = reply[0]
+   found = (float(hit["lat"]), float(hit["lon"]),
+            hit.get("display_name") or query)
+   saved[key] = list(found)
+   try:
+      with open(path, "w", encoding = "utf-8") as handle:
+         json.dump(saved, handle, indent = 1)
+   except OSError:
+      pass
+   return(found)
 
 ###########################################################################
 ###
@@ -2092,13 +2139,13 @@ class MAIN:
 
    def usage(self):
       print(f"""{self.self_name} {REVISION}
-usage: {self.self_name} [options]
+usage: {self.self_name} [options] [place]
 where options are:
-   -aLAT,LON    centre of the area, e.g. -a40.484,-80.037
+   -xLAT,LON    centre of the area, e.g. -x40.484,-80.037
    -rKM         radius in km
-   -tIDENTS     track up to 5 flights anywhere instead of an area:
+   -fIDENTS     follow up to 5 flights anywhere instead of an area:
                 callsigns, flight numbers or tail numbers, comma-
-                separated, e.g. -tUAL1179,DL402,N512GA
+                separated, e.g. -fUAL1179,DL402,N512GA
    -cFILE       settings file (default flightwall.ini beside the
                 script; created with defaults on first run)
    -sSTYLE      half (LED matrix, default) or text (plain lines)
@@ -2108,9 +2155,16 @@ where options are:
    -d           demo data, no network needed
    -v           verbose log; more -v for more verbosity
    -h           help
+and place is where to centre the area instead of -x: a three-letter
+airport code (PIT), or a place name in quotes ("brighton heights, pa").
+Three letters are tried as an airport code first.
 
-"Over <town>" uses GeoNames (CC BY 4.0) and airport positions
-OurAirports, both downloaded once beside the script.
+Place names are looked up with OpenStreetMap's Nominatim service (data
+(c) OpenStreetMap contributors, ODbL), once per name, and remembered in
+flightwall_places.json. Usage policy:
+https://operations.osmfoundation.org/policies/nominatim/
+"Over <town>" uses GeoNames (CC BY 4.0) and airport codes OurAirports,
+both downloaded once beside the script.
 
 Ctrl+C stops it.""")
 
@@ -2268,6 +2322,32 @@ Ctrl+C stops it.""")
 
    ########################################################################
 
+   def locate(self, place):
+      """
+         use:  the place argument -> where to centre the area
+         post: returns (lat, lon, label); three letters are tried as an
+               airport code before they are tried as a place name
+      """
+      if (re.fullmatch(r"[A-Za-z]{3}", place)):
+         if (not os.path.isfile(data_path("airports.csv"))):
+            print(f"{self.self_name}: downloading the airport list "
+                  "(once, about 12 MB)", file = sys.stderr)
+         found = AirportDB.iata(place)
+         if (found):
+            return(found["lat"], found["lon"],
+                   f"{found['name']} ({place.upper()})")
+      try:
+         hit = geocode(place)
+      except FetchError as error:
+         raise(ExceptionClass(f"cannot look up {place}: {error}",
+                              self.self_name))
+      if (hit is None):
+         raise(ExceptionClass(f"cannot find a place called {place}",
+                              self.self_name, E_USAGE))
+      return(hit)
+
+   ########################################################################
+
    def fetch_once(self, fetcher, source):
       try:
          if (self.track):
@@ -2308,10 +2388,13 @@ Ctrl+C stops it.""")
 
    def execute(self, args):
       try:
-         opts, rest = getopt.getopt(args, "a:r:t:c:s:g:l:odvh")
+         opts, rest = getopt.gnu_getopt(args, "x:r:f:c:s:g:l:odvh")
       except getopt.GetoptError as error:
          self.usage()
          raise(ExceptionClass(str(error), self.self_name, E_USAGE))
+                               # a place name forgotten in quotes arrives
+                               # as several words; put them back together
+      place = " ".join(rest).strip()
       here     = os.path.dirname(os.path.abspath(__file__))
       ini_path = os.path.join(here, "flightwall.ini")
       override = {}
@@ -2323,14 +2406,14 @@ Ctrl+C stops it.""")
             if (option == "-h"):
                self.usage()
                return(E_SUCCESS)
-            elif (option == "-a"):
+            elif (option == "-x"):
                lat, lon = [float(v) for v in value.split(",")]
                if (not ((-90 <= lat <= 90) and (-180 <= lon <= 180))):
                   raise(ValueError(value))
                override.update({"lat": lat, "lon": lon})
             elif (option == "-r"):
                override["radius_km"] = float(value)
-            elif (option == "-t"):
+            elif (option == "-f"):
                override["track"] = [t for t in re.split(r"[,\s]+",
                                                         value.upper())
                                     if (t)]
@@ -2356,8 +2439,16 @@ Ctrl+C stops it.""")
             raise(ExceptionClass(f"bad value for {option}: {value}",
                                  self.self_name, E_USAGE))
 
+      if (place and ("lat" in override)):
+         self.usage()
+         raise(ExceptionClass("give either -x or a place, not both",
+                              self.self_name, E_USAGE))
       st = self.load_settings(ini_path)
       st.update(override)
+      if (place):
+         st["lat"], st["lon"], label = self.locate(place)
+         print(f"{self.self_name}: {place} = {label} "
+               f"({st['lat']:.4f},{st['lon']:.4f})", file = sys.stderr)
                                # -g, else the layout's own panel size
       if ("size" in st):
          st["width"], st["height"] = st["size"]
