@@ -56,10 +56,12 @@ needs a terminal of 128 columns by 33 rows.
    track (heading)        climb/descent rate
    what the plane is doing
 
-The bottom line says Departing KPIT, Over <town>, Near <town>,
-Approaching KBOS, Landing at KBOS or Landed at KBOS. The last three
-are green. The climb rate's unit is dropped when the line would be
-too long.
+The bottom line says At KPIT (on the ground, not yet departed),
+Departing KPIT, Over <town>, Near <town>, Approaching KBOS, Landing at
+KBOS or Landed at KBOS. "At" is green; Approaching, Landing at and
+Landed at are red; the rest are white. The progress bar is green, and
+turns red while the plane is landing and once it has landed. The
+climb rate's unit is dropped when the line would be too long.
 Takeoff and landing times sit at the ends of the bar when known:
 both with AeroAPI; with the free route data only the estimated
 landing time. Private planes without a route show "Route unknown"

@@ -1051,6 +1051,8 @@ LOGO_SIZE = 26
 WALL_SIZE = (128, 64)
 GREEN     = (40, 230, 70)
 DIM_GREEN = (20, 80, 30)
+RED       = (255, 95, 85)
+DIM_RED   = (90, 32, 28)
 
 def png_decode(data):
    """
@@ -1308,6 +1310,10 @@ DEMO = [
     ("KPIT", "PIT", 40.49, -80.23, 1203), ("KORD", "ORD", 41.97, -87.91,
                                            672),
     (40, 60, 170), 0, "departing"),
+   ("JBU717",  "JBU", "B6", "JetBlue", "A320", "A320",
+    ("KPIT", "PIT", 40.49, -80.23, 1203), ("KBOS", "BOS", 42.36, -71.01,
+                                           20),
+    (30, 60, 140), 1, "origin"),
    ("N512GA",  "",    "",   "", "GLF5", "G550", None, None, None, 0,
     "cruise")]
 
@@ -1351,7 +1357,8 @@ class DemoFetcher:
       else:
                                # distance along the route by phase
          total = haversine_km(org[2], org[3], dst[2], dst[3])
-         along = {"cruise"   : 0.48 * total,
+         along = {"origin"   : 0.0,
+                  "cruise"   : 0.48 * total,
                   "departing": 18.0,
                   "approach" : total - 45.0,
                   "landing"  : total - 7.0,
@@ -1367,8 +1374,9 @@ class DemoFetcher:
             "departing": (2560.0,  149.0, 11.7),
             "approach" : (1981.0,  128.6, -6.1),
             "landing"  : (dst[4] * 0.3048 + 335.0, 73.0, -3.6),
-            "landed"   : (dst[4] * 0.3048, 9.3, 0.0)}[phase]
-         s.on_ground = (phase == "landed")
+            "landed"   : (dst[4] * 0.3048, 9.3, 0.0),
+            "origin"   : (org[4] * 0.3048, 4.1, 0.0)}[phase]
+         s.on_ground = (phase in ("landed", "origin"))
       s.distance_km = haversine_km(lat, lon, s.lat, s.lon)
       s.bearing_deg = bearing_deg(lat, lon, s.lat, s.lon)
       return(s)
@@ -1400,7 +1408,7 @@ class DemoFetcher:
             org, dst = row[6], row[7]
             ap = lambda a: AirportInfo(a[0], a[1], a[2], a[3], a[4])
             flown = {"cruise": 120, "departing": 6, "approach": 130,
-                     "landing": 75, "landed": 140}[row[10]]
+                     "landing": 75, "landed": 140, "origin": 0}[row[10]]
             info = FlightInfo(
                       ident = row[0], ident_icao = row[0],
                       ident_iata = row[2] + row[0][3:],
@@ -1412,7 +1420,9 @@ class DemoFetcher:
                                                                    ""),
                       origin      = ap(org),
                       destination = ap(dst),
-                      off_time    = time.time() - flown * 60)
+                      off_time    = (     time.time() - flown * 60
+                                     if (flown)
+                                     else 0.0))
             info.logo = demo_logo(row[8], row[9])
             return(info)
       return(None)
@@ -1822,8 +1832,9 @@ class NeoMatrixDisplay:
    def phase(self, f):
       """
          use:  what the plane is doing, for the bottom line
-         post: returns (text, green); green for approaching, landing
-               and landed
+         post: returns (text, state); state is "origin" (on the ground
+               at the origin, not yet departed), "approach", "landing",
+               "landed" or "" for anything else
       """
       s   = f.state
       org = f.origin
@@ -1835,27 +1846,27 @@ class NeoMatrixDisplay:
                 else haversine_km(s.lat, s.lon, org.lat, org.lon))
       if (s.on_ground):
          if ((to_dst is not None) and (to_dst <= 8)):
-            return(f"Landed at {self.code(dst)}", True)
+            return(f"Landed at {self.code(dst)}", "landed")
          if ((to_org is not None) and (to_org <= 8)):
-            return(f"At {self.code(org)}", False)
-         return("On the ground", False)
+            return(f"At {self.code(org)}", "origin")
+         return("On the ground", "")
       if (to_dst is not None):
                                # height above the destination's runways
          agl = (     None if (math.isnan(s.baro_altitude))
                 else s.baro_altitude / 0.3048 - dst.elev_ft)
          if ((to_dst <= 15) and (agl is not None) and (agl <= 3000) and
              (vr <= 0.5)):
-            return(f"Landing at {self.code(dst)}", True)
+            return(f"Landing at {self.code(dst)}", "landing")
                                # descending faster than ~200 ft/min
          if ((to_dst <= 60) and (vr < -1.0)):
-            return(f"Approaching {self.code(dst)}", True)
+            return(f"Approaching {self.code(dst)}", "approach")
       if ((to_org is not None) and (to_org <= 40) and (vr > 1.0)):
-         return(f"Departing {self.code(org)}", False)
+         return(f"Departing {self.code(org)}", "")
       if (f.where):
-         return(f.where, False)
+         return(f.where, "")
       if (to_dst is not None):
-         return(f"En route to {self.code(dst)}", False)
-      return("", False)
+         return(f"En route to {self.code(dst)}", "")
+      return("", "")
 
    ########################################################################
 
@@ -1975,31 +1986,40 @@ class NeoMatrixDisplay:
          m.draw_text(x, 3 + 9 * i, truncate_to_columns(line, cols),
                      self.color)
       if (route):
-         self.draw_bar(32, f)
+         self.draw_bar(32, f, self.phase(f)[1])
       full = (w - 6) // 6
       r    = self.readings(f)
                                # no ALT/SPD/TRK/VR labels: they only fit
                                # some of the time on a 20-character line;
                                # the climb rate's unit goes if it must
       vr_short = re.sub(r"(FPM|M/S)$", "", r["vr"])
-      text, green = self.phase(f)
+      text, state = self.phase(f)
       m.draw_text(3, 36, self.pair([(r["alt"], r["spd"])], full),
                   self.color)
       m.draw_text(3, 45, self.pair([(r["trk"], r["vr"]),
                                     (r["trk"], vr_short)], full),
                   self.color)
       m.draw_text(3, 54, truncate_to_columns(text, full),
-                  GREEN if (green) else self.color)
+                               # red as the flight ends, green while it
+                               # waits at the origin, white otherwise
+                  (     RED   if (state in ("approach", "landing",
+                                              "landed"))
+                   else GREEN if (state == "origin")
+                   else self.color))
 
    ########################################################################
 
-   def draw_bar(self, y, f):
+   def draw_bar(self, y, f, state = ""):
       """
-         use:  3 px progress bar: dim green track, green flown part, a
-               3x3 marker for the plane; small takeoff and landing
-               times at the ends when known (room is kept for them so
-               the bar is the same length on every flight)
+         use:  3 px progress bar: dim track, flown part, a 3x3 marker
+               for the plane; small takeoff and landing times at the
+               ends when known (room is kept for them so the bar is the
+               same length on every flight)
+         usage: state from phase(): the bar is red while landing and
+               once landed, green before that
       """
+      lit, dim = (     (RED, DIM_RED) if (state in ("landing", "landed"))
+                  else (GREEN, DIM_GREEN))
       m   = self.matrix
       off = self.clock(f.off_time)
       on  = self.clock(f.eta)
@@ -2013,15 +2033,15 @@ class NeoMatrixDisplay:
       if (on):
          m.draw_tiny(m.width - 4 - m.tiny_width(on), y - 2, on, self.color)
       for i in range(x0, x1 + 1):
-         m.pixel(i, y, DIM_GREEN)
+         m.pixel(i, y, dim)
       if (math.isnan(f.progress)):
          return
       fill = int((x1 - x0 - 2) * max(0.0, min(100.0, f.progress)) / 100.0)
       for i in range(x0, x0 + fill):
-         m.pixel(i, y, GREEN)
+         m.pixel(i, y, lit)
       for j in range(y - 1, y + 2):
          for i in range(x0 + fill, x0 + fill + 3):
-            m.pixel(i, j, GREEN)
+            m.pixel(i, j, lit)
 
    ########################################################################
 
