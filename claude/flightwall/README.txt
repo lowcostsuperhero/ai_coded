@@ -8,9 +8,9 @@ browser and no extra packages: just Python 3.8 or later.
 
 Run
 ---
-   python flightwall.py                         use the .ini
    python flightwall.py -a40.4914,-80.2328 -r15  around a position
    python flightwall.py -tUAL1179,N512GA        track flights
+   python flightwall.py                         use the .ini
    python flightwall.py -d                      demo, no network
    python flightwall.py -o                      print once, exit
    python flightwall.py -h                      all options
@@ -21,9 +21,8 @@ Options
 -------
    -aLAT,LON    centre of the area
    -rKM         radius in km
-   -tIDENTS     track up to 5 flights anywhere instead of an area:
-                callsigns (UAL1179), flight numbers (UA1179) or tail
-                numbers (N512GA)
+   -tIDENTS     track up to 5 flights anywhere: callsigns (UAL1179),
+                flight numbers (UA1179) or tail numbers (N512GA)
    -cFILE       settings file (default flightwall.ini)
    -sSTYLE      half (LED panel, default) or text (plain lines)
    -gWxH        panel size in pixels
@@ -35,52 +34,54 @@ Options
 
 Values attach directly to the letter: -r15, not -r 15.
 
-The display
------------
-The firmware's card on its 160 x 32 panel (ten 16 x 16 tiles, two
-rows): a border and three lines, cycled through the aircraft in the
-area, nearest first.
+The display (layout = wall)
+---------------------------
+A 128 x 64 panel; the terminal needs to be about 128 columns by 33
+rows (maximise it or make the font smaller).
 
-With layout = full (the default) each aircraft gets two pages, with
-the airline's badge (its code on a coloured disc) at the left:
+   [logo]  flight number (UA1179), else callsign or airline
+           route and % flown (KEWR>KDEN  48%)
+           aircraft type
+   takeoff time ---green progress bar--- landing time
+   altitude                       speed
+   track (heading)        climb/descent rate
+   what the plane is doing
 
-   card       airline / origin>destination / aircraft
-   readings   ALT altitude
-              SPD speed TRK track
-              VR climb or descent rate (an arrow shows which)
-   progress   origin>destination  % flown
-              progress bar
-              ARR arrival time and time to go
+The bottom line says Departing KPIT, Over <town>, Near <town>,
+Approaching KBOS, Landing at KBOS or Landed at KBOS. The last three
+are green. Takeoff and landing times show when known: both with
+AeroAPI; with the free route data only the estimated landing time.
+Private planes without a route show "Route unknown" and no bar.
 
-The progress page shows when the route's airports and the plane's
-position are known (or AeroAPI gives them). A tracked flight that is
-not airborne, or can't be found, shows NOT FOUND OR NOT AIRBORNE.
+Window size: a window too small for the panel shows its top left
+part; the rest is cut off.
 
-layout = classic shows the firmware's card only, without the badge.
-Speeds, altitudes, climb rates and tracks can be shown in other units
-(kt, mph, km/h, m/s, Mach; ft, m; ft/min, m/s; degrees, compass
-points or both): see [display] in the .ini.
-
-Each LED is drawn as half a character cell with the upper half block
-character, so the panel needs a terminal of 160 columns by 17 rows.
-Terminals without 24-bit colour can use -stext for plain lines.
+layout = classic in the .ini gives the original firmware's three-line
+card on the [hardware] panel (160 x 32) instead.
 
 Settings
 --------
-On first run the script writes flightwall.ini next to itself, with
-the same settings as the firmware's config/*.h files: location and
-radius, flights to track ([tracking], instead of -t), API keys and
-data sources, timing, brightness, text colour, route codes (ICAO or
-IATA), layout, units and the panel's tiles.
+On first run the script writes flightwall.ini next to itself:
+location and radius, flights to track, API keys and data sources,
+timing, brightness, text colour, units, logos and panel size.
 Command-line options override it for that run.
 
 Data sources
 ------------
-Live positions: OpenSky with an account (client id and secret, as
-the firmware uses), else airplanes.live (free; adsb.lol as backup).
-Routes: FlightAware AeroAPI with a key (paid per lookup), else
-adsbdb.com (free). Airline and aircraft display names come from
-TheFlightWall's CDN, as in the firmware.
+Live positions: airplanes.live (free), or OpenSky with an account.
+Routes: adsbdb.com (free), or FlightAware AeroAPI with a key (paid
+per lookup). Airline logos: images.kiwi.com. To use your own, put
+<ICAO>.png or <IATA>.png (e.g. UAL.png) in a "logos" folder beside
+the script.
+
+Files downloaded once and kept beside the script:
+- airports.csv: airport positions from OurAirports (public domain),
+  about 12 MB, refreshed every 90 days. Downloaded when AeroAPI is
+  used (it gives airport codes only).
+- cities1000.zip: towns of 1,000+ people from GeoNames
+  (geonames.org, CC BY 4.0), about 10 MB, refreshed every 180 days.
+  "Over <town>" is looked up in it on your computer; no online
+  service is asked about aircraft positions.
 
 Differences from the firmware
 -----------------------------
@@ -91,9 +92,5 @@ Differences from the firmware
 - Flights cycle every display_cycle_seconds; the firmware only
   redraws after each 30 s fetch.
 - Aircraft are listed nearest first.
-- Free stand-ins (airplanes.live, adsbdb.com) when there are no
-  OpenSky/AeroAPI credentials, and a demo mode.
-- Airline badges, the ADS-B readings and progress pages
-  (layout = full) and flight tracking (-t) are additions. Tracking
-  always uses the airplanes.live feed: OpenSky can only find a
-  callsign by downloading the whole world.
+- Logo, readings, progress, times and flight phase (layout = wall),
+  and flight tracking (-t) are additions.
