@@ -35,11 +35,20 @@ The display
 -----------
 The firmware's card on its 160 x 32 panel (ten 16 x 16 tiles, two
 rows): a border and three lines, cycled through the aircraft in the
-area, nearest first:
+area, nearest first.
 
-   airline              (United)
-   origin>destination   (KEWR>KDEN)
-   aircraft             (737 MAX 8)
+With layout = full (the default) each aircraft gets two pages, with
+the airline's badge (its code on a coloured disc) at the left:
+
+   card       airline / origin>destination / aircraft
+   readings   ALT altitude
+              SPD speed TRK track
+              VR climb or descent rate (an arrow shows which)
+
+layout = classic shows the firmware's card only, without the badge.
+Speeds, altitudes, climb rates and tracks can be shown in other units
+(kt, mph, km/h, m/s, Mach; ft, m; ft/min, m/s; degrees, compass
+points or both): see [display] in the .ini.
 
 Each LED is drawn as half a character cell with the upper half block
 character, so the panel needs a terminal of 160 columns by 17 rows.
@@ -50,7 +59,7 @@ Settings
 On first run the script writes flightwall.ini next to itself, with
 the same settings as the firmware's config/*.h files: location and
 radius, API keys and data sources, timing, brightness, text colour,
-route codes (ICAO or IATA) and the panel's tiles.
+route codes (ICAO or IATA), layout, units and the panel's tiles.
 Command-line options override it for that run.
 
 Data sources
@@ -72,3 +81,5 @@ Differences from the firmware
 - Aircraft are listed nearest first.
 - Free stand-ins (airplanes.live, adsbdb.com) when there are no
   OpenSky/AeroAPI credentials, and a demo mode.
+- Airline badges and the ADS-B readings page (layout = full) are
+  additions.
