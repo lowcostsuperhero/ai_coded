@@ -1065,6 +1065,13 @@ GREEN     = (40, 230, 70)
 DIM_GREEN = (20, 80, 30)
 RED       = (255, 95, 85)
 DIM_RED   = (90, 32, 28)
+LT_BLUE   = (128, 206, 255)
+LT_GREEN  = (120, 240, 140)
+LT_RED    = (255, 140, 130)
+                               # the climb/descent arrows keep their own
+                               # colour whatever colour the text is
+ARROW_COLORS = {"\u2191": LT_GREEN,
+                "\u2193": LT_RED}
 
 def png_decode(data):
    """
@@ -1917,9 +1924,11 @@ class Matrix:
    def draw_text(self, x, y, text, color):
       """
          imp: 5x7 glyph plus one blank column = 6 px per character;
-              text wrap is off, so anything past the edge is clipped
+              text wrap is off, so anything past the edge is clipped;
+              the up/down arrows are drawn in ARROW_COLORS
       """
       for ch in text:
+         ink = ARROW_COLORS.get(ch, color)
          code = ord(ch)
          if (ch in FONT_EXTRA):
             glyph = FONT_EXTRA[ch]
@@ -1930,7 +1939,7 @@ class Matrix:
          for col, bits in enumerate(glyph):
             for row in range(8):
                if ((bits >> row) & 1):
-                  self.pixel(x + col, y + row, color)
+                  self.pixel(x + col, y + row, ink)
          x += 6
 
    ########################################################################
@@ -2279,7 +2288,8 @@ class NeoMatrixDisplay:
    def show_wall(self, f):
       """
          use:  the wall layout on a 128x72 panel, 5x7 font:
-                  logo 26x26 | flight number / route  % / aircraft
+                  logo 26x26 | flight number (light blue) / route  % /
+                               aircraft
                   altitude                          speed
                   track                    climb/descent
                   what the plane is doing (red when arriving)
@@ -2308,8 +2318,9 @@ class NeoMatrixDisplay:
                self.lr(route, pct, cols) if (route) else "Route unknown",
                self.aircraft_text(f, cols)]
       for i, line in enumerate(lines):
+                               # the flight number is light blue
          m.draw_text(x, 3 + 9 * i, truncate_to_columns(line, cols),
-                     self.color)
+                     LT_BLUE if (i == 0) else self.color)
       if (route):
          self.draw_bar(60, f, self.phase(f)[1])
          self.draw_flight_times(64, f, self.phase(f)[1])
