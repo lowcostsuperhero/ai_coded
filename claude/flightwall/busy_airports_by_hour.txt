@@ -1,0 +1,56 @@
+Airports likely to be busy, by hour of the day
+==============================================
+
+Your time is US Eastern (EST). Local time at each airport is in
+brackets. The codes work directly with flightwall, for example:
+
+   python flightwall.py HND
+
+The airports are busy at those hours and well covered by the volunteer
+receivers the free feed relies on (mainland China is left out for that
+reason).
+
+Your time  Airports to try (local time there)
+---------  ------------------------------------------
+12 am      HND (2p)   SYD (4p)   SIN (1p)   ICN (2p)
+ 1 am      HND (3p)   SYD (5p)   SIN (2p)   DXB (10a)
+ 2 am      HND (4p)   SYD (6p)   DXB (11a)  IST (10a)
+ 3 am      HND (5p)   SYD (7p)   DXB (12p)  DOH (11a)
+ 4 am      HND (6p)   SIN (5p)   DXB (1p)   IST (12p)
+ 5 am      LHR (10a)  AMS (11a)  FRA (11a)  IST (1p)
+ 6 am      LHR (11a)  AMS (12p)  CDG (12p)  DXB (3p)
+ 7 am      LHR (12p)  AMS (1p)   FRA (1p)   ATL (7a)
+ 8 am      ATL (8a)   ORD (7a)   LHR (1p)   AMS (2p)
+ 9 am      ATL (9a)   ORD (8a)   DFW (8a)   LHR (2p)
+10 am      ATL (10a)  DFW (9a)   ORD (9a)   DEN (8a)
+11 am      ATL (11a)  DFW (10a)  DEN (9a)   LAX (8a)
+12 pm      ATL (12p)  DFW (11a)  DEN (10a)  LAX (9a)
+ 1 pm      ATL (1p)   ORD (12p)  DFW (12p)  LAX (10a)
+ 2 pm      ATL (2p)   ORD (1p)   DEN (12p)  LAX (11a)
+ 3 pm      ATL (3p)   ORD (2p)   DFW (2p)   LAX (12p)
+ 4 pm      ATL (4p)   ORD (3p)   DFW (3p)   LAX (1p)
+ 5 pm      ATL (5p)   JFK (5p)   ORD (4p)   DFW (4p)
+ 6 pm      ATL (6p)   JFK (6p)   ORD (5p)   DEN (4p)
+ 7 pm      ATL (7p)   JFK (7p)   ORD (6p)   DFW (6p)
+ 8 pm      ATL (8p)   ORD (7p)   DFW (7p)   LAX (5p)
+ 9 pm      ATL (9p)   DFW (8p)   DEN (7p)   LAX (6p)
+10 pm      LAX (7p)   SFO (7p)   SEA (7p)   DEN (8p)
+11 pm      LAX (8p)   SEA (8p)   HND (1p)   SYD (3p)
+
+Patterns behind the list
+------------------------
+- ATL is busy from early morning to late evening, so it is the safest
+  pick during US daytime.
+- JFK peaks in the early evening, when the transatlantic departures
+  leave.
+- Europe's airports slow down from about 11 pm local, so they drop off
+  after about 5 pm your time.
+- Dubai (DXB) runs around the clock, and is a good backup if another
+  airport seems quiet.
+
+Caveats
+-------
+This is based on typical airline schedules, not live traffic, so check
+with -o first. It holds until the clocks change: Europe moves in late
+March, and the US, Australia and Japan-to-US gaps shift then too. After
+that the European and Australian rows move by an hour.
