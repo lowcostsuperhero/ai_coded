@@ -15,6 +15,7 @@
 #      vertical rate) and colour airline logos (layout = full).
 
 import configparser
+import datetime
 import getopt
 import json
 import math
@@ -59,6 +60,13 @@ center_lat = 40.484
 center_lon = -80.037
 radius_km  = 10.0
 
+[tracking]
+# not in the firmware: up to 5 flights to follow anywhere instead of
+# watching the area (-t on the command line), e.g.
+# flights = UAL1179, DL402, N512GA
+# (callsign, airline flight number or tail number); blank = area mode
+flights =
+
 [api]
 # APIConfiguration.h. Leave blank to use the free stand-ins:
 # airplanes.live for positions, adsbdb.com for routes.
@@ -89,7 +97,8 @@ show_unidentified = no
 # half: LED matrix with half-block pixels | text: plain lines
 style = half
 # full: the firmware's card with the airline's badge, then pages of
-#       ADS-B readings (altitude, speed, track, climb)
+#       ADS-B readings (altitude, speed, track, climb) and, when the
+#       route is known, progress to the destination
 # classic: the firmware's three-line card only
 layout = full
 # airline badge (its code on a coloured disc): yes | no
@@ -225,7 +234,8 @@ class StateVector:
 class AirportInfo:
    code_icao : str   = ""
    code_iata : str   = ""
-                               # position, when the source knows it
+                               # position, when the source knows it; used
+                               # for a tracked flight's progress
    lat       : float = math.nan
    lon       : float = math.nan
    elev_ft   : float = 0.0
@@ -252,6 +262,11 @@ class FlightInfo:
                                # not in the firmware: logo pixels, rows of
                                # (r, g, b) or None for an unlit LED
    logo        : object      = None
+                               # tracking (-t): progress 0..100, arrival
+                               # as epoch seconds, and not-found marker
+   progress    : float       = math.nan
+   eta         : float       = 0.0
+   missing     : bool        = False
 
 ###########################################################################
 ###
@@ -459,6 +474,21 @@ class AdsbFetcher:
 
    ########################################################################
 
+   def fetch_by_ident(self, ident, lat, lon):
+      """
+         use:  finds one aircraft anywhere by callsign, then tail number
+         post: returns a list of zero or more state vectors
+      """
+      for kind in ("callsign", "reg"):
+         found = self._convert(
+                    self._query(f"/{kind}/{urllib.parse.quote(ident)}"),
+                    lat, lon, None)
+         if (found):
+            return(found)
+      return([])
+
+   ########################################################################
+
    @staticmethod
    def _convert(aircraft, lat, lon, radius_km):
       out = []
@@ -484,7 +514,8 @@ class AdsbFetcher:
                   type_code     = ac.get("t") or "",
                   registration  = ac.get("r") or "")
          s.distance_km = haversine_km(lat, lon, s.lat, s.lon)
-         if (s.distance_km > radius_km):
+                               # no radius: a tracked flight, any distance
+         if ((radius_km is not None) and (s.distance_km > radius_km)):
             continue
          s.bearing_deg = bearing_deg(lat, lon, s.lat, s.lon)
          out.append(s)
@@ -555,6 +586,14 @@ class AeroAPIFetcher:
          raw = raw if (isinstance(raw, dict)) else {}
          return(AirportInfo(code_icao = raw.get("code_icao") or "",
                             code_iata = raw.get("code_iata") or ""))
+      def when(text):
+                               # AeroAPI times are ISO 8601 in UTC
+         try:
+            return(datetime.datetime.fromisoformat(
+                      text.replace("Z", "+00:00")).timestamp())
+         except (AttributeError, ValueError):
+            return(0.0)
+      progress = f.get("progress_percent")
       return(FlightInfo(
                 ident         = f.get("ident") or "",
                 ident_icao    = f.get("ident_icao") or "",
@@ -564,7 +603,13 @@ class AeroAPIFetcher:
                 operator_iata = f.get("operator_iata") or "",
                 aircraft_code = f.get("aircraft_type") or "",
                 origin        = airport(f.get("origin")),
-                destination   = airport(f.get("destination"))))
+                destination   = airport(f.get("destination")),
+                progress      = (     float(progress)
+                                 if (isinstance(progress, (int, float)))
+                                 else math.nan),
+                eta           = when(f.get("actual_on") or
+                                     f.get("estimated_on") or
+                                     f.get("scheduled_on"))))
 
 ###########################################################################
 
@@ -606,6 +651,19 @@ class AdsbdbFetcher:
                          lat       = number(raw.get("latitude")),
                          lon       = number(raw.get("longitude")),
                          elev_ft   = 0.0 if (math.isnan(elev)) else elev))
+
+   ########################################################################
+
+   def callsign_for(self, flight_number):
+      """
+         use:  ICAO callsign for an airline flight number (UA1179 ->
+               UAL1179), if adsbdb knows the route
+      """
+      route = self._get("/callsign/" + urllib.parse.quote(flight_number),
+                        "r:" + flight_number)
+      if (route and isinstance(route.get("flightroute"), dict)):
+         return(route["flightroute"].get("callsign_icao") or "")
+      return("")
 
    ########################################################################
 
@@ -808,6 +866,20 @@ class DemoFetcher:
 
    ########################################################################
 
+   def fetch_by_ident(self, ident, lat, lon):
+      return([self._state(row, lat, lon) for row in DEMO
+              if (ident == row[0])])
+
+   ########################################################################
+
+   def callsign_for(self, flight_number):
+      for row in DEMO:
+         if (row[2] and (flight_number == row[2] + row[0][3:])):
+            return(row[0])
+      return("")
+
+   ########################################################################
+
    def fetch_flight_info(self, state):
       for row in DEMO:
          if ((row[0] == state.callsign) and row[1]):
@@ -837,11 +909,12 @@ class FlightDataFetcher:
       use:  core/FlightDataFetcher: state vectors -> flight info ->
             display names
    """
-   def __init__(self, states, flights, cdn, settings):
+   def __init__(self, states, flights, cdn, settings, resolver = None):
       self.states   = states
       self.flights  = flights
       self.cdn      = cdn
       self.settings = settings
+      self.resolver = resolver
 
    ########################################################################
 
@@ -868,9 +941,44 @@ class FlightDataFetcher:
 
    ########################################################################
 
+   def fetch_tracked(self, idents):
+      """
+         use:  -t: looks up each chosen flight wherever it is
+         post: returns (state vectors, flights); a flight that is not
+               airborne or not found comes back with missing = True
+      """
+      st      = self.settings
+      states  = []
+      flights = []
+      for ident in idents:
+         found = self.states.fetch_by_ident(ident, st["lat"], st["lon"])
+         if ((not found) and self.resolver and
+             re.match(r"^[A-Z0-9]{2}[0-9]{1,4}[A-Z]?$", ident)):
+                               # an airline flight number such as UA1179:
+                               # look for its ICAO callsign (UAL1179)
+            callsign = self.resolver.callsign_for(ident)
+            if (callsign and (callsign != ident)):
+               found = self.states.fetch_by_ident(callsign, st["lat"],
+                                                  st["lon"])
+         if (not found):
+            flights.append(FlightInfo(ident = ident, missing = True))
+            continue
+         s = found[0]
+         states.append(s)
+         info = None
+         if (s.callsign):
+            info = self.flights.fetch_flight_info(s)
+         if (info is None):
+            info = FlightInfo(ident = s.callsign or s.registration or ident,
+                              aircraft_code = s.type_code)
+         flights.append(self._enrich(info, s))
+      return(states, flights)
+
+   ########################################################################
+
    def _enrich(self, info, s):
       """
-         use:  attaches the position, display names and badge
+         use:  attaches the position, display names, logo and progress
       """
       info.state = s
       if (self.cdn):
@@ -886,7 +994,31 @@ class FlightDataFetcher:
           (self.settings["layout"] == "full") and
           (info.operator_iata or info.operator_icao)):
          info.logo = badge(info.operator_iata or info.operator_icao)
+      self._progress(info)
       return(info)
+
+   ########################################################################
+
+   @staticmethod
+   def _progress(info):
+      """
+         post: fills progress and eta from the airports' positions when
+               the source (adsbdb) gave them; AeroAPI's own values stay
+      """
+      s   = info.state
+      org = info.origin
+      dst = info.destination
+      if (math.isnan(org.lat) or math.isnan(dst.lat) or math.isnan(s.lat)):
+         return
+      done = haversine_km(org.lat, org.lon, s.lat, s.lon)
+      left = haversine_km(s.lat, s.lon, dst.lat, dst.lon)
+      if (done + left <= 0):
+         return
+      if (math.isnan(info.progress)):
+         info.progress = 100.0 * done / (done + left)
+      if ((not info.eta) and (not s.on_ground) and
+          (not math.isnan(s.velocity)) and (s.velocity > 25)):
+         info.eta = time.time() + left * 1000.0 / s.velocity
 
 ###########################################################################
 ###
@@ -1083,26 +1215,51 @@ class NeoMatrixDisplay:
 
    ########################################################################
 
+   @staticmethod
+   def arrival(eta):
+      """
+         post: "ARR 8:25PM 56M"-style arrival time and time to go, or ""
+      """
+      if (not eta):
+         return("")
+      t    = time.localtime(eta)
+      left = max(0, int((eta - time.time()) // 60))
+      togo = (     f"{left // 60}H{left % 60:02d}M" if (left >= 60)
+              else f"{left}M")
+      return(f"ARR {t.tm_hour % 12 or 12}:{t.tm_min:02d}"
+             f"{'AM' if (t.tm_hour < 12) else 'PM'} {togo}")
+
+   ########################################################################
+
    def pages(self, f):
       """
          post: the pages shown for flight f: "card", then for
-               layout = full "readings"
+               layout = full "readings" and (route known) "progress";
+               "missing" for a tracked flight that was not found
       """
+      if (f.missing):
+         return(["missing"])
       if (self.settings["layout"] == "classic"):
          return(["card"])
-      return(["card", "readings"])
+      pages = ["card", "readings"]
+      if (not math.isnan(f.progress)):
+         pages.append("progress")
+      return(pages)
 
    ########################################################################
 
    def page_lines(self, f, page):
       """
-         post: the three lines of a page
+         post: the three lines of a page; None marks the progress bar
       """
       if (page == "readings"):
          r = self.readings(f)
          return(["ALT " + r["alt"],
                  f"SPD {r['spd']} TRK {r['trk']}",
                  ("VR " + r["vr"]) if (r["vr"]) else ""])
+      if (page == "progress"):
+         return([f"{self.route_text(f)}  {f.progress:.0f}%", None,
+                 self.arrival(f.eta)])
       return(self.card_lines(f))
 
    ########################################################################
@@ -1111,13 +1268,19 @@ class NeoMatrixDisplay:
       """
          use:  the flight as plain text, for -o and the text style
          post: the card's three lines, then (layout = full) the readings
+               and progress
       """
+      if (f.missing):
+         return([f.ident, "not airborne or not found", ""])
       lines = self.card_lines(f)
       if (self.settings["layout"] == "full"):
          r = self.readings(f)
          lines.append((f"{r['alt']}  {r['spd']}  {r['trk']}  {r['vr']}")
                          .replace("↑", "+").replace("↓", "-")
                          .replace("°", "").strip())
+         if (not math.isnan(f.progress)):
+            lines.append((f"{f.progress:.0f}%  " +
+                          self.arrival(f.eta)).strip())
       return(lines)
 
    ########################################################################
@@ -1128,7 +1291,7 @@ class NeoMatrixDisplay:
       h = m.height
       m.fill_screen()
       m.draw_rect(0, 0, w, h, self.color)
-      if (self.settings["layout"] == "full"):
+      if ((page != "missing") and (self.settings["layout"] == "full")):
          self.show_full(f, page)
          return
       padding  = 2
@@ -1137,7 +1300,10 @@ class NeoMatrixDisplay:
       max_cols = inner_w // 6
       total    = 3 * 8 + 2 * 1
       y        = 1 + padding + (inner_h - total) // 2
-      for line in self.card_lines(f):
+      lines    = (     [f.ident, "NOT FOUND", "OR NOT AIRBORNE"]
+                  if (page == "missing")
+                  else self.card_lines(f))
+      for line in lines:
          m.draw_text(1 + padding, y, truncate_to_columns(line, max_cols),
                      self.color)
          y += 8 + 1
@@ -1156,8 +1322,28 @@ class NeoMatrixDisplay:
          x = 3 + LOGO_SIZE + 4
       cols = (m.width - 3 - x) // 6
       for i, line in enumerate(self.page_lines(f, page)):
-         m.draw_text(x, 3 + 9 * i, truncate_to_columns(line, cols),
-                     self.color)
+         y = 3 + 9 * i
+         if (line is None):
+            self.draw_bar(x, y, m.width - 4 - x, f.progress)
+         else:
+            m.draw_text(x, y, truncate_to_columns(line, cols), self.color)
+
+   ########################################################################
+
+   def draw_bar(self, x, y, w, progress):
+      """
+         use:  outlined progress bar, filled to progress %, with a
+               marker for the plane
+      """
+      m = self.matrix
+      m.draw_rect(x, y, w, 7, self.color)
+      fill = int((w - 4) * max(0.0, min(100.0, progress)) / 100.0)
+      for j in range(y + 2, y + 5):
+         for i in range(x + 2, x + 2 + fill):
+            m.pixel(i, j, self.color)
+      for j in range(y + 1, y + 6):
+         for i in range(x + 1 + fill, x + 3 + fill):
+            m.pixel(i, j, self.color)
 
    ########################################################################
 
@@ -1331,6 +1517,7 @@ class MAIN:
       self.lock      = threading.Lock()
       self.stop      = threading.Event()
       self.fetched   = threading.Event()
+      self.track     = []
 
    ########################################################################
 
@@ -1340,6 +1527,9 @@ usage: {self.self_name} [options]
 where options are:
    -aLAT,LON    centre of the area, e.g. -a40.484,-80.037
    -rKM         radius in km
+   -tIDENTS     track up to 5 flights anywhere instead of an area:
+                callsigns, flight numbers or tail numbers, comma-
+                separated, e.g. -tUAL1179,DL402,N512GA
    -cFILE       settings file (default flightwall.ini beside the
                 script; created with defaults on first run)
    -sSTYLE      half (LED matrix, default) or text (plain lines)
@@ -1381,6 +1571,10 @@ Ctrl+C stops it.""")
             "lat"              : loc.getfloat("center_lat"),
             "lon"              : loc.getfloat("center_lon"),
             "radius_km"        : loc.getfloat("radius_km"),
+            "track"            : [t for t in re.split(
+                                     r"[,\s]+",
+                                     ini["tracking"].get("flights").upper())
+                                  if (t)],
             "opensky_id"       : api.get("opensky_client_id").strip(),
             "opensky_secret"   : api.get("opensky_client_secret").strip(),
             "aeroapi_key"      : api.get("aeroapi_key").strip(),
@@ -1447,9 +1641,15 @@ Ctrl+C stops it.""")
    def build_fetcher(self, st, demo):
       if (demo):
          fake = DemoFetcher()
-         return(FlightDataFetcher(fake, fake, None, st), "demo")
+         return(FlightDataFetcher(fake, fake, None, st, fake), "demo")
       want = st["state_source"]
-      if ((want == "opensky") or
+      if (st["mode"] == "track"):
+                               # OpenSky can only find a callsign by
+                               # downloading the whole world (4 credits a
+                               # time), so tracking always uses the feed
+         states = AdsbFetcher()
+         names  = ["airplanes.live"]
+      elif ((want == "opensky") or
           ((want == "auto") and st["opensky_id"] and st["opensky_secret"])):
          if (not (st["opensky_id"] and st["opensky_secret"])):
             raise(ExceptionClass("state_source = opensky needs "
@@ -1465,19 +1665,26 @@ Ctrl+C stops it.""")
          if (not st["aeroapi_key"]):
             raise(ExceptionClass("flight_source = aeroapi needs "
                                  "aeroapi_key", self.self_name))
-         flights = AeroAPIFetcher(st["aeroapi_key"])
+                               # tracked arrival times go stale; refresh
+                               # every 10 minutes (each refresh is billed)
+         flights = AeroAPIFetcher(st["aeroapi_key"],
+                                  600 if (st["mode"] == "track") else 1800)
          names.append("aeroapi")
       else:
          flights = AdsbdbFetcher()
          names.append("adsbdb")
       cdn = FlightWallFetcher() if (st["use_cdn"]) else None
-      return(FlightDataFetcher(states, flights, cdn, st), "+".join(names))
+      return(FlightDataFetcher(states, flights, cdn, st, AdsbdbFetcher()),
+             "+".join(names))
 
    ########################################################################
 
    def fetch_once(self, fetcher, source):
       try:
-         states, flights = fetcher.fetch_flights()
+         if (self.track):
+            states, flights = fetcher.fetch_tracked(self.track)
+         else:
+            states, flights = fetcher.fetch_flights()
       except FetchError as error:
          Log.line(f"fetch failed: {error}")
          with self.lock:
@@ -1493,8 +1700,11 @@ Ctrl+C stops it.""")
                   f"{f.origin.code_icao}>{f.destination.code_icao}", 1)
       with self.lock:
          self.flights = flights
-         self.status  = (f"{source}  {len(states)} aircraft, "
-                         f"{len(flights)} identified  ")
+         self.status  = (     f"{source}  tracking {len(flights)}, "
+                              f"{len(states)} found  "
+                         if (self.track)
+                         else f"{source}  {len(states)} aircraft, "
+                              f"{len(flights)} identified  ")
          self.status += time.strftime("%H:%M:%S")
       self.fetched.set()
 
@@ -1509,7 +1719,7 @@ Ctrl+C stops it.""")
 
    def execute(self, args):
       try:
-         opts, rest = getopt.getopt(args, "a:r:c:s:g:l:odvh")
+         opts, rest = getopt.getopt(args, "a:r:t:c:s:g:l:odvh")
       except getopt.GetoptError as error:
          self.usage()
          raise(ExceptionClass(str(error), self.self_name, E_USAGE))
@@ -1531,6 +1741,12 @@ Ctrl+C stops it.""")
                override.update({"lat": lat, "lon": lon})
             elif (option == "-r"):
                override["radius_km"] = float(value)
+            elif (option == "-t"):
+               override["track"] = [t for t in re.split(r"[,\s]+",
+                                                        value.upper())
+                                    if (t)]
+               if (not override["track"]):
+                  raise(ValueError(value))
             elif (option == "-c"):
                ini_path = value
             elif (option == "-s"):
@@ -1555,6 +1771,11 @@ Ctrl+C stops it.""")
       st.update(override)
       if ("size" in st):
          st["width"], st["height"] = st["size"]
+      if (len(st["track"]) > 5):
+         raise(ExceptionClass("track at most 5 flights", self.self_name,
+                              E_USAGE))
+      self.track = st["track"]
+      st["mode"] = "track" if (self.track) else "area"
       try:
          color = tuple(int(st["text_color"][i:i + 2], 16)
                        for i in (0, 2, 4))
@@ -1573,8 +1794,10 @@ Ctrl+C stops it.""")
       fetcher, source = self.build_fetcher(st, demo)
       display         = NeoMatrixDisplay(st["width"], st["height"],
                                          color, st)
-      Log.line(f"FlightWall {source} at {st['lat']},{st['lon']} "
-               f"radius {st['radius_km']} km")
+      Log.line(     f"FlightWall {source} tracking "
+                    f"{', '.join(self.track)}" if (self.track)
+               else f"FlightWall {source} at {st['lat']},{st['lon']} "
+                    f"radius {st['radius_km']} km")
 
       if (once):
          self.fetch_once(fetcher, source)
