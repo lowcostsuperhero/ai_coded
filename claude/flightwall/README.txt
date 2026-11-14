@@ -62,10 +62,13 @@ KBOS or Landed at KBOS. "At" is green; Approaching, Landing at and
 Landed at are red; the rest are white. The progress bar is green, and
 turns red while the plane is landing and once it has landed. The
 climb rate's unit is dropped when the line would be too long.
-Takeoff and landing times sit at the ends of the bar when known:
-both with AeroAPI; with the free route data only the estimated
-landing time. Private planes without a route show "Route unknown"
-and no bar.
+Takeoff and landing times sit at the ends of the bar, "--:--" when
+not known. With AeroAPI they are FlightAware's. With the free route
+data the landing time is estimated in the air, and flightwall notes
+the time it sees a plane take off (last seen on the ground, now in
+the air) and land (last seen in the air, now on the ground at its
+destination), to within one fetch interval. Private
+planes without a route show "Route unknown" and no bar.
 
 Window size: the panel is always drawn pixel for pixel, never
 scaled, because a bitmap font can't be resized and stay crisp. In a
