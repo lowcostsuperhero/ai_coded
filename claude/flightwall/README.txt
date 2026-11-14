@@ -51,24 +51,25 @@ needs a terminal of 128 columns by 37 rows.
    [logo]  flight number (UA1179), else callsign or airline
            route and % flown (KEWR>KDEN  48%)
            aircraft (Boeing 737-900 when it fits)
-   takeoff time ---green progress bar--- landing time
-                   time flown | time to go
    altitude                          speed
    track (heading)        climb/descent rate
    what the plane is doing
+   takeoff time ---green progress bar--- landing time
+                   time flown | time to go
 
-The bottom line says At KPIT (on the ground, not yet departed),
+The line above the bar says At KPIT (on the ground, not yet departed),
 Departing KPIT, Over <town>, Near <town>, Approaching KBOS, Landing at
 KBOS or Landed at KBOS. "At" is green; Approaching, Landing at and
 Landed at are red; the rest are white. The progress bar is green, and
-turns red once the plane has landed. The
-climb rate's unit is dropped when the line would be too long.
+turns red once the plane has landed. The climb rate's unit is
+dropped when the line would be too long.
 Takeoff and landing times sit at the ends of the bar, "--:--" when
 not known. Below the bar's marker are the time flown so far and the
 time to go (hours:minutes, "-:--" when not known). Both start white;
 at takeoff the time flown turns green; once landed it shows the whole
-flight's time (still green) and the time to go is a red 0:00. With AeroAPI they are FlightAware's. With the free route
-data the landing time is estimated in the air, and flightwall notes
+flight's time (still green) and the time to go is a red 0:00. With
+AeroAPI the times are FlightAware's. With the free route data the
+landing time is estimated in the air, and flightwall notes
 the time it sees a plane take off (last seen on the ground, now in
 the air) and land (last seen in the air, now on the ground at its
 destination), to within one fetch interval. Private
