@@ -86,9 +86,15 @@ Data sources
 ------------
 Live positions: airplanes.live (free), or OpenSky with an account.
 Routes: adsbdb.com (free), or FlightAware AeroAPI with a key (paid
-per lookup). Airline logos: images.kiwi.com. To use your own, put
-<ICAO>.png or <IATA>.png (e.g. UAL.png) in a "logos" folder beside
-the script.
+per lookup). Airline logos: images.kiwi.com (the 128-pixel logo, else
+the 64-pixel one). To use your own, put <ICAO>.png or <IATA>.png
+(e.g. UAL.png) in a "logos" folder beside the script; any size works.
+
+The logo is drawn as a real picture in terminals that can show Sixel
+images (Windows Terminal 1.22 or later, and many Linux terminals):
+the script asks the terminal at startup. Elsewhere, e.g. an old
+cmd.exe console window, it is drawn in LEDs (26 x 26). Set
+logo_graphics = leds or sixel in the .ini to choose yourself.
 
 Files downloaded once and kept beside the script:
 - airports.csv: airport codes and positions from OurAirports (public

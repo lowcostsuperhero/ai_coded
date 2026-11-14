@@ -118,7 +118,14 @@ layout = wall
 # the airline's codes; a PNG in a "logos" folder beside this script
 # named <ICAO>.png or <IATA>.png is used first, if there is one
 show_logo = yes
-logo_url  = https://images.kiwi.com/airlines/64/{iata}.png
+# several templates may be given, separated by commas: the first that
+# has the logo is used (the larger one looks better as a picture)
+logo_url  = https://images.kiwi.com/airlines/128/{iata}.png,
+            https://images.kiwi.com/airlines/64/{iata}.png
+# how the logo is drawn: auto (a picture if the terminal can show
+# Sixel images, e.g. Windows Terminal 1.22 or later; LEDs otherwise),
+# sixel or leds
+logo_graphics = auto
 # units: speed kt|mph|kmh|mps|mach, altitude ft|m,
 # vertical rate fpm|mps, track deg|card|both
 speed_unit         = kt
@@ -297,6 +304,10 @@ class FlightInfo:
                                # not in the firmware: logo pixels, rows of
                                # (r, g, b) or None for an unlit LED
    logo        : object      = None
+                               # logo as a picture, for Sixel terminals:
+                               # (width, height, RGBA rows), and its key
+   logo_image  : object      = None
+   logo_key    : str         = ""
                                # tracking (-t): progress 0..100, arrival
                                # as epoch seconds, and not-found marker
    progress    : float       = math.nan
@@ -1192,12 +1203,41 @@ class LogoFetcher:
    """
       name: LogoFetcher
       use:  airline logos, from the "logos" folder beside the script or
-            the logo_url template, decoded and shrunk for the panel
+            the logo_url templates (tried in order), decoded and shrunk
+            for the panel
+      post: get() returns {"leds": LOGO_SIZE square of LED colours,
+            "image": (width, height, RGBA rows)} or None; the image is
+            what the Sixel logo is drawn from
    """
-   def __init__(self, url_template, folder):
-      self.url_template = url_template
-      self.folder       = folder
-      self.cache        = TtlCache()
+   def __init__(self, url_templates, folder):
+      self.url_templates = [u.strip() for u in url_templates.split(",")
+                            if (u.strip())]
+      self.folder        = folder
+      self.cache         = TtlCache()
+
+   ########################################################################
+
+   def _download(self, iata, icao):
+      """
+         post: returns (PNG bytes or None, ok); ok is False when the
+               network failed rather than the logo being missing
+      """
+      for template in self.url_templates:
+         if ((("{iata}" in template) and (not iata)) or
+             (("{icao}" in template) and (not icao))):
+            continue
+         url     = template.replace("{iata}", iata).replace("{icao}", icao)
+         request = urllib.request.Request(url, headers = {
+                      "User-Agent": USER_AGENT})
+         try:
+            with urllib.request.urlopen(request, timeout = 8) as reply:
+               return(reply.read(), True)
+         except urllib.error.HTTPError:
+            continue
+         except (urllib.error.URLError, OSError) as error:
+            Log.line(f"LogoFetcher: {error}")
+            return(None, False)
+      return(None, True)
 
    ########################################################################
 
@@ -1211,32 +1251,22 @@ class LogoFetcher:
       if (hit):
          return(value)
       data = None
+      ok   = True
       for code in (icao, iata):
          path = os.path.join(self.folder, code + ".png")
          if (code and os.path.isfile(path)):
             with open(path, "rb") as handle:
                data = handle.read()
             break
-      ok = True
-      if ((data is None) and self.url_template and
-          ((iata or "{iata}" not in self.url_template) and
-           (icao or "{icao}" not in self.url_template))):
-         url = (self.url_template.replace("{iata}", iata)
-                                 .replace("{icao}", icao))
-         request = urllib.request.Request(url, headers = {
-                      "User-Agent": USER_AGENT})
-         try:
-            with urllib.request.urlopen(request, timeout = 8) as reply:
-               data = reply.read()
-         except urllib.error.HTTPError:
-            pass
-         except (urllib.error.URLError, OSError) as error:
-            Log.line(f"LogoFetcher: {error}")
-            ok = False
+      if (data is None):
+         data, ok = self._download(iata, icao)
       value = None
       if (data):
          try:
-            value = logo_pixels(*png_decode(data))
+            image = png_decode(data)
+            value = {"leds" : logo_pixels(*image),
+                     "image": image,
+                     "key"  : key}
          except (ValueError, zlib.error, struct.error,
                  IndexError) as error:
             Log.line(f"LogoFetcher: {key}: {error}")
@@ -1247,38 +1277,242 @@ class LogoFetcher:
 
 ###########################################################################
 
-def demo_logo(color, style):
+def demo_logo(color, style, size = LOGO_SIZE):
    """
-      use:  invented logo art for demo mode (no real airline's logo)
+      use:  invented logo art for demo mode (no real airline's logo),
+            drawn at size x size from shapes in a 0..1 square
+      post: rows of (r, g, b) or None
    """
-   size = LOGO_SIZE
-   art  = Matrix(size, size)
-   half = (size - 1) / 2.0
+   art = Matrix(size, size)
    for y in range(size):
       for x in range(size):
+         u = (x + 0.5) / size
+         v = (y + 0.5) / size
          if (style == 0):
-                               # tail fin on a white tile
-            inside = (min(x, size - 1 - x, y, size - 1 - y) >= 0)
-            corner = (math.hypot(max(0, abs(x - half) - 9),
-                                 max(0, abs(y - half) - 9)) > 3.5)
-            if (inside and not corner):
+                               # tail fin on a white rounded tile
+            cx = max(0.0, abs(u - 0.5) - 0.32)
+            cy = max(0.0, abs(v - 0.5) - 0.32)
+            if (math.hypot(cx, cy) <= 0.16):
                art.pixel(x, y, (255, 255, 255))
-            if ((5 <= y <= 22) and (x >= 6 + (22 - y) * 0.5) and
-                (x <= 12 + (22 - y) * 0.6)):
+            left  = 0.24 + (0.86 - v) * 0.50
+            right = 0.46 + (0.86 - v) * 0.60
+            if ((0.16 <= v <= 0.86) and (left <= u <= right)):
                art.pixel(x, y, color)
-            if ((9 <= y <= 15) and
-                (abs(x - (11 + (22 - y) * 0.55)) < 1.2)):
+            mid = 0.40 + (0.86 - v) * 0.55
+            if ((0.30 <= v <= 0.58) and (abs(u - mid) <= 0.045)):
                art.pixel(x, y, (250, 180, 20))
          else:
-                               # disc with light arcs
-            r = math.hypot(x - half, y - half)
-            if (r <= half + 0.3):
+                               # disc with three light arcs
+            r = math.hypot(u - 0.5, v - 0.5)
+            if (r <= 0.5):
                art.pixel(x, y, color)
-               for arc in (6.5, 9.5, 12.5):
-                  if ((abs(math.hypot(x - half, y - half - 6) - arc)
-                       < 0.8) and (y < half + 2)):
+               for arc in (0.25, 0.37, 0.49):
+                  if ((abs(math.hypot(u - 0.5, v - 0.73) - arc) < 0.035)
+                      and (v < 0.58)):
                      art.pixel(x, y, (230, 245, 245))
    return(art.pixels)
+
+###########################################################################
+
+def demo_logo_set(color, style):
+   """
+      post: the demo logo in the form LogoFetcher.get() gives
+   """
+   big   = demo_logo(color, style, 128)
+   image = (128, 128, [[(c + (255,)) if (c) else (0, 0, 0, 0)
+                        for c in row] for row in big])
+   return({"leds" : demo_logo(color, style),
+           "image": image,
+           "key"  : f"demo{color}{style}"})
+
+###########################################################################
+###
+### s i x e l
+###
+###########################################################################
+
+def scale_image(width, height, rows, box_w, box_h, scale = 1.0):
+   """
+      use:  fits an RGBA image into a box_w x box_h box (centred),
+            bilinear when growing, box-averaged when shrinking, and
+            composites it on black
+      post: rows of (r, g, b) or None (transparent / unlit)
+      usage: scale is the panel brightness, 0..1
+   """
+   fit  = min(box_w / float(width), box_h / float(height))
+   tw   = max(1, int(round(width * fit)))
+   th   = max(1, int(round(height * fit)))
+   ox   = (box_w - tw) // 2
+   oy   = (box_h - th) // 2
+   out  = [[None] * box_w for row in range(box_h)]
+   grow = (fit >= 1.0)
+   for ty in range(th):
+      for tx in range(tw):
+         if (grow):
+                               # bilinear: the 4 nearest source pixels
+            sx = min(width - 1.0, max(0.0, (tx + 0.5) / fit - 0.5))
+            sy = min(height - 1.0, max(0.0, (ty + 0.5) / fit - 0.5))
+            x0 = int(sx)
+            y0 = int(sy)
+            x1 = min(width - 1, x0 + 1)
+            y1 = min(height - 1, y0 + 1)
+            fx = sx - x0
+            fy = sy - y0
+            taps = ((x0, y0, (1 - fx) * (1 - fy)), (x1, y0, fx * (1 - fy)),
+                    (x0, y1, (1 - fx) * fy),       (x1, y1, fx * fy))
+         else:
+            x0 = int(tx / fit)
+            x1 = max(x0 + 1, int((tx + 1) / fit))
+            y0 = int(ty / fit)
+            y1 = max(y0 + 1, int((ty + 1) / fit))
+            n  = float((x1 - x0) * (y1 - y0))
+            taps = [(x, y, 1.0 / n) for y in range(y0, min(y1, height))
+                                    for x in range(x0, min(x1, width))]
+         r = g = b = a = 0.0
+         for x, y, w in taps:
+            pr, pg, pb, pa = rows[y][x]
+            k  = w * pa / 255.0
+            r += pr * k
+            g += pg * k
+            b += pb * k
+            a += w * pa
+         if (a < 64):
+            continue
+         out[oy + ty][ox + tx] = (int(r * scale), int(g * scale),
+                                  int(b * scale))
+   return(out)
+
+###########################################################################
+
+def sixel_encode(pixels, top_pad = 0):
+   """
+      use:  turns rows of (r, g, b) / None into a Sixel image; None
+            pixels are transparent so the panel shows through
+      usage: top_pad = transparent rows added on top (used to start the
+            picture half a character cell down)
+      imp:  up to 255 colours: the colours are reduced to 5, 4 or 3 bits
+            per channel until they fit
+   """
+   rows   = [[None] * len(pixels[0])] * top_pad + pixels
+   height = len(rows)
+   width  = len(rows[0])
+   for bits in (5, 4, 3, 2):
+      shift = 8 - bits
+      seen  = {}
+      for row in rows:
+         for c in row:
+            if (c is not None):
+               key = (c[0] >> shift, c[1] >> shift, c[2] >> shift)
+               seen[key] = seen.get(key, 0) + 1
+      if (len(seen) <= 255):
+         break
+   index = {key: i + 1 for i, key in enumerate(seen)}
+   half  = (1 << shift) >> 1
+   out   = ["\x1bP0;1;0q", f'"1;1;{width};{height}']
+   for key, i in index.items():
+      rgb = [min(255, (v << shift) + half) if (shift) else v for v in key]
+      out.append("#%d;2;%d;%d;%d" % ((i,) + tuple(v * 100 // 255
+                                                   for v in rgb)))
+   for band in range(0, height, 6):
+      used = {}
+      for dy in range(6):
+         if (band + dy >= height):
+            break
+         for x, c in enumerate(rows[band + dy]):
+            if (c is not None):
+               key  = (c[0] >> shift, c[1] >> shift, c[2] >> shift)
+               cols = used.setdefault(index[key], [0] * width)
+               cols[x] |= 1 << dy
+      parts = []
+      for i, cols in used.items():
+         line = ["#%d" % i]
+         x    = 0
+                               # run-length: !count char for repeats
+         while (x < width):
+            run = 1
+            while ((x + run < width) and (cols[x + run] == cols[x])):
+               run += 1
+            ch = chr(63 + cols[x])
+            line.append(f"!{run}{ch}" if (run > 3) else ch * run)
+            x += run
+         parts.append("".join(line))
+      out.append("$".join(parts) + "-")
+   out.append("\x1b\\")
+   return("".join(out))
+
+###########################################################################
+
+def query_terminal(request, timeout = 0.6):
+   """
+      use:  sends a query sequence and collects the terminal's answer
+      post: returns what came back (may be "" if nothing did)
+      imp:  needs a real console on stdin; Windows wants virtual
+            terminal input switched on to pass the answer through
+   """
+   if (not (sys.stdin.isatty() and sys.stdout.isatty())):
+      return("")
+   answer = ""
+   if (os.name == "nt"):
+      import ctypes
+      import msvcrt
+      kernel32 = ctypes.windll.kernel32
+      handle   = kernel32.GetStdHandle(-10)
+      mode     = ctypes.c_uint32()
+      if (not kernel32.GetConsoleMode(handle, ctypes.byref(mode))):
+         return("")
+                               # virtual terminal input on; line input,
+                               # echo and processed input off
+      kernel32.SetConsoleMode(handle, (mode.value | 0x0200) & ~0x0007)
+      try:
+         sys.stdout.write(request)
+         sys.stdout.flush()
+         end = time.time() + timeout
+         while (time.time() < end):
+            if (msvcrt.kbhit()):
+               answer += msvcrt.getwch()
+               end     = max(end, time.time() + 0.05)
+            else:
+               time.sleep(0.01)
+      finally:
+         kernel32.SetConsoleMode(handle, mode.value)
+      return(answer)
+   import select
+   import termios
+   import tty
+   fd  = sys.stdin.fileno()
+   old = termios.tcgetattr(fd)
+   try:
+      tty.setcbreak(fd)
+      sys.stdout.write(request)
+      sys.stdout.flush()
+      end = time.time() + timeout
+      while (time.time() < end):
+         ready, _, _ = select.select([fd], [], [], 0.05)
+         if (ready):
+            answer += os.read(fd, 256).decode("latin-1")
+            end     = max(end, time.time() + 0.05)
+   finally:
+      termios.tcsetattr(fd, termios.TCSADRAIN, old)
+   return(answer)
+
+###########################################################################
+
+def sixel_support():
+   """
+      post: returns (supported, (cell width, cell height) in pixels)
+      imp:  the Device Attributes answer lists 4 when Sixel works; the
+            cell size comes from CSI 16 t (Windows Terminal answers with
+            its fixed 10x20 Sixel cell), else 10x20 is assumed
+   """
+   answer = query_terminal("\x1b[c")
+   match  = re.search(r"\x1b\[\?([0-9;]*)c", answer)
+   if ((not match) or ("4" not in match.group(1).split(";"))):
+      return(False, (10, 20))
+   answer = query_terminal("\x1b[16t")
+   match  = re.search(r"\x1b\[6;(\d+);(\d+)t", answer)
+   if (match and int(match.group(1)) and int(match.group(2))):
+      return(True, (int(match.group(2)), int(match.group(1))))
+   return(True, (10, 20))
 
 ###########################################################################
 ###
@@ -1423,7 +1657,8 @@ class DemoFetcher:
                       off_time    = (     time.time() - flown * 60
                                      if (flown)
                                      else 0.0))
-            info.logo = demo_logo(row[8], row[9])
+            FlightDataFetcher.apply_logo(info, demo_logo_set(row[8],
+                                                             row[9]))
             return(info)
       return(None)
 
@@ -1510,6 +1745,18 @@ class FlightDataFetcher:
 
    ########################################################################
 
+   @staticmethod
+   def apply_logo(info, logo):
+      """
+         use:  stores a LogoFetcher.get() result on the flight
+      """
+      if (logo):
+         info.logo       = logo["leds"]
+         info.logo_image = logo["image"]
+         info.logo_key   = logo["key"]
+
+   ########################################################################
+
    def _enrich(self, info, s):
       """
          use:  attaches the position, display names, logo and progress
@@ -1528,7 +1775,7 @@ class FlightDataFetcher:
             if (name):
                info.aircraft_display_name_full = name
       if (self.logos and (info.logo is None)):
-         info.logo = self.logos.get(info)
+         self.apply_logo(info, self.logos.get(info))
       if (self.airports):
                                # AeroAPI gives codes only; positions and
                                # elevations come from OurAirports
@@ -1695,6 +1942,9 @@ class NeoMatrixDisplay:
       self.matrix   = Matrix(width, height)
       self.color    = color
       self.settings = settings
+                               # a Sixel logo to draw over the panel:
+                               # {"key", "image", "x", "y", "size"}
+      self.overlay  = None
 
    ########################################################################
 
@@ -1911,6 +2161,7 @@ class NeoMatrixDisplay:
    ########################################################################
 
    def show_flight(self, f, page = "wall"):
+      self.overlay = None
       m = self.matrix
       w = m.width
       h = m.height
@@ -1974,7 +2225,16 @@ class NeoMatrixDisplay:
       w = m.width
       x = 3
       if (self.settings["show_logo"] and f.logo):
-         m.draw_image(3, 3, f.logo)
+         if (self.settings.get("sixel") and f.logo_image):
+                               # left dark: the renderer paints the logo
+                               # there as a picture
+            self.overlay = {"key"  : f.logo_key,
+                            "image": f.logo_image,
+                            "x"    : 3,
+                            "y"    : 3,
+                            "size" : LOGO_SIZE}
+         else:
+            m.draw_image(3, 3, f.logo)
          x = 3 + LOGO_SIZE + 3
       cols  = (w - 3 - x) // 6
       route = self.route_text(f)
@@ -2046,6 +2306,7 @@ class NeoMatrixDisplay:
    ########################################################################
 
    def show_loading(self):
+      self.overlay = None
       m = self.matrix
       m.fill_screen()
       m.draw_rect(0, 0, m.width, m.height, (255, 255, 255))
@@ -2055,6 +2316,7 @@ class NeoMatrixDisplay:
    ########################################################################
 
    def show_message(self, message):
+      self.overlay = None
       m = self.matrix
       m.fill_screen()
       m.draw_text(0, (m.height - 6) // 2,
@@ -2098,9 +2360,12 @@ class TerminalRenderer:
    """
    OFF = (22, 22, 22)
 
-   def __init__(self, brightness):
-      self.scale = max(0, min(255, brightness)) / 255.0
-      self.last  = None
+   def __init__(self, brightness, sixel = False, cell = (10, 20)):
+      self.scale  = max(0, min(255, brightness)) / 255.0
+      self.last   = None
+      self.sixel  = sixel
+      self.cell   = cell
+      self.images = {}
 
    ########################################################################
 
@@ -2125,7 +2390,7 @@ class TerminalRenderer:
 
    ########################################################################
 
-   def draw(self, matrix, status):
+   def draw(self, matrix, status, overlay = None):
       """
          use:  paints the panel pixel for pixel, centred in the terminal
          imp:  never scaled, since a bitmap font can't be resized and
@@ -2134,7 +2399,8 @@ class TerminalRenderer:
                larger one centres it at full size
       """
       size = shutil.get_terminal_size((80, 24))
-      key  = (matrix.key(), status, size)
+      key  = (matrix.key(), status, size,
+              overlay["key"] if (overlay) else None)
       if (key == self.last):
          return
       self.last = key
@@ -2166,8 +2432,39 @@ class TerminalRenderer:
       if (top + rows < size.lines):
          out.append(f"\x1b[{top + rows + 1};{left + 1}H\x1b[0m\x1b[2m"
                     + status[:cols] + "\x1b[0m")
+      if (overlay and self.sixel):
+         out.append(self._picture(overlay, left, top, size))
       sys.stdout.write("".join(out))
       sys.stdout.flush()
+
+   ########################################################################
+
+   def _picture(self, overlay, left, top, size):
+      """
+         use:  the logo as a Sixel picture over its patch of the panel
+         post: returns the escape sequence, or "" when the patch is not
+               wholly in the window (a cut-off picture would scroll)
+         imp:  one LED is one cell wide and half a cell high, so the
+               patch is size cells wide and size / 2 cells high; a patch
+               starting on an odd LED row starts half a cell down
+      """
+      cw, ch = self.cell
+      x      = overlay["x"]
+      y      = overlay["y"]
+      n      = overlay["size"]
+      col    = left + x
+      row    = top + y // 2
+      if ((col + n > size.columns) or
+          (top + (y + n + 1) // 2 >= size.lines)):
+         return("")
+      key = (overlay["key"], cw, ch, self.scale)
+      if (key not in self.images):
+         w, h, rgba = overlay["image"]
+         box_w      = n * cw
+         box_h      = n * ch // 2
+         pixels     = scale_image(w, h, rgba, box_w, box_h, self.scale)
+         self.images[key] = sixel_encode(pixels, (y % 2) * ch // 2)
+      return(f"\x1b[{row + 1};{col + 1}H" + self.images[key])
 
 ###########################################################################
 
@@ -2306,6 +2603,8 @@ Ctrl+C stops it.""")
                                              ).replace("full", "wall"),
             "show_logo"        : dsp.getboolean("show_logo"),
             "logo_url"         : dsp.get("logo_url").strip(),
+            "logo_graphics"    : self.choice(dsp, "logo_graphics",
+                                             ("auto", "sixel", "leds")),
             "speed_unit"       : self.choice(dsp, "speed_unit",
                                              ("kt", "mph", "kmh", "mps",
                                               "mach")),
@@ -2598,7 +2897,16 @@ Ctrl+C stops it.""")
          print(f"{self.self_name}: this console cannot show colours; "
                "using -stext", file = sys.stderr)
          st["style"] = "text"
-      renderer = (     TerminalRenderer(st["brightness"])
+      st["sixel"] = False
+      cell        = (10, 20)
+      if ((st["style"] == "half") and (st["layout"] == "wall") and
+          st["show_logo"] and (st["logo_graphics"] != "leds")):
+                               # ask the terminal whether it can show
+                               # pictures (and how big a cell is)
+         st["sixel"], cell = sixel_support()
+         if (st["logo_graphics"] == "sixel"):
+            st["sixel"] = True
+      renderer = (     TerminalRenderer(st["brightness"], st["sixel"], cell)
                   if (st["style"] == "half")
                   else TextRenderer(display))
 
@@ -2657,7 +2965,7 @@ Ctrl+C stops it.""")
             display.show_loading()
             lines = ["..."]
          if (half):
-            renderer.draw(display.matrix, status)
+            renderer.draw(display.matrix, status, display.overlay)
          else:
             renderer.draw_card(lines, status)
          time.sleep(0.25)
