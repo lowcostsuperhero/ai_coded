@@ -2340,10 +2340,10 @@ class NeoMatrixDisplay:
                for the plane; small takeoff and landing times at the
                ends, "--:--" when not known, so the bar is the same
                length on every flight
-         usage: state from phase(): the bar is red while landing and
-               once landed, green before that
+         usage: state from phase(): the bar turns red once the plane has
+               landed, green until then
       """
-      lit, dim = (     (RED, DIM_RED) if (state in ("landing", "landed"))
+      lit, dim = (     (RED, DIM_RED) if (state == "landed")
                   else (GREEN, DIM_GREEN))
       m   = self.matrix
       off = self.clock(f.off_time) or "--:--"

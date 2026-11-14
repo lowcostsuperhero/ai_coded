@@ -60,7 +60,7 @@ The bottom line says At KPIT (on the ground, not yet departed),
 Departing KPIT, Over <town>, Near <town>, Approaching KBOS, Landing at
 KBOS or Landed at KBOS. "At" is green; Approaching, Landing at and
 Landed at are red; the rest are white. The progress bar is green, and
-turns red while the plane is landing and once it has landed. The
+turns red once the plane has landed. The
 climb rate's unit is dropped when the line would be too long.
 Takeoff and landing times sit at the ends of the bar, "--:--" when
 not known. With AeroAPI they are FlightAware's. With the free route
