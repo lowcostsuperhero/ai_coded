@@ -43,8 +43,8 @@ E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-REVISION   = "1.3"
-USER_AGENT = "flightwall/1.3 (personal, non-commercial)"
+REVISION   = "1.4"
+USER_AGENT = "flightwall/1.4 (personal, non-commercial)"
 
 OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
                      "opensky-network/protocol/openid-connect/token")
@@ -86,8 +86,14 @@ opensky_client_secret =
 aeroapi_key           =
 # auto | opensky | adsb       (auto: opensky if credentials are set)
 state_source  = auto
-# auto | aeroapi | adsbdb     (auto: aeroapi if a key is set)
+# auto | aeroapi | adsbdb
+#    auto:    adsbdb, plus AeroAPI (when a key is set) only for routes
+#             adsbdb doesn't know or that don't fit where the plane is
+#    aeroapi: AeroAPI for every flight (soon past the free allowance)
 flight_source = auto
+# most AeroAPI calls a month (UTC); 0 = no limit. The Personal tier's
+# free $5 a month buys 1,000 flight lookups at $0.005 each
+aeroapi_monthly_limit = 900
 # airline/aircraft display names from TheFlightWall CDN: yes | no
 use_flightwall_cdn = yes
 
@@ -832,17 +838,69 @@ class AdsbFetcher:
 ###
 ###########################################################################
 
+class AeroBudget:
+   """
+      name: AeroBudget
+      use:  counts AeroAPI calls month by month in flightwall_aeroapi.json
+            so a wall left running stays inside FlightAware's free
+            allowance
+      imp:  months are UTC months; a limit of 0 means no limit
+   """
+   def __init__(self, limit):
+      self.limit  = limit
+      self.path   = data_path("flightwall_aeroapi.json")
+      self.warned = ""
+      self.month  = ""
+      self.calls  = 0
+      try:
+         with open(self.path, "r", encoding = "utf-8") as handle:
+            saved = json.load(handle)
+         self.month = str(saved["month"])
+         self.calls = int(saved["calls"])
+      except (OSError, ValueError, KeyError, TypeError):
+         pass
+
+   ########################################################################
+
+   def take(self):
+      """
+         post: returns True and counts one call when this month's limit
+               allows it, else False
+      """
+      month = time.strftime("%Y-%m", time.gmtime())
+      if (month != self.month):
+         self.month = month
+         self.calls = 0
+      if (self.limit and (self.calls >= self.limit)):
+         if (self.warned != month):
+            Log.line(f"AeroAPI: {self.calls} calls this month, the "
+                     f"limit; using the free route data until next "
+                     f"month")
+            self.warned = month
+         return(False)
+      self.calls += 1
+      try:
+         with open(self.path, "w", encoding = "utf-8") as handle:
+            json.dump({"month": self.month, "calls": self.calls}, handle)
+      except OSError:
+         pass
+      return(True)
+
+###########################################################################
+
 class AeroAPIFetcher:
    """
       name: AeroAPIFetcher
       use:  adapters/AeroAPIFetcher: GET /flights/{ident} with x-apikey
       imp:  AeroAPI is billed per call while the firmware asks again
-            for every aircraft on every fetch; answers are cached here
+            for every aircraft on every fetch; answers are cached here,
+            and calls stop for the month at the budget's limit
    """
-   def __init__(self, key, ttl = 1800):
-      self.key   = key
-      self.ttl   = ttl
-      self.cache = TtlCache()
+   def __init__(self, key, ttl = 1800, budget = None):
+      self.key    = key
+      self.ttl    = ttl
+      self.budget = budget
+      self.cache  = TtlCache()
 
    ########################################################################
 
@@ -851,6 +909,8 @@ class AeroAPIFetcher:
       hit, info = self.cache.get(ident)
       if (hit):
          return(info)
+      if (self.budget and (not self.budget.take())):
+         return(None)
       try:
          status, reply = http_json(
                             f"{AEROAPI_BASE_URL}/flights/"
@@ -1686,9 +1746,15 @@ class FlightDataFetcher:
             display names
    """
    def __init__(self, states, flights, cdn, settings, logos = None,
-                resolver = None, places = None, airports = None):
+                resolver = None, places = None, airports = None,
+                backup = None):
       self.states   = states
       self.flights  = flights
+                               # AeroAPI, asked only when the free route
+                               # data has no route or one that doesn't
+                               # fit; the free data's routes are checked
+      self.backup   = backup
+      self.check    = isinstance(flights, AdsbdbFetcher)
       self.cdn      = cdn
       self.settings = settings
       self.logos    = logos
@@ -1713,7 +1779,7 @@ class FlightDataFetcher:
       for s in states:
          if (not s.callsign):
             continue
-         info = self.flights.fetch_flight_info(s)
+         info = self.route_for(s)
          if ((info is None) and st["show_unidentified"]):
             info = FlightInfo(ident = s.callsign,
                               aircraft_code = s.type_code)
@@ -1750,12 +1816,85 @@ class FlightDataFetcher:
          states.append(s)
          info = None
          if (s.callsign):
-            info = self.flights.fetch_flight_info(s)
+            info = self.route_for(s)
          if (info is None):
             info = FlightInfo(ident = s.callsign or s.registration or ident,
                               aircraft_code = s.type_code)
          flights.append(self._enrich(info, s))
       return(states, flights)
+
+   ########################################################################
+
+   def route_for(self, s):
+      """
+         use:  the flight's route from the free route data when it fits
+               where the plane is; otherwise from AeroAPI when a key is
+               set; otherwise the flight is shown without a route
+         post: returns a FlightInfo, or None when nothing is known
+         imp:  adsbdb looks routes up by callsign alone and keeps old
+               routes for re-used flight numbers (cargo flights
+               especially: ATN3310 still listed as ILN>SFO while it
+               flew ABE>AFW)
+      """
+      info = self.flights.fetch_flight_info(s)
+      if (info is None):
+                               # airline callsigns only (ATN3310); a tail
+                               # number has no route to look up
+         if (self.backup and
+             re.match(r"^[A-Z]{3}[0-9]{1,4}[A-Z]{0,2}$", s.callsign)):
+            info = self.backup.fetch_flight_info(s)
+         return(info)
+      if ((not self.check) or self.plausible(info, s)):
+         return(info)
+      org = info.origin.code_icao or info.origin.code_iata
+      dst = info.destination.code_icao or info.destination.code_iata
+      Log.line(f"{s.callsign}: route {org}>{dst} doesn't fit where the "
+               f"plane is" + ("; asking AeroAPI" if (self.backup) else ""))
+      if (self.backup):
+         better = self.backup.fetch_flight_info(s)
+         if (better):
+            return(better)
+      info.origin      = AirportInfo()
+      info.destination = AirportInfo()
+      return(info)
+
+   ########################################################################
+
+   @staticmethod
+   def plausible(info, s):
+      """
+         use:  sanity check of a route against the plane's position
+         post: returns False when the plane is well off the line between
+               the airports, behind its origin, past its destination,
+               heading away from the destination, or on the ground at
+               neither airport; True when it fits or can't be judged
+      """
+      org = info.origin
+      dst = info.destination
+      if (math.isnan(org.lat) or math.isnan(dst.lat) or math.isnan(s.lat)):
+         return(True)
+      direct = haversine_km(org.lat, org.lon, dst.lat, dst.lon)
+      done   = haversine_km(org.lat, org.lon, s.lat, s.lon)
+      left   = haversine_km(s.lat, s.lon, dst.lat, dst.lon)
+      if (s.on_ground):
+         return(min(done, left) <= 10.0)
+                               # airways, weather and vectoring add some
+                               # distance, but not this much
+      if (done + left - direct > max(150.0, 0.15 * direct)):
+         return(False)
+                               # behind the origin or beyond the
+                               # destination (75 km allows for departure
+                               # turns and approach patterns)
+      if ((left > direct + 75.0) or (done > direct + 75.0)):
+         return(False)
+                               # the right line but the wrong way: the
+                               # return leg under the same callsign
+      if ((done > 50.0) and (left > 150.0) and
+          (not math.isnan(s.heading))):
+         to_dst = bearing_deg(s.lat, s.lon, dst.lat, dst.lon)
+         if (abs((s.heading - to_dst + 180.0) % 360.0 - 180.0) > 120.0):
+            return(False)
+      return(True)
 
    ########################################################################
 
@@ -2741,6 +2880,8 @@ Ctrl+C stops it.""")
             "aeroapi_key"      : api.get("aeroapi_key").strip(),
             "state_source"     : api.get("state_source").strip().lower(),
             "flight_source"    : api.get("flight_source").strip().lower(),
+            "aeroapi_limit"    : max(0, api.getint(
+                                           "aeroapi_monthly_limit")),
             "use_cdn"          : api.getboolean("use_flightwall_cdn"),
             "fetch_interval"   : max(5, tim.getint(
                                            "fetch_interval_seconds")),
@@ -2829,19 +2970,26 @@ Ctrl+C stops it.""")
       else:
          states = AdsbFetcher()
          names  = ["airplanes.live"]
-      want = st["flight_source"]
-      if ((want == "aeroapi") or ((want == "auto") and st["aeroapi_key"])):
-         if (not st["aeroapi_key"]):
-            raise(ExceptionClass("flight_source = aeroapi needs "
-                                 "aeroapi_key", self.self_name))
+      want   = st["flight_source"]
+      backup = None
+      if ((want == "aeroapi") and (not st["aeroapi_key"])):
+         raise(ExceptionClass("flight_source = aeroapi needs "
+                              "aeroapi_key", self.self_name))
+      if (st["aeroapi_key"] and (want in ("aeroapi", "auto"))):
                                # tracked arrival times go stale; refresh
                                # every 10 minutes (each refresh is billed)
-         flights = AeroAPIFetcher(st["aeroapi_key"],
-                                  600 if (st["mode"] == "track") else 1800)
+         aero = AeroAPIFetcher(st["aeroapi_key"],
+                               600 if (st["mode"] == "track") else 1800,
+                               AeroBudget(st["aeroapi_limit"]))
+      if (want == "aeroapi"):
+         flights = aero
          names.append("aeroapi")
       else:
          flights = AdsbdbFetcher()
          names.append("adsbdb")
+         if ((want == "auto") and st["aeroapi_key"]):
+            backup = aero
+            names.append("aeroapi")
       cdn   = FlightWallFetcher() if (st["use_cdn"]) else None
       logos = None
       if (st["show_logo"] and wall):
@@ -2853,7 +3001,8 @@ Ctrl+C stops it.""")
       return(FlightDataFetcher(states, flights, cdn, st, logos,
                                AdsbdbFetcher(),
                                PlaceIndex if (wall) else None,
-                               AirportDB  if (wall) else None),
+                               AirportDB  if (wall) else None,
+                               backup),
              "+".join(names))
 
    ########################################################################
