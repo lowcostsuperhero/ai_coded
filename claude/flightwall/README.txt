@@ -8,20 +8,22 @@ browser and no extra packages: just Python 3.8 or later.
 
 Run
 ---
-   python flightwall.py -a40.4914,-80.2328 -r15  around a position
-   python flightwall.py -tUAL1179,N512GA        track flights
+   python flightwall.py PIT                    around an airport
+   python flightwall.py "brighton heights, pa"    around a place
+   python flightwall.py -x40.484,-80.037 -r8    around a position
+   python flightwall.py -fUAL1179,N512GA        follow flights
    python flightwall.py                         use the .ini
    python flightwall.py -d                      demo, no network
-   python flightwall.py -o                      print once, exit
+   python flightwall.py -o PIT                  print once, exit
    python flightwall.py -h                      all options
 
 Ctrl+C stops it.
 
 Options
 -------
-   -aLAT,LON    centre of the area
+   -xLAT,LON    centre of the area
    -rKM         radius in km
-   -tIDENTS     track up to 5 flights anywhere: callsigns (UAL1179),
+   -fIDENTS     follow up to 5 flights anywhere: callsigns (UAL1179),
                 flight numbers (UA1179) or tail numbers (N512GA)
    -cFILE       settings file (default flightwall.ini)
    -sSTYLE      half (LED panel, default) or text (plain lines)
@@ -33,6 +35,12 @@ Options
    -h           help
 
 Values attach directly to the letter: -r15, not -r 15.
+
+A place on the command line (instead of -x) can be:
+- a three-letter airport code, e.g. PIT. Three letters are always
+  tried as an airport code first, then as a place name.
+- a place name, in quotes if it has spaces: "brighton heights, pa".
+-x and a place can't be used together.
 
 The display (layout = wall)
 ---------------------------
@@ -62,7 +70,7 @@ card on the [hardware] panel (160 x 32) instead.
 Settings
 --------
 On first run the script writes flightwall.ini next to itself:
-location and radius, flights to track, API keys and data sources,
+location and radius, flights to follow, API keys and data sources,
 timing, brightness, text colour, units, logos and panel size.
 Command-line options override it for that run.
 
@@ -75,13 +83,22 @@ per lookup). Airline logos: images.kiwi.com. To use your own, put
 the script.
 
 Files downloaded once and kept beside the script:
-- airports.csv: airport positions from OurAirports (public domain),
-  about 12 MB, refreshed every 90 days. Downloaded when AeroAPI is
-  used (it gives airport codes only).
+- airports.csv: airport codes and positions from OurAirports (public
+  domain), about 12 MB, refreshed every 90 days. Downloaded the first
+  time you give a three-letter code, or when AeroAPI is used.
 - cities1000.zip: towns of 1,000+ people from GeoNames
   (geonames.org, CC BY 4.0), about 10 MB, refreshed every 180 days.
   "Over <town>" is looked up in it on your computer; no online
   service is asked about aircraft positions.
+- flightwall_places.json: place names you have looked up, so each
+  name is only ever looked up once.
+
+Place names are looked up with OpenStreetMap's Nominatim service.
+Data (c) OpenStreetMap contributors, ODbL. Its usage policy is at
+https://operations.osmfoundation.org/policies/nominatim/ - in short:
+at most one request a second, an identifying User-Agent (the script
+sends one), results cached (they are), and no bulk, automatic or
+repeated lookups. The script only asks when you type a new place name.
 
 Differences from the firmware
 -----------------------------
@@ -93,4 +110,4 @@ Differences from the firmware
   redraws after each 30 s fetch.
 - Aircraft are listed nearest first.
 - Logo, readings, progress, times and flight phase (layout = wall),
-  and flight tracking (-t) are additions.
+  flight following (-f), and place-name lookup are additions.
