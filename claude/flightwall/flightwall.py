@@ -174,7 +174,8 @@ TINY_3X5 = {"0": "111101101101111", "1": "010110010010111",
             "4": "101101111001001", "5": "111100111001111",
             "6": "111100111101111", "7": "111001010010010",
             "8": "111101111101111", "9": "111101111001111",
-            "A": "010101111101101", "P": "110101110100100"}
+            "A": "010101111101101", "P": "110101110100100",
+            "-": "000000111000000"}
 
 FONT_EXTRA = {
    "\u00b0": bytes.fromhex("00000000182424180000000000000000"),
@@ -1684,6 +1685,9 @@ class FlightDataFetcher:
       self.resolver = resolver
       self.places   = places
       self.airports = airports
+                               # times seen happen: flight key ->
+                               # {"off", "on", "ground", "seen"}
+      self.history  = {}
 
    ########################################################################
 
@@ -1789,7 +1793,59 @@ class FlightDataFetcher:
       if (self.places and (not math.isnan(s.lat))):
          info.where = self.places.describe(s.lat, s.lon)
       self._progress(info)
+      self._remember(info)
       return(info)
+
+   ########################################################################
+
+   def _remember(self, info):
+      """
+         use:  keeps takeoff and landing times the route data doesn't
+               give: a takeoff is seen when a plane last seen on the
+               ground is now in the air; a landing when
+               a plane last seen in the air is now on the ground near
+               its destination; the last arrival estimate made in the
+               air is kept too
+         post: fills info.off_time / info.eta from what was seen when
+               the source gave none
+         imp:  times seen are within one fetch interval of the event
+      """
+      s   = info.state
+      org = info.origin
+      dst = info.destination
+      if ((not (org.code_icao or org.code_iata)) or math.isnan(s.lat)):
+         return
+      key  = (info.ident, org.code_icao, dst.code_icao)
+      now  = time.time()
+      seen = self.history.get(key)
+      if ((seen is None) or (now - seen["seen"] > 12 * 3600)):
+         seen = {"off": 0.0, "on": 0.0, "ground": None}
+      near_dst = ((not math.isnan(dst.lat)) and
+                  (haversine_km(s.lat, s.lon, dst.lat, dst.lon) <= 8))
+                               # ground: True / False as last seen, None
+                               # when not seen before
+      if (s.on_ground):
+         if (near_dst and (seen["ground"] is False) and (not seen["on"])):
+            seen["on"] = now
+      else:
+         if ((seen["ground"] is True) and (not seen["off"])):
+            seen["off"] = now
+         if (info.eta):
+                               # the latest estimate, until it lands
+            seen["eta"] = info.eta
+      seen["ground"] = s.on_ground
+      seen["seen"]   = now
+      self.history[key] = seen
+      if (not info.off_time):
+         info.off_time = seen["off"]
+      if (not info.eta):
+         info.eta = (     seen["on"]           if (seen["on"])
+                     else seen.get("eta", 0.0) if (s.on_ground and near_dst)
+                     else 0.0)
+      if (len(self.history) > 2000):
+                               # forget flights not seen for 12 hours
+         self.history = {k: v for k, v in self.history.items()
+                         if (now - v["seen"] <= 12 * 3600)}
 
    ########################################################################
 
@@ -2269,29 +2325,32 @@ class NeoMatrixDisplay:
 
    ########################################################################
 
+   def bar_span(self):
+      """
+         post: (x0, x1), the first and last columns of the progress bar;
+               room is kept at each end for the takeoff/landing times
+      """
+      return(3 + 25, self.matrix.width - 4 - 25)
+
+   ########################################################################
+
    def draw_bar(self, y, f, state = ""):
       """
          use:  3 px progress bar: dim track, flown part, a 3x3 marker
                for the plane; small takeoff and landing times at the
-               ends when known (room is kept for them so the bar is the
-               same length on every flight)
+               ends, "--:--" when not known, so the bar is the same
+               length on every flight
          usage: state from phase(): the bar is red while landing and
                once landed, green before that
       """
       lit, dim = (     (RED, DIM_RED) if (state in ("landing", "landed"))
                   else (GREEN, DIM_GREEN))
       m   = self.matrix
-      off = self.clock(f.off_time)
-      on  = self.clock(f.eta)
-      x0  = 3
-      x1  = m.width - 4
-      if (off or on):
-         x0 += 22
-         x1 -= 22
-      if (off):
-         m.draw_tiny(3, y - 2, off, self.color)
-      if (on):
-         m.draw_tiny(m.width - 4 - m.tiny_width(on), y - 2, on, self.color)
+      off = self.clock(f.off_time) or "--:--"
+      on  = self.clock(f.eta) or "--:--"
+      x0, x1 = self.bar_span()
+      m.draw_tiny(3, y - 2, off, self.color)
+      m.draw_tiny(m.width - 4 - m.tiny_width(on), y - 2, on, self.color)
       for i in range(x0, x1 + 1):
          m.pixel(i, y, dim)
       if (math.isnan(f.progress)):
