@@ -31,7 +31,18 @@ weights are saved and seed the next run's genetic search (warm start), and
 a ridge-regression member joins the ensemble when it shows validation
 skill. Calibration for a past date only uses outcomes known by then.
 
-NOT financial advice. Daily bars only, so "short" mode is a 1-3 day swing
+Sell rule: a position is held for as long as the model still projects a
+rise. Both exits are measured from the highest close since the buy, so
+they only ever move up:
+  - trailing stop: SELL when the price falls stop_atr x ATR below that
+    high, whatever the projection ('set stop_atr 0' turns it off);
+  - expected drop: SELL when the model projects a decline AND the price
+    is already dip_atr x ATR below that high, so one bad day alone does
+    not trigger a sale ('set dip_atr 0' sells on the projection alone).
+There is no maximum holding period unless one is set with 'set max_hold
+N'.
+
+NOT financial advice. Daily bars only, so "short" mode is a swing
 strategy rather than true intraday trading. The built-in universe is
 today's blue chips, so backtests suffer survivorship bias and look better
 than reality. Treat all output as an experiment, not a promise.
@@ -77,12 +88,18 @@ VZ T CMCSA TMUS DIS SO DUK NEE
 FILTERS = dict(min_price=20.0, min_dollar_vol=1e8, max_vol=0.55,
                max_dd=-0.50, min_history=300)
 
+# horizon is how far ahead the BUY projection looks; max_hold=0 means no
+# holding limit. stop_atr is the trailing stop and dip_atr the smaller
+# pullback (both in ATRs below the highest close since the buy) that
+# must also be present before a projected drop triggers a SELL.
 MODES = dict(
-   short=dict(horizon=2, train_days=750, max_hold=3, stop_atr=1.5,
+   short=dict(horizon=2, train_days=750, max_hold=0, stop_atr=1.5,
+              dip_atr=0.75,
               target_mult=2.5, min_gain=0.004, min_conf=35.0,
               min_lift=0.03, max_pos=3, stride=5, rebalance=1, topk=5,
               cal_days=250, cal_step=2, cal_stride=10),
-   long=dict(horizon=63, train_days=1250, max_hold=126, stop_atr=3.0,
+   long=dict(horizon=63, train_days=1250, max_hold=0, stop_atr=3.0,
+             dip_atr=1.5,
              target_mult=1.5, min_gain=0.03, min_conf=35.0,
              min_lift=0.03, max_pos=8, stride=21, rebalance=5, topk=5,
              cal_days=500, cal_step=10, cal_stride=21))
@@ -96,7 +113,8 @@ FEATS = ["ret1", "ret3", "ret5", "ret10", "ret21", "ret63", "rsi14",
          "hi252", "mom12_1"]
 
 HELP = dict(
-   mode="mode short|long       switch between 1-3 day and multi-month",
+   mode="mode short|long       switch between days-to-weeks and "
+        "multi-month",
    horizon="horizon N            override holding horizon (trading days)",
    asof="asof DATE|-N|+N|now  pretend today is DATE (YYYY-MM-DD), N "
         "trading days back/forward, or now",
@@ -120,8 +138,11 @@ HELP = dict(
              "(live + backtest)",
    learn="learn [days|all]     score outcomes, calibrate, retrain, save",
    set="set NAME VALUE       min_gain, min_lift (percent), min_conf, "
-       "max_pos, stop_atr,\n                          target_mult, "
-       "max_hold  (current mode)",
+       "max_pos, stop_atr,\n                          dip_atr, "
+       "target_mult, max_hold  (current mode;\n"
+       "                          stop_atr 0 = no trailing stop, dip_atr 0 "
+       "= sell on a\n                          projected drop alone, "
+       "max_hold 0 = no holding limit)",
    effort="effort low|normal|high   GA search effort (speed vs. depth)",
    status="status",
    quit="quit")
@@ -144,6 +165,20 @@ def pctd(x, px, sep="/"):
 
 def phi(x):
    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+# Stop-loss price for a buy at px, or 0.0 when the stop is turned off.
+def stop_px(px, c, atr):
+   if c["stop_atr"] <= 0:
+      return 0.0
+   return px * (1 - c["stop_atr"] * atr)
+
+
+# Holding-limit text for status lines.
+def hold_text(c):
+   if c["max_hold"] > 0:
+      return "max %d days" % c["max_hold"]
+   return "no holding limit"
 
 
 # ---------------------------------------------------------------- data
@@ -545,7 +580,7 @@ def score_rows(d, m, c, idx):
       rows.append(dict(
          j=j, t=d.tickers[j], price=px, exp=exp, conf=conf, sig=ens[j],
          agree=agree[j], pup=pup, why=why,
-         stop=px * (1 - c["stop_atr"] * d.atr[idx, j]),
+         stop=stop_px(px, c, d.atr[idx, j]), atr=d.atr[idx, j],
          target=px * (1 + c["target_mult"] * max(exp, 0.0))))
    rows.sort(key=lambda r: -r["exp"])
    for i, r in enumerate(rows):
@@ -890,7 +925,41 @@ class Picker(object):
                      r["lift"] >= c["min_lift"])
       return r["exp"] >= c["min_gain"] and r["conf"] >= c["min_conf"]
 
+   # Trailing levels for a held position as of the close of day idx:
+   # the highest close since the buy (never below the entry price), the
+   # trailing stop (0.0 when off) and the pullback level below which a
+   # projected drop turns into a SELL. Both only ever move up.
+   def levels(self, p, idx):
+      d = self.d
+      c = self.cfg(p["mode"])
+      j = d.col[p["ticker"]]
+      i0 = d.idx_of(p["entry_date"])
+      cl = d.C[max(i0, 0):idx + 1, j]
+      cl = cl[np.isfinite(cl)]
+      high = max(p["entry_price"], float(cl.max()) if len(cl) else 0.0)
+      atr = p.get("atr")
+      if not atr:
+         # positions recorded by older versions: recover the ATR used
+         # for their stop, else take it from the entry date
+         if p.get("stop", 0) > 0 and c["stop_atr"] > 0:
+            atr = (1 - p["stop"] / p["entry_price"]) / c["stop_atr"]
+         else:
+            atr = d.atr[max(i0, 0), j]
+         if not (np.isfinite(atr) and atr > 0):
+            atr = 0.02
+      stop = high * (1 - c["stop_atr"] * atr) if c["stop_atr"] > 0 \
+         else 0.0
+      dip = high * (1 - max(c["dip_atr"], 0.0) * atr)
+      return high, stop, dip
+
    # SELL / HOLD decision for a held position on date index idx.
+   # A position is held as long as the model projects a rise. SELL when
+   #   - the close falls to the trailing stop (stop_atr ATRs below the
+   #     highest close since the buy), whatever the projection, or
+   #   - the model projects a drop AND the close is already at least
+   #     dip_atr ATRs below that high (one bad day alone is not enough),
+   #   - or an optional holding limit is reached (max_hold > 0).
+   # Reaching the target or slipping in rank never forces a sale.
    def judge(self, p, idx, by, check_levels=True):
       d = self.d
       c = self.cfg(p["mode"])
@@ -899,27 +968,34 @@ class Picker(object):
       if not np.isfinite(px):
          return "HOLD", "no price on this date"
       held = idx - d.idx_of(p["entry_date"])
-      if check_levels:
-         if px <= p["stop"]:
-            return "SELL", "stop-loss hit (%.2f)" % p["stop"]
-         if px >= p["target"]:
-            return "SELL", "target reached (%.2f), take profit" % \
-               p["target"]
-      if held >= c["max_hold"]:
-         return "SELL", "max holding period (%d days) reached" % \
+      high, stop, dip = self.levels(p, idx)
+      off = "%s from high %.2f" % (pct(px / high - 1), high)
+      if check_levels and stop > 0 and px <= stop:
+         return "SELL", "trailing stop %.2f hit (%s)" % (stop, off)
+      if 0 < c["max_hold"] <= held:
+         return "SELL", "holding limit (%d days) reached" % \
             c["max_hold"]
       if by is None:
-         return "HOLD", "inside holding window (%d days held)" % held
+         return "HOLD", "no fresh projection today (%d days held)" % held
       r = by.get(j)
       if r is None:
-         return "SELL", "no longer passes the quality filters"
+         why = [k for k, v in d.why_not.items() if v[idx, j]]
+         return "HOLD", ("no projection: fails quality gate (%s); "
+                         "trailing stop still applies" % (
+                            ", ".join(why) or "insufficient data"))
       if r["exp"] < 0:
-         return "SELL", "model now expects %s" % pctd(r["exp"], px)
-      if r["rank"] > max(10, 3 * c["max_pos"]):
-         return "SELL", "signal faded to rank %d of %d" % (r["rank"],
-                                                         r["n"])
-      return "HOLD", "still expects %s (rank %d, conf %.0f%%)" % (
-         pctd(r["exp"], px), r["rank"], r["conf"])
+         if px <= dip:
+            return "SELL", "model expects a drop of %s and price is %s" \
+               % (pctd(r["exp"], px), off)
+         return "HOLD", ("model expects a dip of %s, but price is only "
+                         "%s (sell on a close below %.2f)" % (
+                            pctd(r["exp"], px), off, dip))
+      note = ""
+      if px >= p["target"]:
+         note = ", past target %.2f" % p["target"]
+      return "HOLD", ("still expects %s (rank %d, conf %.0f%%%s, %d "
+                      "days held)" % (pctd(r["exp"], px), r["rank"],
+                                      r["conf"], note, held))
 
    def make_pos(self, mode, t, entry_idx, price, r=None):
       d = self.d
@@ -927,12 +1003,14 @@ class Picker(object):
       j = d.col[t]
       atr = d.atr[entry_idx, j]
       atr = atr if np.isfinite(atr) else 0.02
+      # stop and target are measured from the actual entry price, which
+      # can differ from the close when 'buy TICKER price' is used
+      gain = max(r["exp"], 0.0) * c["target_mult"] if r else \
+         2 * c["min_gain"]
       return dict(ticker=t, mode=mode, entry_date=d.date_str(entry_idx),
                   entry_price=float(price),
-                  stop=float(r["stop"] if r else price *
-                             (1 - c["stop_atr"] * atr)),
-                  target=float(r["target"] if r else price *
-                               (1 + 2 * c["min_gain"])),
+                  stop=float(stop_px(price, c, atr)),
+                  target=float(price * (1 + gain)), atr=float(atr),
                   exp=float(r["exp"]) if r else 0.0,
                   conf=float(r["conf"]) if r else 0.0)
 
@@ -947,8 +1025,8 @@ class Picker(object):
       return r, spy, i1 - i0
 
    # Trade the model day by day over [end - days, end]; decisions use the
-   # close, execution happens at the NEXT open, stops/targets use the
-   # day's low/high (stop wins if both are touched).
+   # close, execution happens at the NEXT open, the stop-loss uses the
+   # day's low. Positions are kept while a rise is still projected.
    def simulate(self, mode, days, capital, slip):
       d, c = self.d, self.cfg(mode)
       end = self.cur()
@@ -982,16 +1060,21 @@ class Picker(object):
             if j in pos or not np.isfinite(px) or size < 100:
                continue
             cash -= size
+            atr = r["atr"] if np.isfinite(r["atr"]) else 0.02
             pos[j] = dict(shares=size / px, px=px, i0=i, exp=r["exp"],
-                          conf=r["conf"], stop=r["stop"],
-                          target=r["target"], entry=d.date_str(i))
+                          conf=r["conf"], pp=dict(
+                             ticker=d.tickers[j], mode=mode,
+                             entry_date=d.date_str(i), entry_price=px,
+                             atr=atr, stop=stop_px(px, c, atr),
+                             target=px * (r["target"] / r["price"])))
          pend_buy = []
+         # trailing stop known before today's trading (highest close
+         # through yesterday), checked against today's low
          for j in list(pos):
-            p, lo, hi, op = pos[j], d.L[i, j], d.H[i, j], d.O[i, j]
-            if lo <= p["stop"]:
-               close_pos(j, i, min(p["stop"], op), "stop-loss")
-            elif hi >= p["target"]:
-               close_pos(j, i, max(p["target"], op), "target hit")
+            p, lo, op = pos[j], d.L[i, j], d.O[i, j]
+            _, stop, _ = self.levels(p["pp"], i - 1)
+            if stop > 0 and lo <= stop:
+               close_pos(j, i, min(stop, op), "trailing stop")
          eq = cash + sum(p["shares"] * d.C[i, j] for j, p in pos.items())
          equity.append(eq)
          eq_prev = eq
@@ -1007,10 +1090,7 @@ class Picker(object):
             ncal += 1 if sc["info"]["cal"] else 0
          by = dict((r["j"], r) for r in sc["rows"]) if sc else None
          for j, p in pos.items():
-            pp = dict(ticker=d.tickers[j], mode=mode,
-                      entry_date=p["entry"], stop=p["stop"],
-                      target=p["target"])
-            act, why = self.judge(pp, i, by, check_levels=False)
+            act, why = self.judge(p["pp"], i, by, check_levels=False)
             if act == "SELL":
                pend_sell[j] = why
          if sc:
@@ -1073,14 +1153,15 @@ class Shell(cmd.Cmd):
       p, d = self.p, self.p.d
       c = p.cfg()
       i = p.cur()
-      print("mode=%s horizon=%dd max_hold=%dd min_gain=%s min_conf=%.0f "
-            "effort=%s" % (p.mode, c["horizon"], c["max_hold"],
+      print("mode=%s horizon=%dd (%s) min_gain=%s min_conf=%.0f "
+            "effort=%s" % (p.mode, c["horizon"], hold_text(c),
                            pct(c["min_gain"]), c["min_conf"], p.effort))
       print("as of %s (%d trading days of future data available), "
             "%d eligible stocks" % (d.date_str(i), len(d.dates) - 1 - i,
                                     int(d.el[i].sum())))
-      print("min_lift=%.1f points, max_pos=%d, stop_atr=%.1f" % (
-         100 * c["min_lift"], c["max_pos"], c["stop_atr"]))
+      print("min_lift=%.1f points, max_pos=%d, trailing stop_atr=%.2f, "
+            "dip_atr=%.2f" % (100 * c["min_lift"], c["max_pos"],
+                              c["stop_atr"], c["dip_atr"]))
       for mode in ("short", "long"):
          h = p.cfg(mode)["horizon"]
          R = p.resolved(mode, h)
@@ -1101,8 +1182,9 @@ class Shell(cmd.Cmd):
          return
       self.p.mode = "short" if a == "s" else "long"
       c = self.p.cfg()
-      print("Mode %s: hold ~%d trading days (max %d), up to %d positions."
-            % (self.p.mode, c["horizon"], c["max_hold"], c["max_pos"]))
+      print("Mode %s: buys on a projected rise over ~%d trading days, "
+            "holds until a drop\nis expected (%s), up to %d positions."
+            % (self.p.mode, c["horizon"], hold_text(c), c["max_pos"]))
 
    def do_horizon(self, arg):
       try:
@@ -1111,8 +1193,7 @@ class Shell(cmd.Cmd):
       except Exception:
          print("usage: horizon N   (trading days)")
          return
-      self.p.over.setdefault(self.p.mode, {}).update(
-         horizon=h, max_hold=max(h + 1, int(h * 1.5)))
+      self.p.over.setdefault(self.p.mode, {}).update(horizon=h)
       print("Horizon for %s mode is now %d days." % (self.p.mode, h))
 
    def do_effort(self, arg):
@@ -1178,7 +1259,7 @@ class Shell(cmd.Cmd):
    def do_set(self, arg):
       a = arg.split()
       names = ("min_gain", "min_lift", "min_conf", "max_pos", "stop_atr",
-               "target_mult", "max_hold")
+               "dip_atr", "target_mult", "max_hold")
       if len(a) != 2 or a[0] not in names:
          print("usage: set NAME VALUE   NAME is one of: %s" %
                ", ".join(names))
@@ -1312,9 +1393,10 @@ class Shell(cmd.Cmd):
          call = "BUY" if self.p.is_buy(r, c) else "watch"
          if call == "BUY":
             buys.append(r)
-         print("%2d  %-6s %9.2f %-20s %4.0f%% %9.2f %9.2f  %s" % (
+         stop = "%.2f" % r["stop"] if r["stop"] > 0 else "none"
+         print("%2d  %-6s %9.2f %-20s %4.0f%% %9s %9.2f  %s" % (
             r["rank"], r["t"], r["price"],
-            pctd(r["exp"], r["price"], " "), r["conf"], r["stop"],
+            pctd(r["exp"], r["price"], " "), r["conf"], stop,
             r["target"], call))
          print("      why: %s | P(up)=%.0f%%, votes %.0f%%" % (
             r["why"], 100 * r["pup"], 100 * r["agree"]))
@@ -1373,6 +1455,10 @@ class Shell(cmd.Cmd):
             act, q["ticker"], q["mode"], q["entry_date"],
             q["entry_price"], px,
             pctd(px / q["entry_price"] - 1, q["entry_price"]), why))
+         high, stop, dip = p.levels(q, i)
+         print("      high since buy %.2f | trailing stop %s | a "
+               "projected drop sells below %.2f" % (
+                  high, "%.2f" % stop if stop > 0 else "off", dip))
 
    def do_positions(self, arg):
       if not self.p.ledger():
@@ -1491,7 +1577,11 @@ class Shell(cmd.Cmd):
          if act == "SELL":
             print("SELL call on %s (%s): stock then moved %s -> sell was "
                   "%s" % (q["ticker"], why, pct(a[0]),
-                          "RIGHT" if a[0] < a[1] else "WRONG"))
+                          "RIGHT" if a[0] < 0 else "WRONG"))
+         else:
+            print("HOLD call on %s: stock then moved %s -> hold was %s"
+                  % (q["ticker"], pct(a[0]),
+                     "RIGHT" if a[0] >= 0 else "WRONG"))
 
    def do_follow(self, arg):
       p, d = self.p, self.p.d
@@ -1526,12 +1616,10 @@ class Shell(cmd.Cmd):
          r = by.get(j)
          px = d.C[i, j]
          act = p.actual(j, i, h)
-         if r is None:
-            label, note = "N/A", "not eligible (fails quality gate)"
-            if pos:
-               label, note = "SELL", "dropped out of the quality gate"
-         elif pos:
+         if pos:
             label, note = p.judge(pos, i, by)
+         elif r is None:
+            label, note = "N/A", "not eligible (fails quality gate)"
          elif p.is_buy(r, c):
             label, note = "BUY", r["why"]
          else:
