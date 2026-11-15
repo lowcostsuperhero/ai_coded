@@ -118,12 +118,22 @@ HELP = dict(
    horizon="horizon N            override holding horizon (trading days)",
    asof="asof DATE|-N|+N|now  pretend today is DATE (YYYY-MM-DD), N "
         "trading days back/forward, or now",
+   nextday="nextday              advance the as-of date to the next "
+           "business day",
    recommend="recommend [N]        top N picks with gain, confidence, "
              "sells for held positions",
    track="track [N]            record the BUY picks as open positions",
    buy="buy TICKER [price]   record a position you opened",
    sell="sell TICKER          close a recorded position",
    positions="positions            show open positions and SELL/HOLD",
+   realpositions="realpositions        the real ledger's positions and "
+                 "SELL/HOLD on the latest\n                          "
+                 "date (ignores asof and the practice timeline)",
+   savepositions="savepositions        save the current positions, "
+                 "overwriting the ledger file",
+   mergepositions="mergepositions       (practice timeline) add the real "
+                  "ledger's positions owned\n"
+                  "                          on the as-of date",
    compare="compare [N]          judge picks at the as-of date against "
            "what really happened",
    follow="follow TICKER [steps] [step_days]   walk one stock forward "
@@ -666,6 +676,12 @@ class Picker(object):
       self.cache = {}
       self.real = self.load_ledger()
       self.pretend = []
+      # True once 'asof' has moved to a past date. From then on this
+      # session is its own practice timeline with its own positions: it
+      # is never auto-saved and the real ledger is never mixed in, even
+      # after returning to the latest date. Only 'savepositions' (write)
+      # and 'mergepositions' (read) touch the ledger file.
+      self.forked = False
       self.last_buys = []
       self.warm = {}
       self.preds = []
@@ -871,13 +887,13 @@ class Picker(object):
          return []
 
    def save_ledger(self):
-      if self.asof is None:
+      if not self.forked:
          os.makedirs(HOME, exist_ok=True)
          with open(LEDGER, "w") as fh:
             json.dump(self.real, fh, indent=1)
 
    def ledger(self):
-      return self.real if self.asof is None else self.pretend
+      return self.pretend if self.forked else self.real
 
    def cfg(self, mode=None):
       m = mode or self.mode
@@ -1120,7 +1136,8 @@ class Shell(cmd.Cmd):
    def set_prompt(self):
       a = "latest" if self.p.asof is None else \
          self.p.d.date_str(self.p.asof)
-      self.prompt = "[%s | as of %s] > " % (self.p.mode, a)
+      self.prompt = "[%s | as of %s%s] > " % (
+         self.p.mode, a, " | practice" if self.p.forked else "")
 
    def postcmd(self, stop, line):
       self.set_prompt()
@@ -1136,8 +1153,11 @@ class Shell(cmd.Cmd):
 
    def do_help(self, arg):
       print("")
-      for k in ("mode", "horizon", "asof", "recommend", "track", "buy",
-                "sell", "positions", "compare", "follow", "simulate",
+      for k in ("mode", "horizon", "asof", "nextday", "recommend",
+                "track", "buy",
+                "sell", "positions", "realpositions",
+                "savepositions", "mergepositions", "compare",
+                "follow", "simulate",
                 "universe", "refresh", "calibrate", "scorecard",
                 "learn", "set", "effort", "status", "quit"):
          print("  " + HELP[k])
@@ -1224,13 +1244,30 @@ class Shell(cmd.Cmd):
             return
          p.asof = None if i == last else i
       i = p.cur()
-      if p.asof is None:
-         p.pretend = []
-      else:
-         p.pretend = [q for q in p.pretend
-                      if d.idx_of(q["entry_date"]) <= i]
+      new = p.asof is not None and not p.forked
+      if p.asof is not None:
+         p.forked = True
+      # positions bought after the new date do not exist yet there
+      p.pretend = [q for q in p.pretend
+                   if d.idx_of(q["entry_date"]) <= i]
       print("Pretending today is %s; %d trading days of 'future' data "
             "exist for checking." % (d.date_str(i), last - i))
+      if new:
+         print("Practice timeline started: positions here are separate "
+               "from your real ledger\nand are not saved ('savepositions'"
+               " saves them, 'mergepositions' adds\nreal ones owned on "
+               "this date).")
+
+   # Step the pretend date forward one business day (the next trading
+   # day in the price history; weekends and market holidays are skipped).
+   def do_nextday(self, arg):
+      p, d = self.p, self.p.d
+      if p.asof is None:
+         print("Already at the latest date (%s); there is no next day "
+               "yet. Use 'asof DATE' or 'asof -N' first." %
+               d.date_str(len(d.dates) - 1))
+         return
+      self.do_asof("+1")
 
    def do_universe(self, arg):
       d, i = self.p.d, self.p.cur()
@@ -1437,12 +1474,18 @@ class Shell(cmd.Cmd):
             " ".join(r["t"] for r in buys), len(p.last_buys)))
       self.show_positions(i)
 
-   def show_positions(self, i):
+   # SELL / HOLD lines for positions on date index i. By default these
+   # are the session's positions bought by that date; 'realpositions'
+   # passes the real ledger instead, with its own title.
+   def show_positions(self, i, led=None, title=None):
       p, d = self.p, self.p.d
-      led = [q for q in p.ledger() if d.idx_of(q["entry_date"]) <= i]
+      if led is None:
+         led = [q for q in p.ledger()
+                if d.idx_of(q["entry_date"]) <= i]
       if not led:
          return
-      print("\n--- open positions: sell / hold advice ---")
+      print("\n--- %s ---" % (title or "open positions: sell / hold "
+                               "advice"))
       for q in led:
          try:
             res = p.scores(q["mode"], i)
@@ -1465,6 +1508,72 @@ class Shell(cmd.Cmd):
          print("No open positions. Use 'track' or 'buy TICKER'.")
          return
       self.show_positions(self.p.cur())
+
+   # The real positions in the ledger file, judged on the latest date,
+   # whatever the as-of date or timeline of this session.
+   def do_realpositions(self, arg):
+      p, d = self.p, self.p.d
+      last = len(d.dates) - 1
+      led, skip = [], []
+      for q in p.load_ledger():
+         (led if q["ticker"] in d.col else skip).append(q)
+      if not led and not skip:
+         print("No real positions in %s." % LEDGER)
+         return
+      self.show_positions(last, led, "real positions (%s) as of the "
+                          "latest date, %s" % (LEDGER, d.date_str(last)))
+      for q in skip:
+         print("%-6s in %s @ %.2f: no price data loaded for this ticker"
+               % (q["ticker"], q["entry_date"], q["entry_price"]))
+
+   # Force a save: write the positions currently shown (the practice
+   # ones when an as-of date is active) over the ledger file. Nothing
+   # else about saving changes.
+   def do_savepositions(self, arg):
+      led = self.p.ledger()
+      os.makedirs(HOME, exist_ok=True)
+      with open(LEDGER, "w") as fh:
+         json.dump(led, fh, indent=1)
+      print("Saved %d position%s to %s" % (
+         len(led), "" if len(led) == 1 else "s", LEDGER))
+      for q in led:
+         print("  %-6s [%s] in %s @ %.2f" % (
+            q["ticker"], q["mode"], q["entry_date"], q["entry_price"]))
+
+   # Practice timeline only: copy in the positions from the real ledger
+   # file that were already owned on the current as-of date (bought on
+   # or before it). Positions already in the timeline are skipped.
+   def do_mergepositions(self, arg):
+      p, d = self.p, self.p.d
+      if not p.forked:
+         print("Nothing to merge: this session is on the real timeline. "
+               "Use 'asof DATE' first.")
+         return
+      i = p.cur()
+      have = set((q["ticker"], q["mode"], q["entry_date"])
+                 for q in p.pretend)
+      added, later = [], 0
+      for q in p.load_ledger():
+         if q["ticker"] not in d.col:
+            continue
+         if d.idx_of(q["entry_date"]) > i:
+            later += 1
+            continue
+         key = (q["ticker"], q["mode"], q["entry_date"])
+         if key in have:
+            continue
+         have.add(key)
+         p.pretend.append(dict(q))
+         added.append(q)
+      print("Merged %d position%s from %s owned as of %s:" % (
+         len(added), "" if len(added) == 1 else "s", LEDGER,
+         d.date_str(i)))
+      for q in added:
+         print("  %-6s [%s] in %s @ %.2f" % (
+            q["ticker"], q["mode"], q["entry_date"], q["entry_price"]))
+      if later:
+         print("(%d bought after %s %s left out)" % (
+            later, d.date_str(i), "was" if later == 1 else "were"))
 
    def do_track(self, arg):
       p, d = self.p, self.p.d
