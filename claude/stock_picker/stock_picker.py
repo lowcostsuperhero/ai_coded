@@ -21,6 +21,16 @@ the GA never saw measures real predictive skill, and that skill shrinks
 the expected gain and drives the confidence figure. Walk-forward only:
 a model used on date X is trained solely on data that was known by X.
 
+Learning over time (files live in ~/.stock_picker): every 'recommend'
+on the latest date is journaled and later scored against what really
+happened ('scorecard'). 'calibrate' / 'learn' replay history walk-forward
+to turn raw scores into honest numbers: expected gain is rescaled by how
+much of it really materialized, confidence becomes the observed chance of
+a gain, and BUY calls are suppressed when the picks show no edge. Evolved
+weights are saved and seed the next run's genetic search (warm start), and
+a ridge-regression member joins the ensemble when it shows validation
+skill. Calibration for a past date only uses outcomes known by then.
+
 NOT financial advice. Daily bars only, so "short" mode is a 1-3 day swing
 strategy rather than true intraday trading. The built-in universe is
 today's blue chips, so backtests suffer survivorship bias and look better
@@ -46,7 +56,7 @@ CACHE = os.path.join(HOME, "prices.pkl")
 LEDGER = os.path.join(HOME, "ledger.json")
 STATE = os.path.join(HOME, "state.json")
 PREDS = os.path.join(HOME, "predictions.json")
-MIN_PAIRS = 150                  # past predictions needed to calibrate
+MIN_PAIRS = 150                # past predictions needed to calibrate
 BENCH = "SPY"
 
 UNIVERSE = """
@@ -104,6 +114,14 @@ HELP = dict(
             "N days (default 90)",
    universe="universe             show which stocks pass the quality gate",
    refresh="refresh              re-download price history",
+   calibrate="calibrate [days]      replay history to measure how reliable "
+             "past picks were",
+   scorecard="scorecard            real results of past recommendations "
+             "(live + backtest)",
+   learn="learn [days|all]     score outcomes, calibrate, retrain, save",
+   set="set NAME VALUE       min_gain, min_lift (percent), min_conf, "
+       "max_pos, stop_atr,\n                          target_mult, "
+       "max_hold  (current mode)",
    effort="effort low|normal|high   GA search effort (speed vs. depth)",
    status="status",
    quit="quit")
@@ -139,7 +157,8 @@ def load_frames(tickers, years, force=False, synthetic=False):
          with open(CACHE, "rb") as fh:
             c = pickle.load(fh)
          fresh = time.time() - c["time"] < 20 * 3600
-         if fresh and set(want) <= set(c["requested"]):
+         deep = c.get("years", 0) >= years
+         if fresh and deep and set(want) <= set(c["requested"]):
             print("Using cached prices (use 'refresh' to re-download).")
             return dict((t, c["frames"][t]) for t in want
                         if t in c["frames"])
@@ -148,7 +167,7 @@ def load_frames(tickers, years, force=False, synthetic=False):
    frames = download(want, years)
    os.makedirs(HOME, exist_ok=True)
    with open(CACHE, "wb") as fh:
-      pickle.dump(dict(time=time.time(), requested=want,
+      pickle.dump(dict(time=time.time(), requested=want, years=years,
                        frames=frames), fh)
    return frames
 
@@ -515,8 +534,10 @@ def score_rows(d, m, c, idx):
       if sig_h > 0:
          exp = min(2 * sig_h, max(-2 * sig_h, exp))
       pup = phi(exp / sig_h) if sig_h > 0 else 0.5
-      p_s = min(1.0, max(0.0, (pup - 0.5) / 0.15))
-      conf = 100.0 * (0.40 * agree[j] + 0.30 * p_s + 0.30 * quality)
+      p_s = min(1.0, max(0.0, (pup - 0.5) / 0.30))
+      zc = min(1.0, max(0.0, ens[j] / 3.0))
+      conf = 100.0 * (0.30 * agree[j] + 0.25 * p_s + 0.25 * quality +
+                      0.20 * zc)
       contrib = z[j] * wavg
       top = np.argsort(-np.abs(contrib))[:3]
       why = ", ".join("%s %+.1fsd(%s)" % (FEATS[q], z[j, q],
@@ -536,6 +557,68 @@ def score_rows(d, m, c, idx):
    return dict(rows=rows, info=info)
 
 
+# Atomic JSON write (never leaves a half-written state file behind).
+def dump_json(path, obj):
+   os.makedirs(os.path.dirname(path), exist_ok=True)
+   tmp = path + ".tmp"
+   with open(tmp, "w") as fh:
+      json.dump(obj, fh)
+   os.replace(tmp, path)
+
+
+# Fit the calibration from the first n resolved predictions (sorted by
+# the day their outcome became known): a linear map raw expected gain ->
+# realized gain, and a monotone map raw confidence -> realized chance of
+# a gain (binned, shrunk toward the overall rate, pooled to monotone).
+def fit_calib(R, n):
+   e, cf = R["exp"][:n], R["conf"][:n]
+   ret, ua, ub = R["ret"][:n], R["uavg"][:n], R["ub"][:n]
+   var = float(e.var())
+   b = 0.0
+   corr = 0.0
+   if var > 1e-12 and float(ret.std()) > 0:
+      b = float(np.cov(e, ret, bias=True)[0, 1] / var)
+      corr = float(np.corrcoef(e, ret)[0, 1])
+   b = min(1.25, max(0.0, b))
+   a = float(ret.mean() - b * e.mean())
+   exc = float((ret - ua).mean())
+   win = (ret > 0).astype(float)
+   pw = float(win.mean())
+   chunks = np.array_split(np.argsort(cf), max(2, min(6, n // 50)))
+   vals = [(win[ch].sum() + 20 * pw) / (len(ch) + 20) for ch in chunks]
+   wts = [len(ch) + 20.0 for ch in chunks]
+   xsm = [float(cf[ch].mean()) * w for ch, w in zip(chunks, wts)]
+   i = 0
+   while i < len(vals) - 1:
+      if vals[i] > vals[i + 1]:
+         w = wts[i] + wts[i + 1]
+         vals[i] = (vals[i] * wts[i] + vals[i + 1] * wts[i + 1]) / w
+         xsm[i] += xsm[i + 1]
+         wts[i] = w
+         del vals[i + 1], wts[i + 1], xsm[i + 1]
+         i = max(i - 1, 0)
+      else:
+         i += 1
+   xs = [x / w for x, w in zip(xsm, wts)]
+   return dict(n=n, a=a, b=b, corr=corr, exc=exc, base=float(ub.mean()),
+               xs=xs, ys=vals,
+               edge=bool(corr > 0.02 and b >= 0.15 and exc > 0))
+
+
+# One-line description of a calibration (or the lack of one).
+def cal_text(cal):
+   if cal is None:
+      return ("NONE yet (confidence is a heuristic score, not odds). "
+              "Run 'calibrate'; needs %d+ past predictions." % MIN_PAIRS)
+   s = ("%d past predictions | gain slope %.2f | rank corr %+.3f | picks "
+        "beat universe by %s | universe up-rate %.0f%%" % (
+           cal["n"], cal["b"], cal["corr"], pct(cal["exc"]),
+           100 * cal["base"]))
+   if not cal["edge"]:
+      s += "\n  -> NO DEMONSTRATED EDGE: BUY calls are suppressed"
+   return s
+
+
 # -------------------------------------------------------------- engine
 class Picker(object):
    def __init__(self, data, mode, effort):
@@ -549,6 +632,201 @@ class Picker(object):
       self.real = self.load_ledger()
       self.pretend = []
       self.last_buys = []
+      self.warm = {}
+      self.preds = []
+      self.last_learn = {}
+      self.pver = 0
+      self._rp = {}
+      self._fit = {}
+      self.dirty = False
+      self.load_state()
+      self.resolve()
+
+   # Learning state: warm-start weights, prediction journal, timestamps.
+   def load_state(self):
+      try:
+         with open(STATE) as fh:
+            st = json.load(fh)
+      except Exception:
+         st = {}
+      if st.get("feats") == FEATS:
+         for key, lst in st.get("warm", {}).items():
+            mode, h = key.split("|")
+            self.warm[(mode, int(h))] = [
+               (e["date"], np.array(e["W"])) for e in lst]
+      self.last_learn = st.get("last_learn", {})
+      try:
+         with open(PREDS) as fh:
+            self.preds = json.load(fh)
+      except Exception:
+         self.preds = []
+
+   def save_state(self):
+      warm = {}
+      for (mode, h), lst in self.warm.items():
+         keep = sorted(lst, key=lambda e: e[0])[-6:]
+         warm["%s|%d" % (mode, h)] = [
+            dict(date=dt, W=W.tolist()) for dt, W in keep]
+      dump_json(STATE, dict(version=1, feats=FEATS, warm=warm,
+                            last_learn=self.last_learn))
+      dump_json(PREDS, self.preds)
+      self.dirty = False
+
+   # Newest warm-start weights learned strictly before `date`.
+   def warm_for(self, mode, h, date):
+      best = None
+      for dt, W in self.warm.get((mode, h), []):
+         if dt < date and (best is None or dt > best[0]):
+            best = (dt, W)
+      return None if best is None else best[1]
+
+   def add_warm(self, mode, h, date, W):
+      lst = [e for e in self.warm.get((mode, h), []) if e[0] != date]
+      lst.append((date, W))
+      lst.sort(key=lambda e: e[0])
+      self.warm[(mode, h)] = lst[-60:]
+
+   # Fill in the outcome of every prediction whose horizon has passed.
+   def resolve(self):
+      d = self.d
+      last = len(d.dates) - 1
+      changed = 0
+      for p in self.preds:
+         if p.get("ret") is not None:
+            continue
+         i0 = d.idx_of(p["date"])
+         i1 = i0 + p["h"]
+         if i0 < 0 or i1 > last or d.date_str(i0) != p["date"]:
+            continue
+         if p["t"] not in d.col:
+            continue
+         j = d.col[p["t"]]
+         if not (np.isfinite(d.C[i0, j]) and np.isfinite(d.C[i1, j])):
+            continue
+         el = d.el[i0] & np.isfinite(d.C[i1])
+         allr = d.C[i1][el] / d.C[i0][el] - 1
+         p.update(ret=float(d.C[i1, j] / d.C[i0, j] - 1),
+                  spy=float(d.BC[i1] / d.BC[i0] - 1),
+                  ub=float((allr > 0).mean()) if len(allr) else 0.5,
+                  uavg=float(allr.mean()) if len(allr) else 0.0,
+                  end=d.date_str(i1))
+         changed += 1
+      if changed:
+         self.pver += 1
+         self.dirty = True
+      return changed
+
+   # Resolved predictions for one mode/horizon as arrays sorted by the
+   # day the outcome was known (a live record replaces a backtest one).
+   def resolved(self, mode, h):
+      key = (self.pver, mode, h)
+      if key not in self._rp:
+         seen = {}
+         for p in self.preds:
+            if p["mode"] != mode or p["h"] != h or p.get("ret") is None:
+               continue
+            k = (p["date"], p["t"])
+            if k not in seen or p["src"] == "live":
+               seen[k] = p
+         P = sorted(seen.values(), key=lambda p: p["end"])
+         arr = lambda f: np.array([p[f] for p in P], dtype=float)
+         self._rp[key] = dict(
+            endi=np.array([int(p["end"].replace("-", "")) for p in P]),
+            exp=arr("exp"), conf=arr("conf"), ret=arr("ret"),
+            uavg=arr("uavg"), ub=arr("ub"))
+      return self._rp[key]
+
+   # Calibration using only predictions whose outcome was already known
+   # on `cutoff` (so a backtest never peeks at its own future).
+   def calib(self, mode, h, cutoff):
+      R = self.resolved(mode, h)
+      n = int((R["endi"] <= int(cutoff.replace("-", ""))).sum())
+      if n < MIN_PAIRS:
+         return None
+      key = (self.pver, mode, h, n)
+      if key not in self._fit:
+         self._fit[key] = fit_calib(R, n)
+      return self._fit[key]
+
+   # Replace raw expected gain / confidence by their calibrated values.
+   def apply_cal(self, res, mode, h, idx):
+      c = self.cfg(mode)
+      cal = self.calib(mode, h, self.d.date_str(idx))
+      info = dict(res["info"])
+      info["cal"] = cal
+      rows = []
+      for r in res["rows"]:
+         r = dict(r)
+         r["exp_raw"], r["conf_raw"] = r["exp"], r["conf"]
+         if cal:
+            pw = float(np.interp(r["conf"], cal["xs"], cal["ys"]))
+            r["exp"] = cal["a"] + cal["b"] * r["exp"]
+            r["conf"] = 100.0 * pw
+            r["lift"] = pw - cal["base"]
+            r["edge"] = cal["edge"]
+            r["cal"] = True
+            r["target"] = r["price"] * (
+               1 + c["target_mult"] * max(r["exp"], 0.0))
+         rows.append(r)
+      return dict(rows=rows, info=info)
+
+   # Journal today's top picks so their real outcome can be scored later.
+   def log_live(self, mode, idx, res):
+      if self.asof is not None or idx != len(self.d.dates) - 1:
+         return
+      c = self.cfg(mode)
+      h, ds = c["horizon"], self.d.date_str(idx)
+      live = dict(((p["mode"], p["h"], p["date"], p["t"]), p)
+                  for p in self.preds if p["src"] == "live")
+      for r in res["rows"][:15]:
+         rec = dict(src="live", mode=mode, h=h, date=ds, t=r["t"],
+                    price=float(r["price"]), exp=float(r["exp_raw"]),
+                    conf=float(r["conf_raw"]), expc=float(r["exp"]),
+                    confc=float(r["conf"]), cal=bool(r.get("cal")),
+                    buy=bool(self.is_buy(r, c)), ret=None)
+         old = live.get((mode, h, ds, r["t"]))
+         if old is None:
+            self.preds.append(rec)
+         elif old.get("ret") is None:
+            old.update(rec)
+      self.dirty = True
+
+   # Replay history day by day (strictly walk-forward) and record what
+   # the model would have predicted and what then happened.
+   def calibrate(self, mode, days=None, say=None):
+      d, c = self.d, self.cfg(mode)
+      h, last = c["horizon"], len(self.d.dates) - 1
+      hi = last - h
+      lo = max(1, hi - (days or c["cal_days"]))
+      idxs = sorted(range(hi, lo, -c["cal_step"]))
+      have = set((p["mode"], p["h"], p["date"], p["t"])
+                 for p in self.preds)
+      added = 0
+      for n, i in enumerate(idxs):
+         if say and n % 4 == 0:
+            say("   replaying %s  (%d/%d)" % (d.date_str(i), n + 1,
+                                              len(idxs)))
+         try:
+            res = self.scores(mode, i, exact=False, raw=True,
+                              stride=c["cal_stride"])
+         except ValueError:
+            continue
+         if res is None:
+            continue
+         ds = d.date_str(i)
+         for r in res["rows"][:15]:
+            key = (mode, h, ds, r["t"])
+            if key in have:
+               continue
+            have.add(key)
+            self.preds.append(dict(
+               src="bt", mode=mode, h=h, date=ds, t=r["t"],
+               price=float(r["price"]), exp=float(r["exp"]),
+               conf=float(r["conf"]), ret=None))
+            added += 1
+      self.resolve()
+      self.dirty = True
+      return added
 
    def load_ledger(self):
       try:
@@ -579,23 +857,37 @@ class Picker(object):
       c = self.cfg(mode)
       key = (mode, c["horizon"], anchor, self.effort)
       if key not in self.models:
-         self.models[key] = train_model(
+         ds = self.d.date_str(anchor)
+         warm = self.warm_for(mode, c["horizon"], ds)
+         m = train_model(
             self.d, c["horizon"], c["topk"], c["train_days"], anchor,
-            EFFORT[self.effort])
+            EFFORT[self.effort], warm=warm)
+         self.models[key] = m
+         self.add_warm(mode, c["horizon"], ds, m.ga)
+         self.dirty = True
       return self.models[key]
 
    # exact=True trains on data up to idx; otherwise the model is only
    # retrained every `stride` days (faster, still strictly walk-forward).
-   def scores(self, mode, idx, exact=True):
+   # raw=True skips calibration (used while building the calibration).
+   def scores(self, mode, idx, exact=True, raw=False, stride=None):
       c = self.cfg(mode)
-      anchor = idx if exact else idx - idx % c["stride"]
+      anchor = idx if exact else idx - idx % (stride or c["stride"])
       key = ("s", mode, c["horizon"], idx, anchor, self.effort)
       if key not in self.cache:
          self.cache[key] = score_rows(self.d, self.model(mode, anchor),
                                       c, idx)
-      return self.cache[key]
+      res = self.cache[key]
+      if raw or res is None:
+         return res
+      return self.apply_cal(res, mode, c["horizon"], idx)
 
+   # Calibrated rows must also show an edge and beat the universe's
+   # up-rate by min_lift; uncalibrated rows use the heuristic bar.
    def is_buy(self, r, c):
+      if r.get("cal"):
+         return bool(r["edge"] and r["exp"] >= c["min_gain"] and
+                     r["lift"] >= c["min_lift"])
       return r["exp"] >= c["min_gain"] and r["conf"] >= c["min_conf"]
 
    # SELL / HOLD decision for a held position on date index idx.
@@ -666,6 +958,7 @@ class Picker(object):
       cash, eq_prev = capital, capital
       pos, trades, equity = {}, [], []
       pend_sell, pend_buy = {}, []
+      ncal = ndec = 0
 
       def close_pos(j, i, px, why):
          nonlocal cash
@@ -709,6 +1002,9 @@ class Picker(object):
             break
          full = (i - start) % c["rebalance"] == 0
          sc = self.scores(mode, i, exact=False) if full else None
+         if sc:
+            ndec += 1
+            ncal += 1 if sc["info"]["cal"] else 0
          by = dict((r["j"], r) for r in sc["rows"]) if sc else None
          for j, p in pos.items():
             pp = dict(ticker=d.tickers[j], mode=mode,
@@ -726,7 +1022,7 @@ class Picker(object):
       el0 = d.el[start]
       ew = d.C[end][el0] / d.C[start][el0] - 1
       return dict(start=start, end=end, trades=trades, equity=equity,
-                  spy=d.BC[end] / d.BC[start] - 1,
+                  cal=(ncal, ndec), spy=d.BC[end] / d.BC[start] - 1,
                   ew=float(np.nanmean(ew)), capital=capital)
 
 
@@ -748,6 +1044,8 @@ class Shell(cmd.Cmd):
 
    def postcmd(self, stop, line):
       self.set_prompt()
+      if self.p.dirty:
+         self.p.save_state()
       return stop
 
    def emptyline(self):
@@ -760,7 +1058,8 @@ class Shell(cmd.Cmd):
       print("")
       for k in ("mode", "horizon", "asof", "recommend", "track", "buy",
                 "sell", "positions", "compare", "follow", "simulate",
-                "universe", "refresh", "effort", "status", "quit"):
+                "universe", "refresh", "calibrate", "scorecard",
+                "learn", "set", "effort", "status", "quit"):
          print("  " + HELP[k])
       print("")
 
@@ -780,6 +1079,20 @@ class Shell(cmd.Cmd):
       print("as of %s (%d trading days of future data available), "
             "%d eligible stocks" % (d.date_str(i), len(d.dates) - 1 - i,
                                     int(d.el[i].sum())))
+      print("min_lift=%.1f points, max_pos=%d, stop_atr=%.1f" % (
+         100 * c["min_lift"], c["max_pos"], c["stop_atr"]))
+      for mode in ("short", "long"):
+         h = p.cfg(mode)["horizon"]
+         R = p.resolved(mode, h)
+         live = [q for q in p.preds if q["mode"] == mode and
+                 q["src"] == "live"]
+         print("%s: %d resolved predictions (%d live journal entries), "
+               "%d warm-start sets, last learned %s" % (
+                  mode, len(R["ret"]), len(live),
+                  len(p.warm.get((mode, h), [])),
+                  p.last_learn.get(mode, "never")))
+         print("   calibration: %s" % cal_text(
+            p.calib(mode, h, d.date_str(i))))
 
    def do_mode(self, arg):
       a = arg.strip().lower()[:1]
@@ -856,17 +1169,141 @@ class Shell(cmd.Cmd):
                            synthetic=ARGS.synthetic)
       p.d = Data(frames)
       p.models, p.cache = {}, {}
-      print("Reloaded through %s." % p.d.date_str(-1))
+      p.resolve()
+      print("Reloaded through %s; %d past predictions now have outcomes."
+            % (p.d.date_str(-1), sum(1 for q in p.preds
+                                     if q.get("ret") is not None)))
+
+   # ----------------------------------------------------- learning
+   def do_set(self, arg):
+      a = arg.split()
+      names = ("min_gain", "min_lift", "min_conf", "max_pos", "stop_atr",
+               "target_mult", "max_hold")
+      if len(a) != 2 or a[0] not in names:
+         print("usage: set NAME VALUE   NAME is one of: %s" %
+               ", ".join(names))
+         return
+      try:
+         v = float(a[1])
+      except ValueError:
+         print("VALUE must be a number")
+         return
+      if a[0] in ("min_gain", "min_lift"):
+         v /= 100.0
+      if a[0] in ("max_pos", "max_hold"):
+         v = int(v)
+      self.p.over.setdefault(self.p.mode, {})[a[0]] = v
+      self.p.cache = {}
+      print("%s mode: %s = %s" % (self.p.mode, a[0], a[1]))
+
+   def do_calibrate(self, arg):
+      p, d = self.p, self.p.d
+      c = p.cfg()
+      days = int(arg) if arg.strip().isdigit() else None
+      print("Replaying %d days of %s-mode history, retraining along the "
+            "way (a few minutes on real data)..." % (
+               days or c["cal_days"], p.mode))
+      n = p.calibrate(p.mode, days, say=lambda m: print(m, end="\r"))
+      print(" " * 50)
+      print("Added %d predictions with known outcomes." % n)
+      print("Calibration: " + cal_text(
+         p.calib(p.mode, c["horizon"], d.date_str(len(d.dates) - 1))))
+
+   def do_learn(self, arg):
+      p, d = self.p, self.p.d
+      a = arg.split()
+      modes = ["short", "long"] if "all" in a else [p.mode]
+      days = next((int(x) for x in a if x.isdigit()), None)
+      last = len(d.dates) - 1
+      p.resolve()
+      for mode in modes:
+         c = p.cfg(mode)
+         print("Learning %s mode..." % mode)
+         n = p.calibrate(mode, days, say=lambda m: print(m, end="\r"))
+         p.scores(mode, last, raw=True)
+         p.last_learn[mode] = time.strftime("%Y-%m-%d %H:%M")
+         print(" " * 50)
+         print("  %d new replayed predictions; model retrained on data "
+               "through %s (warm-started: %s)" % (
+                  n, d.date_str(last),
+                  "yes" if p.warm_for(mode, c["horizon"],
+                                      d.date_str(last)) is not None
+                  else "no"))
+         print("  calibration: " + cal_text(
+            p.calib(mode, c["horizon"], d.date_str(last))))
+      p.dirty = True
+      p.save_state()
+
+   def sc_line(self, label, P):
+      ret = np.array([q["ret"] for q in P])
+      ua = np.array([q["uavg"] for q in P])
+      ub = np.array([q["ub"] for q in P])
+      print("  %-12s n=%4d (%3d dates) | avg %8s vs universe %8s -> "
+            "excess %8s | up %3.0f%% (universe %3.0f%%)" % (
+               label, len(P), len(set(q["date"] for q in P)),
+               pct(ret.mean()), pct(ua.mean()), pct((ret - ua).mean()),
+               100 * (ret > 0).mean(), 100 * ub.mean()))
+
+   def do_scorecard(self, arg):
+      p = self.p
+      p.resolve()
+      pend = [q for q in p.preds if q["src"] == "live" and
+              q.get("ret") is None]
+      print("\nLive journal: %d predictions still waiting for their "
+            "horizon to pass." % len(pend))
+      shown = False
+      for mode in ("short", "long"):
+         h = p.cfg(mode)["horizon"]
+         for src, title in (("live", "LIVE forward test (true "
+                                     "out-of-sample)"),
+                            ("bt", "Walk-forward replay (calibrate/"
+                                   "learn)")):
+            P = [q for q in p.preds if q["mode"] == mode and
+                 q["h"] == h and q["src"] == src and
+                 q.get("ret") is not None]
+            if not P:
+               continue
+            shown = True
+            print("\n=== %s mode, %d-day horizon: %s ===" % (
+               mode.upper(), h, title))
+            self.sc_line("all picks", P)
+            B = [q for q in P if q.get("buy")]
+            if B:
+               self.sc_line("BUY calls", B)
+            months = sorted(set(q["date"][:7] for q in P))[-8:]
+            for mth in months:
+               self.sc_line(mth, [q for q in P if q["date"][:7] == mth])
+            if len(P) >= 40:
+               cf = np.array([q["confc"] if q.get("cal") else q["conf"]
+                              for q in P])
+               ex = np.array([q["expc"] if q.get("cal") else q["exp"]
+                              for q in P])
+               rt = np.array([q["ret"] for q in P])
+               print("  predicted vs realized by confidence quartile:")
+               for ch in np.array_split(np.argsort(cf), 4):
+                  print("    conf %3.0f%% -> up %3.0f%% | expected %8s "
+                        "-> realized %8s" % (
+                           cf[ch].mean(), 100 * (rt[ch] > 0).mean(),
+                           pct(ex[ch].mean()), pct(rt[ch].mean())))
+      if not shown:
+         print("No resolved predictions yet. Run 'calibrate' to replay "
+               "history now, and 'recommend' on the latest date to start "
+               "the live journal.")
 
    # ------------------------------------------------ recommendations
    def show_picks(self, res, c, n):
       info = res["info"]
-      print("Model: ensemble of %d GA-evolved scorers | validation IC "
+      print("Model: ensemble of %d scorers (GA%s%s) | validation IC "
             "%+.3f (hit rate %.0f%%) | skill shrink %.2f | %d eligible"
-            % (info["nens"], info["val_ic"], 100 * info["val_hit"],
-               info["shrink"], info["n"]))
-      print("(IC near 0 = no demonstrated edge; 'why': (+) supports "
-            "buying, (-) argues against)")
+            % (info["nens"], " + ridge" if info.get("ridge") else "",
+               ", warm-started" if info.get("warm") else "",
+               info["val_ic"], 100 * info["val_hit"], info["shrink"],
+               info["n"]))
+      cal = info.get("cal")
+      print("Calibration: " + cal_text(cal))
+      print("(Conf = %s; 'why': (+) supports buying, (-) argues against)"
+            % ("calibrated chance of a gain over the horizon" if cal
+               else "heuristic score, not a probability"))
       print(" #  %-6s %9s %-20s %5s %9s %9s  %s" % (
          "Ticker", "Price", "ExpGain % $/share", "Conf", "Stop",
          "Target", "Call"))
@@ -899,10 +1336,20 @@ class Shell(cmd.Cmd):
             (p.mode.upper(), d.date_str(i), c["horizon"]))
       buys = self.show_picks(res, c, n)
       p.last_buys = buys[:c["max_pos"]]
+      p.log_live(p.mode, i, res)
+      cal = res["info"].get("cal")
       if not buys:
-         print("\nNo stock clears the bar (gain >= %s and confidence >= "
-               "%.0f%%). Standing aside is a valid recommendation." %
-               (pct(c["min_gain"]), c["min_conf"]))
+         if cal and not cal["edge"]:
+            bar = "the model shows no demonstrated edge on past picks"
+         elif cal:
+            bar = ("none reaches a %s gain with odds %.1f points above "
+                   "the universe up-rate" % (pct(c["min_gain"]),
+                                              100 * c["min_lift"]))
+         else:
+            bar = ("none reaches gain >= %s with confidence >= %.0f%%"
+                   % (pct(c["min_gain"]), c["min_conf"]))
+         print("\nNo BUY: %s. Standing aside is a valid recommendation."
+               % bar)
       else:
          print("\nBUY candidates: %s  ('track' records the top %d)" % (
             " ".join(r["t"] for r in buys), len(p.last_buys)))
@@ -1168,6 +1615,22 @@ class Shell(cmd.Cmd):
                                              pct(r["ew"])))
       print("Strategy vs SPY: %s. Slippage 0.05%%/side included; no "
             "taxes. Backtest only." % pct(total - r["spy"]))
+      nc, nd = r["cal"]
+      print("Calibrated odds were available on %d of %d decision days%s"
+            % (nc, nd, "" if nc == nd else
+               " (earlier days used the raw heuristic; 'calibrate' a "
+               "longer span first for a cleaner test)"))
+
+
+# Point every persistent file at another directory (used by --synthetic
+# so test data never mixes with real predictions).
+def set_home(path):
+   global HOME, CACHE, LEDGER, STATE, PREDS
+   HOME = path
+   CACHE = os.path.join(HOME, "prices.pkl")
+   LEDGER = os.path.join(HOME, "ledger.json")
+   STATE = os.path.join(HOME, "state.json")
+   PREDS = os.path.join(HOME, "predictions.json")
 
 
 def main():
@@ -1176,12 +1639,16 @@ def main():
    ap.add_argument("--mode", choices=["short", "long"], default="short")
    ap.add_argument("--tickers", help="comma separated custom universe")
    ap.add_argument("--universe-file", help="text file of tickers")
-   ap.add_argument("--years", type=int, default=8)
+   ap.add_argument("--years", type=int, default=10)
    ap.add_argument("--effort", choices=list(EFFORT), default="normal")
    ap.add_argument("--refresh", action="store_true")
+   ap.add_argument("--learn", action="store_true",
+                   help="run 'learn' for the chosen mode at startup")
    ap.add_argument("--synthetic", action="store_true",
                    help="offline fake data for testing the program")
    ARGS = ap.parse_args()
+   if ARGS.synthetic:
+      set_home(HOME + "-synthetic")
    tickers = UNIVERSE
    if ARGS.tickers:
       tickers = [t.strip().upper() for t in ARGS.tickers.split(",")]
@@ -1191,7 +1658,10 @@ def main():
    frames = load_frames(tickers, ARGS.years, ARGS.refresh,
                         ARGS.synthetic)
    data = Data(frames)
-   Shell(Picker(data, ARGS.mode, ARGS.effort)).cmdloop()
+   sh = Shell(Picker(data, ARGS.mode, ARGS.effort))
+   if ARGS.learn:
+      sh.do_learn("")
+   sh.cmdloop()
 
 
 if __name__ == "__main__":
