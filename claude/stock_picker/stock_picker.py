@@ -44,6 +44,9 @@ warnings.filterwarnings("ignore")
 HOME = os.path.join(os.path.expanduser("~"), ".stock_picker")
 CACHE = os.path.join(HOME, "prices.pkl")
 LEDGER = os.path.join(HOME, "ledger.json")
+STATE = os.path.join(HOME, "state.json")
+PREDS = os.path.join(HOME, "predictions.json")
+MIN_PAIRS = 150                  # past predictions needed to calibrate
 BENCH = "SPY"
 
 UNIVERSE = """
@@ -67,17 +70,20 @@ FILTERS = dict(min_price=20.0, min_dollar_vol=1e8, max_vol=0.55,
 MODES = dict(
    short=dict(horizon=2, train_days=750, max_hold=3, stop_atr=1.5,
               target_mult=2.5, min_gain=0.004, min_conf=35.0,
-              max_pos=3, stride=5, rebalance=1, topk=5),
+              min_lift=0.03, max_pos=3, stride=5, rebalance=1, topk=5,
+              cal_days=250, cal_step=2, cal_stride=10),
    long=dict(horizon=63, train_days=1250, max_hold=126, stop_atr=3.0,
              target_mult=1.5, min_gain=0.03, min_conf=35.0,
-             max_pos=8, stride=21, rebalance=5, topk=5))
+             min_lift=0.03, max_pos=8, stride=21, rebalance=5, topk=5,
+             cal_days=500, cal_step=10, cal_stride=21))
 
 # (population, generations, ensemble size)
 EFFORT = dict(low=(24, 12, 3), normal=(40, 20, 4), high=(64, 40, 6))
 
 FEATS = ["ret1", "ret3", "ret5", "ret10", "ret21", "ret63", "rsi14",
          "dist_sma20", "dist_sma50", "dist_sma200", "vol20", "atr14",
-         "volratio", "bbpos", "macd", "gap", "stoch"]
+         "volratio", "bbpos", "macd", "gap", "stoch", "rel21", "rel63",
+         "hi252", "mom12_1"]
 
 HELP = dict(
    mode="mode short|long       switch between 1-3 day and multi-month",
@@ -202,9 +208,10 @@ def synth_frames():
 
 
 # Technical features for one stock (all use trailing data only).
-def make_features(df):
+def make_features(df, bc):
    c, h, l, v, o = (df["Close"], df["High"], df["Low"], df["Volume"],
                     df["Open"])
+   bc = bc.reindex(df.index).ffill()
    r1 = c.pct_change()
    f = pd.DataFrame(index=df.index)
    for n in (1, 3, 5, 10, 21, 63):
@@ -226,6 +233,12 @@ def make_features(df):
    f["gap"] = o / c.shift() - 1
    lo, hi = l.rolling(14).min(), h.rolling(14).max()
    f["stoch"] = (c - lo) / (hi - lo + 1e-12) - 0.5
+   # relative strength vs the market, distance from the 52-week high,
+   # and 12-month momentum skipping the latest month
+   f["rel21"] = f["ret21"] - bc.pct_change(21)
+   f["rel63"] = f["ret63"] - bc.pct_change(63)
+   f["hi252"] = c / c.rolling(252, min_periods=120).max() - 1
+   f["mom12_1"] = c.shift(21) / c.shift(252) - 1
    return f[FEATS]
 
 
@@ -265,7 +278,8 @@ class Data(object):
          self.H[:, j] = b["High"].values
          self.L[:, j] = b["Low"].values
          self.C[:, j] = b["Close"].values
-         X[:, j, :] = make_features(df).reindex(self.dates).values
+         X[:, j, :] = make_features(
+            df, bench["Close"]).reindex(self.dates).values
          e = make_extras(df).reindex(self.dates)
          for k in ex:
             ex[k][:, j] = e[k].values
@@ -341,7 +355,7 @@ def eval_pop(W, X, Yz, M, k):
    return fit, ic
 
 
-def run_ga(X, Yz, M, k, rng, pop, gens):
+def run_ga(X, Yz, M, k, rng, pop, gens, init=None):
    F = X.shape[2]
    W = rng.uniform(-1, 1, (pop, F))
    seeds = np.zeros((3, F))
@@ -352,6 +366,15 @@ def run_ga(X, Yz, M, k, rng, pop, gens):
    for name, wt in (("dist_sma200", 1), ("macd", 1), ("ret10", 1)):
       seeds[2, FEATS.index(name)] = wt
    W[:3] = seeds
+   # Warm start: a quarter of the population begins from the weights
+   # evolved earlier (exact copies first, then jittered copies), so the
+   # search keeps building on what it already learned.
+   if init is not None and len(init):
+      take = max(2, pop // 4)
+      base = np.asarray(init)[np.arange(take) % len(init)]
+      jit = rng.normal(0, 0.08, base.shape)
+      jit[0] = 0.0
+      W[3:3 + take] = np.clip(base + jit, -1, 1)
    n_el = max(2, pop // 10)
    for g in range(gens):
       fit, _ = eval_pop(W, X, Yz, M, k)
@@ -369,13 +392,25 @@ def run_ga(X, Yz, M, k, rng, pop, gens):
    return W[0], fit[0]
 
 
+# Closed-form ridge regression of the future (z-scored) return on the
+# features: a stable, non-evolutionary member for the ensemble.
+def ridge_fit(X, Y, M, lam):
+   F = X.shape[2]
+   A = X.reshape(-1, F)
+   keep = M.reshape(-1) > 0
+   A, y = A[keep], Y.reshape(-1)[keep]
+   G = A.T @ A + lam * len(A) * np.eye(F)
+   return np.linalg.solve(G, A.T @ y)
+
+
 class Model(object):
    pass
 
 
 # Train on data whose outcome was known by `anchor`; validate on a later
-# slice the GA never saw; calibrate score -> expected return.
-def train_model(d, h, k, train_days, anchor, effort, seed=7):
+# slice the models never saw; calibrate score -> expected return.
+# `warm` (optional) holds weights evolved earlier, used to seed the GA.
+def train_model(d, h, k, train_days, anchor, effort, seed=7, warm=None):
    pop, gens, nens = effort
    Yw, Yz, M = d.target(h)
    end = anchor - h
@@ -392,19 +427,39 @@ def train_model(d, h, k, train_days, anchor, effort, seed=7):
    rng = np.random.default_rng(seed + anchor)
    cut = int(len(sub) * 0.75)
    gap = h // step + 1
-   wv, _ = run_ga(Xs[:cut], Ys[:cut], Ms[:cut], k, rng, pop, gens)
    vs = slice(cut + gap, None)
+   okv = Ms[vs].sum(axis=1) >= need
+   # Validation GA starts cold: warm weights may have seen this slice.
+   wv, _ = run_ga(Xs[:cut], Ys[:cut], Ms[:cut], k, rng, pop, gens)
    val_ic, val_hit = 0.0, 0.5
-   if (Ms[vs].sum(axis=1) >= need).any():
+   if okv.any():
       _, ic = eval_pop(wv[None], Xs[vs], Ys[vs], Ms[vs], k)
-      okv = Ms[vs].sum(axis=1) >= need
       val_ic = float(ic[0][okv].mean())
       val_hit = float((ic[0][okv] > 0).mean())
-   Wm = np.array([run_ga(Xs, Ys, Ms, k, rng, pop, gens)[0]
-                  for _ in range(nens)])
-   Wm = Wm / (np.linalg.norm(Wm, axis=1, keepdims=True) + 1e-12)
+   # Ridge member: its penalty is chosen on the validation slice and it
+   # joins the ensemble only if it shows positive skill there.
+   ridge_ic, best, wr = -1.0, None, None
+   if okv.any():
+      for lam in (0.05, 0.5, 5.0):
+         w = ridge_fit(Xs[:cut], Ys[:cut], Ms[:cut], lam)
+         _, ic = eval_pop(w[None], Xs[vs], Ys[vs], Ms[vs], k)
+         v = float(ic[0][okv].mean())
+         if v > ridge_ic:
+            ridge_ic, best = v, lam
+      if ridge_ic > 0:
+         wr = ridge_fit(Xs, Ys, Ms, best)
+   ga = []
+   for i in range(nens):
+      init = None if warm is None else np.roll(warm, -i, axis=0)
+      ga.append(run_ga(Xs, Ys, Ms, k, rng, pop, gens, init)[0])
+   ga = np.array(ga)
+   ga = ga / (np.linalg.norm(ga, axis=1, keepdims=True) + 1e-12)
+   Wm = ga
+   if wr is not None:
+      Wm = np.vstack([ga, wr / (np.linalg.norm(wr) + 1e-12)])
+   nm = len(Wm)
    D, T = Ms.shape
-   S = (Xs.reshape(-1, Wm.shape[1]) @ Wm.T).T.reshape(nens, D, T)
+   S = (Xs.reshape(-1, Wm.shape[1]) @ Wm.T).T.reshape(nm, D, T)
    n = np.maximum(Ms.sum(1), 1)
    mu = (S * Ms[None]).sum(2) / n[None]
    dev = (S - mu[:, :, None]) * Ms[None]
@@ -424,7 +479,10 @@ def train_model(d, h, k, train_days, anchor, effort, seed=7):
       m.shrink = min(1.0, max(0.15, val_ic / m.train_ic))
    else:
       m.shrink = 0.15
-   m.W, m.val_ic, m.val_hit, m.nens = Wm, val_ic, val_hit, nens
+   m.W, m.val_ic, m.val_hit, m.nens = Wm, val_ic, val_hit, nm
+   m.ga = ga
+   m.ridge_ic = ridge_ic if wr is not None else None
+   m.warm = warm is not None
    return m
 
 
@@ -473,7 +531,8 @@ def score_rows(d, m, c, idx):
       r["rank"] = i + 1
       r["n"] = n
    info = dict(n=n, val_ic=m.val_ic, val_hit=m.val_hit,
-               train_ic=m.train_ic, shrink=m.shrink, nens=m.nens)
+               train_ic=m.train_ic, shrink=m.shrink, nens=m.nens,
+               ridge=m.ridge_ic, warm=m.warm)
    return dict(rows=rows, info=info)
 
 

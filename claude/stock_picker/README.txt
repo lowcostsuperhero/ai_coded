@@ -75,15 +75,19 @@ No penny stocks, thin stocks or junk. "universe" shows who passes.
 
 How it scores
 -------------
-Each stock gets technical features (momentum over several windows, RSI,
-distance from moving averages, volatility, ATR, volume ratio, Bollinger
-position, MACD, gap, stochastic, strength relative to SPY, distance from
-the 252-day high). A genetic algorithm evolves weights so the weighted
-score ranks stocks by their following N-day return. An ensemble of
-independently evolved scorers votes. A validation slice the search never
-saw measures real skill, and that skill shrinks the expected gain and
-drives the confidence figure. It is walk-forward only: a model used on
-date X was trained solely on data known by X.
+Each stock gets 21 technical features (momentum over several windows,
+RSI, distance from moving averages, volatility, ATR, volume ratio,
+Bollinger position, MACD, gap, stochastic, strength relative to SPY,
+distance from the 252-day high, 12-1 month momentum). A genetic algorithm
+evolves weights so the weighted score ranks stocks by their following
+N-day return, and its fitness is the cross-sectional rank correlation
+plus the return of the top picks. An ensemble of independently evolved
+scorers votes, joined by a ridge-regression member when that member shows
+skill on the validation slice. The slice the search never saw measures
+real skill, and that skill shrinks the expected gain and drives the
+confidence figure. Evolved weights are saved and seed the next search
+(warm start). Walk-forward only: a model used on date X was trained
+solely on data known by X.
 
 Reading the output
 ------------------
