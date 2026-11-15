@@ -33,8 +33,8 @@ Prices are cached in ~/.stock_picker so later starts are quick.
 
 Modes
 -----
-   short   hold for 1-3 days; swing-trading style
-   long    hold for months (about 63 trading days ahead)
+   short   buy on a projection about 2 trading days ahead; swing style
+   long    buy on a projection about 63 trading days (3 months) ahead
 
 
 Switch at the prompt with "mode short" or "mode long".
@@ -129,9 +129,21 @@ only uses outcomes that were known by that date, so replays never peek.
 
 When to sell
 ------------
-A position is sold when the stop-loss is hit, the target is reached, the
-maximum holding period ends, the model now expects a decline, or the
-stock stops passing the quality gate.
+A position is held for as long as the model still projects a rise.
+Both exits are measured from the highest close since the buy, so they
+only ever move up:
+
+   trailing stop   SELL when the price falls stop_atr x ATR below that
+                   high, whatever the projection (set stop_atr 0 to turn
+                   it off)
+   expected drop   SELL when the model projects a decline AND the price is
+                   already dip_atr x ATR below that high, so one bad day
+                   alone does not trigger a sale (set dip_atr 0 to sell
+                   on the projection alone)
+
+Defaults: short mode stop_atr 1.5, dip_atr 0.75; long mode 3.0 and 1.5.
+There is no maximum holding period unless you set one ("set max_hold N").
+Reaching the target never forces a sale; it is only noted.
 
 What to expect
 --------------
