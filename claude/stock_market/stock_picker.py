@@ -865,7 +865,8 @@ class Shell(cmd.Cmd):
          px = d.C[i, d.col[q["ticker"]]]
          print("%-5s %-6s [%s] in %s @ %.2f now %.2f (%s): %s" % (
             act, q["ticker"], q["mode"], q["entry_date"],
-            q["entry_price"], px, pct(px / q["entry_price"] - 1), why))
+            q["entry_price"], px,
+            pctd(px / q["entry_price"] - 1, q["entry_price"]), why))
 
    def do_positions(self, arg):
       if not self.p.ledger():
@@ -918,7 +919,8 @@ class Shell(cmd.Cmd):
       px = d.C[p.cur(), d.col[t]]
       for q in hit:
          print("Closed %s: %.2f -> %.2f (%s)" % (
-            t, q["entry_price"], px, pct(px / q["entry_price"] - 1)))
+            t, q["entry_price"], px,
+            pctd(px / q["entry_price"] - 1, q["entry_price"])))
          led.remove(q)
       p.save_ledger()
 
