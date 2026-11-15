@@ -69,6 +69,13 @@ Commands
    learn [days|all]         score outcomes, calibrate, retrain, save
    set NAME VALUE           change a threshold for the current mode
 
+   nextday                  advance the as-of date one business day
+   realpositions            the real ledger's positions, judged on the
+                            latest date (ignores asof and practice)
+   savepositions            write the positions shown over the ledger file
+   mergepositions           (practice timeline) add the real positions
+                            that were already owned on the as-of date
+
 Which stocks are considered
 ---------------------------
 Only established, liquid names. A quality gate is applied to every stock
@@ -144,6 +151,17 @@ only ever move up:
 Defaults: short mode stop_atr 1.5, dip_atr 0.75; long mode 3.0 and 1.5.
 There is no maximum holding period unless you set one ("set max_hold N").
 Reaching the target never forces a sale; it is only noted.
+
+Practice timeline
+-----------------
+The first time "asof" moves to a past date, the session becomes its own
+practice timeline. Practice positions are kept apart from your real
+ledger and are never saved automatically, even after you return to the
+latest date. The prompt shows "practice". "nextday" steps forward one
+business day. "savepositions" writes the practice positions over the
+ledger file, "mergepositions" copies in the real positions that were
+already owned on the as-of date, and "realpositions" always shows the real
+ledger judged on the latest date.
 
 What to expect
 --------------
