@@ -107,6 +107,17 @@ def pct(x):
    return "%+.2f%%" % (x * 100.0)
 
 
+# Signed dollar amount, e.g. +$1,234.50 or -$0.37.
+def usd(v):
+   return "%s$%s" % ("+" if v >= 0 else "-", format(abs(v), ",.2f"))
+
+
+# Percent plus the dollar gain on one share bought at price px.
+# sep is "/" for running text and " " for table columns.
+def pctd(x, px, sep="/"):
+   return "%s%s%s" % (pct(x), sep, usd(x * px))
+
+
 def phi(x):
    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -552,12 +563,12 @@ class Picker(object):
       if r is None:
          return "SELL", "no longer passes the quality filters"
       if r["exp"] < 0:
-         return "SELL", "model now expects %s" % pct(r["exp"])
+         return "SELL", "model now expects %s" % pctd(r["exp"], px)
       if r["rank"] > max(10, 3 * c["max_pos"]):
          return "SELL", "signal faded to rank %d of %d" % (r["rank"],
                                                          r["n"])
       return "HOLD", "still expects %s (rank %d, conf %.0f%%)" % (
-         pct(r["exp"]), r["rank"], r["conf"])
+         pctd(r["exp"], px), r["rank"], r["conf"])
 
    def make_pos(self, mode, t, entry_idx, price, r=None):
       d = self.d
@@ -797,16 +808,18 @@ class Shell(cmd.Cmd):
                info["shrink"], info["n"]))
       print("(IC near 0 = no demonstrated edge; 'why': (+) supports "
             "buying, (-) argues against)")
-      print(" #  %-6s %9s %8s %5s %9s %9s  %s" % (
-         "Ticker", "Price", "ExpGain", "Conf", "Stop", "Target", "Call"))
+      print(" #  %-6s %9s %-20s %5s %9s %9s  %s" % (
+         "Ticker", "Price", "ExpGain % $/share", "Conf", "Stop",
+         "Target", "Call"))
       buys = []
       for r in res["rows"][:n]:
          call = "BUY" if self.p.is_buy(r, c) else "watch"
          if call == "BUY":
             buys.append(r)
-         print("%2d  %-6s %9.2f %8s %4.0f%% %9.2f %9.2f  %s" % (
-            r["rank"], r["t"], r["price"], pct(r["exp"]), r["conf"],
-            r["stop"], r["target"], call))
+         print("%2d  %-6s %9.2f %-20s %4.0f%% %9.2f %9.2f  %s" % (
+            r["rank"], r["t"], r["price"],
+            pctd(r["exp"], r["price"], " "), r["conf"], r["stop"],
+            r["target"], call))
          print("      why: %s | P(up)=%.0f%%, votes %.0f%%" % (
             r["why"], 100 * r["pup"], 100 * r["agree"]))
       return buys
@@ -933,26 +946,29 @@ class Shell(cmd.Cmd):
                             "" if i + h <= last else " (partial window)"))
       if not flagged:
          print("(no BUY cleared the bar; showing the top %d ranked)" % n)
-      print("%-6s %9s %8s %5s %9s %9s %8s  %s" % (
-         "Ticker", "Price", "ExpGain", "Conf", "Actual", "SPY", "Excess",
-         "Result"))
+      print("%-6s %9s %-20s %5s %9s %9s %8s  %s" % (
+         "Ticker", "Price", "ExpGain % $/share", "Conf", "Actual",
+         "SPY", "Excess", "Result"))
       acts = []
       for r in picks:
          a = p.actual(r["j"], i, h)
          acts.append(a[0])
-         print("%-6s %9.2f %8s %4.0f%% %9s %9s %8s  %s" % (
-            r["t"], r["price"], pct(r["exp"]), r["conf"], pct(a[0]),
-            pct(a[1]), pct(a[0] - a[1]), "WIN" if a[0] > 0 else "loss"))
+         print("%-6s %9.2f %-20s %4.0f%% %9s %9s %8s  %s" % (
+            r["t"], r["price"], pctd(r["exp"], r["price"], " "),
+            r["conf"], pct(a[0]), pct(a[1]), pct(a[0] - a[1]),
+            "WIN" if a[0] > 0 else "loss"))
       a0 = [p.actual(r["j"], i, h)[0] for r in rows]
       spy = p.actual(0, i, h)[1]
       k = min(10, len(rows) // 3)
       top = np.mean(a0[:k])
       bot = np.mean(a0[-k:])
-      print("\nPicks: avg actual %s vs avg expected %s | win rate %.0f%% "
-            "| SPY %s" % (pct(np.mean(acts)),
-                          pct(np.mean([r["exp"] for r in picks])),
-                          100 * np.mean([x > 0 for x in acts]),
-                          pct(spy)))
+      avg_usd = np.mean([r["exp"] * r["price"] for r in picks])
+      print("\nPicks: avg actual %s vs avg expected %s | "
+            "win rate %.0f%% | SPY %s" % (
+               pct(np.mean(acts)),
+               "%s/%s" % (pct(np.mean([r["exp"] for r in picks])),
+                          usd(avg_usd)),
+               100 * np.mean([x > 0 for x in acts]), pct(spy)))
       print("Whole ranking: top-%d avg %s, bottom-%d avg %s, universe "
             "avg %s  -> spread %s" % (k, pct(top), k, pct(bot),
                                       pct(np.mean(a0)), pct(top - bot)))
@@ -1021,8 +1037,8 @@ class Shell(cmd.Cmd):
             pos = None
          line = "%s  %8.2f  %-5s" % (d.date_str(i), px, label)
          if r:
-            line += "  rank %2d/%d  exp %7s  conf %3.0f%%" % (
-               r["rank"], r["n"], pct(r["exp"]), r["conf"])
+            line += "  rank %2d/%d  exp %s  conf %3.0f%%" % (
+               r["rank"], r["n"], pctd(r["exp"], px), r["conf"])
          if act:
             line += "  actual %7s (SPY %s)" % (pct(act[0]), pct(act[1]))
             if label in ("BUY", "AVOID", "SELL"):
@@ -1065,7 +1081,8 @@ class Shell(cmd.Cmd):
                "(conf %.0f%%)" % (
                   x["t"], d.date_str(x["i0"]), d.date_str(x["i1"]),
                   x["px0"], x["px1"], x["pnl"], pct(x["ret"]),
-                  pct(x["spy"]), x["why"], pct(x["exp"]), x["conf"]))
+                  pct(x["spy"]), x["why"], pctd(x["exp"], x["px0"], " "),
+                  x["conf"]))
       if len(tr) > 40:
          print("(showing the last 40 of %d trades)" % len(tr))
       eq = np.array(r["equity"])
@@ -1081,7 +1098,9 @@ class Shell(cmd.Cmd):
          print("Avg trade %s | avg model expectation %s | avg SPY over "
                "the same holds %s" % (
                   pct(np.mean([x["ret"] for x in tr])),
-                  pct(np.mean([x["exp"] for x in tr])),
+                  "%s/%s" % (
+                     pct(np.mean([x["exp"] for x in tr])),
+                     usd(np.mean([x["exp"] * x["px0"] for x in tr]))),
                   pct(np.mean([x["spy"] for x in tr]))))
       print("ACTUAL market over the window: SPY buy&hold %s | equal-"
             "weight universe buy&hold %s" % (pct(r["spy"]),

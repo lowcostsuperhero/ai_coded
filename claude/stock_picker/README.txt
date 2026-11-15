@@ -87,8 +87,9 @@ date X was trained solely on data known by X.
 
 Reading the output
 ------------------
-Each pick shows the expected gain as a percent and a confidence figure
-from 0 to 100. Confidence is not a probability.
+Expected gain is shown as a percent and as dollars for one share, e.g.
++0.20%/+$0.32 in running text. In tables the two are separated by a
+space: +0.20% +$0.32. Confidence is 0-100; it is not a probability.
 
 When to sell
 ------------
