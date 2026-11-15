@@ -62,6 +62,13 @@ Commands
    effort low|normal|high   genetic search effort
    status, help, quit
 
+   calibrate [days]         replay history to measure how reliable past
+                            picks were
+   scorecard                real results of past recommendations (live and
+                            backtest)
+   learn [days|all]         score outcomes, calibrate, retrain, save
+   set NAME VALUE           change a threshold for the current mode
+
 Which stocks are considered
 ---------------------------
 Only established, liquid names. A quality gate is applied to every stock
@@ -94,13 +101,45 @@ Reading the output
 Expected gain is shown as a percent and as dollars for one share, e.g.
 +0.20%/+$0.32 in running text. In tables the two are separated by a
 space: +0.20% +$0.32. Gain or loss on open positions and after a sell is
-shown the same way. Confidence is 0-100; it is not a probability.
+shown the same way.
+
+Learning over time
+------------------
+The first answer is honest, not flattering. Files live in ~/.stock_picker:
+
+   predictions.json   journal of every prediction and, later, its outcome
+   state.json         evolved weights that seed the next search
+   ledger.json        your positions
+   prices.pkl         cached price history
+
+Every "recommend" on the latest date is journaled and later scored
+against what really happened ("scorecard"). "calibrate" and "learn"
+replay history walk-forward to produce paired predictions and outcomes.
+From these pairs the program:
+
+   - rescales expected gain by how much of it really materialized
+   - turns confidence into the observed chance of a gain
+   - checks whether the picks show any edge at all
+
+When there is no demonstrated edge, or the expected gain is too small,
+BUY calls are suppressed. That is deliberate. With fewer than 150 past
+predictions it falls back to a heuristic. Calibration for a past date
+only uses outcomes that were known by that date, so replays never peek.
+"set" changes thresholds (min_gain, min_lift, min_conf, max_pos, ...).
 
 When to sell
 ------------
 A position is sold when the stop-loss is hit, the target is reached, the
 maximum holding period ends, the model now expects a decline, or the
 stock stops passing the quality gate.
+
+What to expect
+--------------
+On real price history of large caps, in tests with this code, the picks
+showed no demonstrated edge in either mode, so BUY calls were mostly
+suppressed. That is the program being honest. A wider universe (a few
+hundred large caps, via --universe-file) gives the calibration more to
+work with.
 
 Files
 -----
