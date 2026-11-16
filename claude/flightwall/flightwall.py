@@ -45,8 +45,8 @@ E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-REVISION   = "1.9"
-USER_AGENT = "flightwall/1.9 (personal, non-commercial)"
+REVISION   = "1.10"
+USER_AGENT = "flightwall/1.10 (personal, non-commercial)"
 
 OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
                      "opensky-network/protocol/openid-connect/token")
@@ -1302,29 +1302,66 @@ class LogoFetcher:
                             if (u.strip())]
       self.folder        = folder
       self.cache         = TtlCache()
+                               # template -> the stand-in picture the site
+                               # sends for an airline it has no logo for
+      self.stand_ins     = {}
+
+   ########################################################################
+
+   @staticmethod
+   def _get(template, iata, icao):
+      """
+         post: the picture's bytes, or None when the site has none
+               (HTTP error); network failures raise OSError
+      """
+      url     = template.replace("{iata}", iata).replace("{icao}", icao)
+      request = urllib.request.Request(url, headers = {
+                   "User-Agent": USER_AGENT})
+      try:
+         with urllib.request.urlopen(request, timeout = 8) as reply:
+            return(reply.read())
+      except urllib.error.HTTPError:
+         return(None)
+
+   ########################################################################
+
+   def _stand_in(self, template):
+      """
+         post: the picture the site sends for an airline it doesn't
+               know, or None if it answers those with an error
+         imp:  images.kiwi.com sends a generic plane rather than a 404,
+               which would hide the craft silhouette; asked once per
+               template, with codes no airline uses
+      """
+      if (template not in self.stand_ins):
+         try:
+            self.stand_ins[template] = self._get(template, "9Z", "9ZZ")
+         except (urllib.error.URLError, OSError):
+            return(None)
+      return(self.stand_ins[template])
 
    ########################################################################
 
    def _download(self, iata, icao):
       """
          post: returns (PNG bytes or None, ok); ok is False when the
-               network failed rather than the logo being missing
+               network failed rather than the logo being missing; the
+               site's stand-in picture for unknown airlines counts as
+               missing
       """
       for template in self.url_templates:
          if ((("{iata}" in template) and (not iata)) or
              (("{icao}" in template) and (not icao))):
             continue
-         url     = template.replace("{iata}", iata).replace("{icao}", icao)
-         request = urllib.request.Request(url, headers = {
-                      "User-Agent": USER_AGENT})
          try:
-            with urllib.request.urlopen(request, timeout = 8) as reply:
-               return(reply.read(), True)
-         except urllib.error.HTTPError:
-            continue
+            data = self._get(template, iata, icao)
+            if (data and (data == self._stand_in(template))):
+               data = None
          except (urllib.error.URLError, OSError) as error:
             Log.line(f"LogoFetcher: {error}")
             return(None, False)
+         if (data):
+            return(data, True)
       return(None, True)
 
    ########################################################################
