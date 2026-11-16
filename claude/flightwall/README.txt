@@ -64,16 +64,17 @@ needs a terminal of 128 columns by 37 rows.
 
 The line above the bar says At KPIT (on the ground, not yet departed),
 Departing KPIT, Over <town>, Near <town>, Approaching KBOS, Landing at
-KBOS or Landed at KBOS. "At" is green; Approaching, Landing at and
-Landed at are red; the rest are white. The flight number is light
-blue; the climb arrow is light green and the descent arrow light red.
-The progress bar is green, and turns red once the plane has landed.
-The climb rate's unit is dropped when the line would be too long.
+KBOS or Landed at KBOS. "At" is light blue (like the flight number);
+once the plane is in the air the line is green; Approaching, Landing
+at and Landed at are red. The flight number is light blue; the climb
+arrow is light green and the descent arrow light red. The progress
+bar is green, and turns red once the plane has landed. The climb
+rate's unit is dropped when the line would be too long.
 Takeoff and landing times sit at the ends of the bar, "--:--" when
 not known. Below the bar's marker are the time flown so far and the
 time to go (hours:minutes, "-:--" when not known). Both start white;
-at takeoff the time flown turns green; once landed it shows the whole
-flight's time (still green) and the time to go is a red 0:00. With
+at takeoff the time flown turns green; once landed both turn red: the
+time flown shows the whole flight's time and the time to go is 0:00. With
 AeroAPI the times are FlightAware's. With the free route data the
 landing time is estimated in the air, and flightwall notes
 the time it sees a plane take off (last seen on the ground, now in

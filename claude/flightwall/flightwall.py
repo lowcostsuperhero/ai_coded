@@ -45,8 +45,8 @@ E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-REVISION   = "1.8"
-USER_AGENT = "flightwall/1.8 (personal, non-commercial)"
+REVISION   = "1.9"
+USER_AGENT = "flightwall/1.9 (personal, non-commercial)"
 
 OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
                      "opensky-network/protocol/openid-connect/token")
@@ -190,7 +190,6 @@ TINY_3X5 = {"0": "111101101101111", "1": "010110010010111",
             "4": "101101111001001", "5": "111100111001111",
             "6": "111100111101111", "7": "111001010010010",
             "8": "111101111101111", "9": "111101111001111",
-            "A": "010101111101101", "P": "110101110100100",
             "-": "000000111000000"}
 
 FONT_EXTRA = {
@@ -938,7 +937,8 @@ class AeroAPIFetcher:
          return(None)
       info = None
       if ((status == 200) and reply and reply.get("flights")):
-         info = self._parse(self._pick(reply["flights"]))
+         info = self._parse(self._pick(reply["flights"],
+                                       state.on_ground))
       else:
          Log.line(f"AeroAPIFetcher: HTTP {status} for flight {ident}")
       self.cache.put(ident, info, self.ttl if (info) else 600)
@@ -947,14 +947,20 @@ class AeroAPIFetcher:
    ########################################################################
 
    @staticmethod
-   def _pick(flights):
+   def _pick(flights, on_ground = False):
       """
          imp: the firmware takes flights[0], which can be tomorrow's
-              departure; prefer the one in the air now
+              departure (0% done, with tomorrow's times); prefer the one
+              in the air now, or for a plane on the ground the latest
+              one that has landed. AeroAPI lists the newest first
       """
       for f in flights:
          if (f.get("actual_off") and not f.get("actual_on")):
             return(f)
+      if (on_ground):
+         for f in flights:
+            if (f.get("actual_on")):
+               return(f)
       return(flights[0])
 
    ########################################################################
@@ -2147,7 +2153,10 @@ class FlightDataFetcher:
    def _progress(info):
       """
          post: fills progress and eta from the airports' positions when
-               the source (adsbdb) gave them; AeroAPI's own values stay
+               the source (adsbdb) gave them; AeroAPI's own values stay,
+               except that a plane on the ground at its destination is
+               100% done and one at its origin 0%, whatever the source
+               says (so the bar agrees with "Landed at" / "At")
       """
       s   = info.state
       org = info.origin
@@ -2158,7 +2167,11 @@ class FlightDataFetcher:
       left = haversine_km(s.lat, s.lon, dst.lat, dst.lon)
       if (done + left <= 0):
          return
-      if (math.isnan(info.progress)):
+      if (s.on_ground and (left <= 8)):
+         info.progress = 100.0
+      elif (s.on_ground and (done <= 8)):
+         info.progress = 0.0
+      elif (math.isnan(info.progress)):
          info.progress = 100.0 * done / (done + left)
       if ((not info.eta) and (not s.on_ground) and
           (not math.isnan(s.velocity)) and (s.velocity > 25)):
@@ -2231,7 +2244,7 @@ class Matrix:
    def draw_tiny(self, x, y, text, color):
       """
          use:  3x5 font for the takeoff/landing times beside the bar
-         usage: digits, ":", "A" and "P" only
+         usage: digits, ":" and "-" only
       """
       for ch in text:
          if (ch == ":"):
@@ -2421,13 +2434,12 @@ class NeoMatrixDisplay:
    @staticmethod
    def clock(epoch):
       """
-         post: "6:52P"-style local time, or "" when unknown
+         post: "18:52"-style local time (24-hour clock), or "" when
+               unknown
       """
       if (not epoch):
          return("")
-      t = time.localtime(epoch)
-      return(f"{t.tm_hour % 12 or 12}:{t.tm_min:02d}"
-             f"{'A' if (t.tm_hour < 12) else 'P'}")
+      return(time.strftime("%H:%M", time.localtime(epoch)))
 
    ########################################################################
 
@@ -2576,7 +2588,8 @@ class NeoMatrixDisplay:
                                aircraft
                   speed                          altitude
                   track                    climb/descent
-                  what the plane is doing (red when arriving)
+                  what the plane is doing (blue at the gate,
+                     green in the air, red when arriving)
                   takeoff time ---- green progress bar ---- landing time
                                 time flown | time to go (under the marker)
       """
@@ -2625,11 +2638,14 @@ class NeoMatrixDisplay:
                                     (r["trk"], vr_short)], full),
                   self.color)
       m.draw_text(3, 48, truncate_to_columns(text, full),
-                               # red as the flight ends, green while it
-                               # waits at the origin, white otherwise
-                  (     RED   if (state in ("approach", "landing",
-                                              "landed"))
-                   else GREEN if (state == "origin")
+                               # light blue (as the flight number) while
+                               # it waits at the origin, green in the
+                               # air, red as the flight ends; white for a
+                               # plane on the ground anywhere else
+                  (     RED     if (state in ("approach", "landing",
+                                                "landed"))
+                   else LT_BLUE if (state == "origin")
+                   else GREEN   if (not f.state.on_ground)
                    else self.color))
 
    ########################################################################
@@ -2638,8 +2654,14 @@ class NeoMatrixDisplay:
       """
          post: (x0, x1), the first and last columns of the progress bar;
                room is kept at each end for the takeoff/landing times
+               ("18:52" or "--:--"), with the same gap on both sides
       """
-      return(3 + 25, self.matrix.width - 4 - 25)
+      m    = self.matrix
+      slot = m.tiny_width("00:00")
+      gap  = 3
+                               # the left time starts at column 3, the
+                               # right one ends at width - 5
+      return(3 + slot + gap, m.width - 5 - slot - gap)
 
    ########################################################################
 
@@ -2673,8 +2695,8 @@ class NeoMatrixDisplay:
          post: ((time flown, colour), (time to go, colour)) as text
          imp:  before takeoff both are white (the text colour) and the
                time flown is 0:00; once airborne the time flown turns
-               green; once landed it is the whole flight's time (still
-               green) and the time to go is a red 0:00
+               green; once landed both turn red: the time flown is the
+               whole flight's time and the time to go is 0:00
       """
       now = time.time()
       if (state == "origin"):
@@ -2684,7 +2706,7 @@ class NeoMatrixDisplay:
       if (state == "landed"):
          total = (     f.eta - f.off_time if (f.eta and f.off_time)
                   else None)
-         return((self.duration(total), GREEN), (self.duration(0), RED))
+         return((self.duration(total), RED), (self.duration(0), RED))
       return((self.duration(now - f.off_time if (f.off_time) else None),
               GREEN),
              (self.duration(f.eta - now if (f.eta) else None),
