@@ -28,7 +28,9 @@ import random
 import re
 import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -43,8 +45,8 @@ E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-REVISION   = "1.4"
-USER_AGENT = "flightwall/1.4 (personal, non-commercial)"
+REVISION   = "1.8"
+USER_AGENT = "flightwall/1.8 (personal, non-commercial)"
 
 OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/"
                      "opensky-network/protocol/openid-connect/token")
@@ -57,6 +59,10 @@ ADSBDB_BASE_URL   = "https://api.adsbdb.com/v0"
 NOMINATIM_URL     = "https://nominatim.openstreetmap.org"
 OURAIRPORTS_URL   = ("https://davidmegginson.github.io/ourairports-data/"
                      "airports.csv")
+DETACHED_ENV      = "FLIGHTWALL_DETACHED"
+                               # file the window's process writes once its
+                               # window is showing (-dgui start-up check)
+READY_ENV         = "FLIGHTWALL_READY"
 GEONAMES_URL      = "https://download.geonames.org/export/dump/cities1000.zip"
 
                                # mirrors the firmware's config/*.h files;
@@ -111,7 +117,11 @@ text_color = ffffff
 route_codes = icao
 # also show aircraft with no flight info (private/GA): yes | no
 show_unidentified = no
-# half: LED matrix with half-block pixels | text: plain lines
+# (-d on the command line)
+# half: LED matrix with half-block pixels in the terminal
+# gui:  a window drawn as an LED board (square LEDs, tight grid); the
+#       window can be resized and the LEDs grow or shrink with it
+# text: plain lines
 style = half
 # wall: logo, flight, route and %, aircraft, green progress bar with
 #       takeoff/landing times, altitude/speed, track/climb, and what
@@ -273,6 +283,9 @@ class StateVector:
                                # the aircraft type, OpenSky does not
    type_code      : str   = ""
    registration   : str   = ""
+                               # ADS-B emitter category (A1..A7, B1..B7),
+                               # from the free feed only
+   category       : str   = ""
 
 ###########################################################################
 
@@ -823,7 +836,8 @@ class AdsbFetcher:
                   vertical_rate = math.nan if (vr is None) else vr * 0.00508,
                   squawk        = ac.get("squawk") or "",
                   type_code     = ac.get("t") or "",
-                  registration  = ac.get("r") or "")
+                  registration  = ac.get("r") or "",
+                  category      = ac.get("category") or "")
          s.distance_km = haversine_km(lat, lon, s.lat, s.lon)
                                # no radius: a tracked flight, any distance
          if ((radius_km is not None) and (s.distance_km > radius_km)):
@@ -1395,6 +1409,131 @@ def demo_logo_set(color, style):
 
 ###########################################################################
 ###
+### s i l h o u e t t e s
+###
+###########################################################################
+
+SILHOUETTE_GREY = (150, 150, 156)
+                               # 26x26 grey outlines for flights without a
+                               # logo: each row is 7 hex digits, the top
+                               # 26 bits of 28, leftmost LED first. Fixed
+                               # wing craft fly to the upper right, the
+                               # helicopter to the right
+SILHOUETTES = {
+   "airliner":
+      "00000000000000000000000000000000000000018000007801c00f001f81f00"
+      "0ff3e0003ffc0001ff800003f000003f000007f80000ff80021f38003fe3c00"
+      "1fc3c000781c000780e000180e00018060000c000000000000000000",
+   "bizjet":
+      "00000000000000000000000000000000000000018000003800000f000e01e00"
+      "0f83e0007f7c0001ff800007f000013e00003ff00007ff00023f780039f3800"
+      "1ffb8000f71c000331c000380c00018000000c000000000000000000",
+   "turboprop":
+      "0000000000000000000000300000039000003d800001fc30000fef000079e00"
+      "003fe00001fc00000fa00001fb00003ff80007dfc018f8f001df07800fe03c0"
+      "07c01e007800e007c000000e00000060000000000000000000000000",
+   "light":
+      "00000000000000008000001c000001e060000f03000078780003cfc0001ff40"
+      "000fe000007c00000fc00001fe00003ef00007c7800c783c00ef01e007c00f0"
+      "038006003c000000e000000600000000000000000000000000000000",
+   "helicopter":
+      "000000000000000000000000000000000000000000000000001fffc003fffc0"
+      "00010000c03c000c0ff000dfff800ffff8003fff80000ff000007e000004200"
+      "0004200001ffc0000000000000000000000000000000000000000000",
+   "glider":
+      "0000000000000000000000700000038000001c000000e000000706000038e00"
+      "001fc00000f8000007800000f800001dc000038e00007070008e03800dc01c0"
+      "07800e00700060038002000c00000000000000000000000000000000",
+   "balloon":
+      "00000000000000000000000000000000000003f000007f80000ffc0001ffe00"
+      "01ffe0001ffe0001ffe0000ffc0000ffc00007f800003f000001e0000008000"
+      "0000000001e000001e000000c0000000000000000000000000000000",
+   "drone":
+      "0000000000000000000000000000000000003807000440880040008004c0c80"
+      "02c0d000021000001e000001e000001e000001e000002100002c0d0004c0c80"
+      "04002800440880038070000000000000000000000000000000000000"
+   }
+                               # ICAO type designators, for when the
+                               # category doesn't say (or the source has
+                               # none); anything else falls back on it
+CRAFT_TYPES = {
+   "helicopter": "R22 R44 R66 EC20 EC25 EC30 EC35 EC45 EC55 EC75 H160 "
+                 "AS32 AS50 AS55 AS65 A109 A119 A139 A169 A189 B06 B06T "
+                 "B212 B222 B230 B407 B412 B427 B429 B430 B505 S76 S92 "
+                 "H60 UH1 H500 MD52 MD60 EXPL AW09 BK17 S300 S330 HUCO "
+                 "H47 H64 V22",
+   "bizjet"    : "C25A C25B C25C C25M C500 C501 C510 C525 C526 C550 C551 "
+                 "C560 C56X C650 C680 C68A C700 C750 CL30 CL35 CL60 GL5T "
+                 "GL7T GLEX GLF2 GLF3 GLF4 GLF5 GLF6 GALX ASTR LJ35 LJ40 "
+                 "LJ45 LJ55 LJ60 LJ70 LJ75 F2TH F900 FA10 FA20 FA50 FA6X "
+                 "FA7X FA8X E50P E55P E545 E550 PRM1 HDJT H25A H25B H25C "
+                 "SF50 PC24 EA50 BE40",
+   "turboprop" : "AT43 AT45 AT46 AT72 AT75 AT76 DH8A DH8B DH8C DH8D DHC6 "
+                 "DHC7 SF34 SW3 SW4 B190 BE20 BE30 BE9L BE99 BE10 C208 "
+                 "C425 C441 PC12 PC6T TBM7 TBM8 TBM9 JS31 JS32 JS41 D328 "
+                 "F27 F50 E110 E120 L410 P180 KODI AN24 AN26 C130 C30J "
+                 "M600 P46T PAY1 PAY2 PAY3 PAY4 SH36 CN35 C295",
+   "light"     : "C120 C140 C150 C152 C170 C172 C175 C177 C180 C182 C185 "
+                 "C195 C205 C206 C207 C210 C310 C337 C340 C414 C421 P28A "
+                 "P28B P28R P28T P32R P32T PA11 PA12 PA18 PA20 PA22 PA24 "
+                 "PA30 PA31 PA34 PA44 PA46 PA60 SR20 SR22 S22T DA20 DA40 "
+                 "DA42 DA62 BE23 BE24 BE33 BE35 BE36 BE55 BE58 BE76 M20P "
+                 "M20T J3 AA1 AA5 RV4 RV6 RV7 RV8 RV10 RV12 CH7A AC11 "
+                 "BL8 GA8 T206 T210 C72R TOBA",
+   "glider"    : "GLID",
+   "balloon"   : "BALL",
+   "drone"     : "UAV"}
+CRAFT_BY_TYPE = {code: kind for kind, codes in CRAFT_TYPES.items()
+                 for code in codes.split()}
+                               # ADS-B emitter categories: A1 light, A2
+                               # small (15,500-75,000 lb), A3-A5 large to
+                               # heavy, A6 high performance, A7 rotorcraft,
+                               # B1 glider, B2 lighter than air, B4
+                               # ultralight, B6 unmanned
+CRAFT_BY_CATEGORY = {"A1": "light",     "A2": "bizjet",
+                     "A3": "airliner",  "A4": "airliner",
+                     "A5": "airliner",  "A6": "bizjet",
+                     "A7": "helicopter", "B1": "glider",
+                     "B2": "balloon",   "B4": "light",
+                     "B6": "drone"}
+
+def craft_kind(type_code, category):
+   """
+      post: "airliner", "bizjet", "turboprop", "light", "helicopter",
+            "glider", "balloon", "drone", or "" when not known
+      imp:  the type designator decides first (it tells a turboprop from
+            a jet, which the category can't); airline jets not listed
+            are recognised by their makers' prefixes
+   """
+   code = (type_code or "").upper()
+   if (code in CRAFT_BY_TYPE):
+      return(CRAFT_BY_TYPE[code])
+   if (re.match(r"^(A3[0-9]{2}|A[123][19]N|A20N|B7[0-9]{2}|B3[789]M|"
+                r"B3XM|E1[79][05]|E75[LS]|E29[05]|CRJ[1-9X]|BCS[13]|"
+                r"MD[89][0-9]|MD11|DC10|A124|A225|IL96|SU95|C919|A388)$",
+                code)):
+      return("airliner")
+   return(CRAFT_BY_CATEGORY.get((category or "").upper(), ""))
+
+###########################################################################
+
+def silhouette(kind):
+   """
+      post: LOGO_SIZE rows of SILHOUETTE_GREY or None, or None when there
+            is no outline for kind
+   """
+   bits = SILHOUETTES.get(kind)
+   if (not bits):
+      return(None)
+   rows = []
+   for y in range(LOGO_SIZE):
+      value = int(bits[y * 7:y * 7 + 7], 16)
+      rows.append([SILHOUETTE_GREY if ((value >> (27 - x)) & 1) else None
+                   for x in range(LOGO_SIZE)])
+   return(rows)
+
+###########################################################################
+###
 ### s i x e l
 ###
 ###########################################################################
@@ -1929,6 +2068,12 @@ class FlightDataFetcher:
                info.aircraft_display_name_full = name
       if (self.logos and (info.logo is None)):
          self.apply_logo(info, self.logos.get(info))
+      if ((info.logo is None) and self.settings.get("show_logo") and
+          (self.settings.get("layout") == "wall")):
+                               # no logo: a grey outline of the kind of
+                               # craft, if that is known
+         info.logo = silhouette(craft_kind(info.aircraft_code or
+                                           s.type_code, s.category))
       if (self.airports):
                                # AeroAPI gives codes only; positions and
                                # elevations come from OurAirports
@@ -2438,6 +2583,11 @@ class NeoMatrixDisplay:
       m = self.matrix
       w = m.width
       x = 3
+                               # the logo's space is kept even when there is
+                               # nothing to show in it, so the text never
+                               # moves
+      if (self.settings["show_logo"]):
+         x = 3 + LOGO_SIZE + 3
       if (self.settings["show_logo"] and f.logo):
          if (self.settings.get("sixel") and f.logo_image):
                                # left dark: the renderer paints the logo
@@ -2449,7 +2599,6 @@ class NeoMatrixDisplay:
                             "size" : LOGO_SIZE}
          else:
             m.draw_image(3, 3, f.logo)
-         x = 3 + LOGO_SIZE + 3
       cols  = (w - 3 - x) // 6
       route = self.route_text(f)
       pct   = "" if (math.isnan(f.progress)) else f"{f.progress:.0f}%"
@@ -2675,6 +2824,12 @@ class TerminalRenderer:
 
    ########################################################################
 
+   @staticmethod
+   def wait(seconds):
+      time.sleep(seconds)
+
+   ########################################################################
+
    def _rgb(self, color):
       if (color is None):
          return(self.OFF)
@@ -2761,6 +2916,204 @@ class TerminalRenderer:
 
 ###########################################################################
 
+class WindowClosed(Exception):
+   """
+      name: WindowClosed
+      use:  raised when the GUI window is closed, to stop like Ctrl+C
+   """
+
+###########################################################################
+
+class GuiRenderer:
+   """
+      name: GuiRenderer
+      use:  shows the panel in a window drawn as an LED board: square
+            LEDs in a tight grid, thin dark gaps between them, unlit
+            ones dimly visible; the window can be resized and the LEDs
+            grow or shrink with it (they stay square and sharp)
+      imp:  tkinter, which comes with Python; a canvas holds one item
+            per LED, and only the LEDs that change are recoloured
+   """
+   BOARD = (10, 10, 12)
+   OFF   = (34, 34, 38)
+                               # gap between LEDs as a fraction of their
+                               # spacing (at least one screen pixel)
+   GAP   = 1.0 / 6.0
+
+   def __init__(self, brightness):
+      import tkinter
+      self.tk      = tkinter
+      self.scale   = max(0, min(255, brightness)) / 255.0
+      self.root    = None
+      self.canvas  = None
+      self.label   = None
+      self.size    = None
+      self.leds    = []
+      self.shown   = []
+      self.closed  = False
+      self.resized = False
+      self.status  = None
+
+   ########################################################################
+
+   def start(self):
+      tk        = self.tk
+      board     = self.hex(self.BOARD)
+      self.root = tk.Tk()
+      self.root.title("FlightWall")
+      self.root.configure(background = board)
+      self.root.protocol("WM_DELETE_WINDOW", self._close)
+      self.canvas = tk.Canvas(self.root, background = board,
+                              highlightthickness = 0)
+      self.canvas.pack(fill = "both", expand = True)
+      self.label = tk.Label(self.root, background = board,
+                            foreground = "#808080", anchor = "w",
+                            font = "TkFixedFont")
+      self.label.pack(fill = "x")
+      self.canvas.bind("<Configure>", self._configure)
+
+   ########################################################################
+
+   def stop(self):
+      if (self.root is not None):
+         try:
+            self.root.destroy()
+         except self.tk.TclError:
+            pass
+         self.root = None
+
+   ########################################################################
+
+   def _close(self):
+      self.closed = True
+
+   ########################################################################
+
+   def _configure(self, event):
+      self.resized = True
+
+   ########################################################################
+
+   @staticmethod
+   def hex(color):
+      return("#%02x%02x%02x" % tuple(color))
+
+   ########################################################################
+
+   def color(self, color):
+      """
+         post: the LED's colour as a Tk colour string, dimmed by the
+               brightness; unlit LEDs are dark grey
+      """
+      if (color is None):
+         return(self.hex(self.OFF))
+      return(self.hex([max(self.OFF[i], int(color[i] * self.scale))
+                       for i in range(3)]))
+
+   ########################################################################
+
+   def _build(self, width, height):
+      """
+         use:  one LED item per pixel
+      """
+      c = self.canvas
+      c.delete("all")
+      c.configure(width = width * 6 + 12, height = height * 6 + 12)
+      n         = width * height
+      off       = self.color(None)
+      self.leds = [c.create_rectangle(0, 0, 0, 0, fill = off, width = 0)
+                   for i in range(n)]
+      self.shown   = [None] * n
+      self.size    = (width, height)
+      self.resized = True
+
+   ########################################################################
+
+   def _layout(self):
+      """
+         use:  places every LED for the canvas's current size, centred,
+               as large as fits
+         imp:  whole-pixel spacing and sizes, so every LED is drawn the
+               same shape
+      """
+      c             = self.canvas
+      width, height = self.size
+      cw            = max(1, c.winfo_width())
+      ch            = max(1, c.winfo_height())
+      pitch         = max(2, min((cw - 12) // width,
+                                 (ch - 12) // height))
+      ox            = (cw - pitch * width) // 2
+      oy            = (ch - pitch * height) // 2
+      d             = pitch - max(1, int(round(pitch * self.GAP)))
+      inset         = (pitch - d) // 2
+      for y in range(height):
+         y0 = oy + y * pitch + inset
+         for x in range(width):
+            x0 = ox + x * pitch + inset
+            c.coords(self.leds[y * width + x], x0, y0, x0 + d, y0 + d)
+      self.resized = False
+
+   ########################################################################
+
+   def draw(self, matrix, status, overlay = None):
+      """
+         use:  shows the matrix; the logo is drawn in LEDs here, so the
+               overlay (a Sixel picture) is not used
+      """
+      if (self.closed):
+         raise(WindowClosed())
+      if (self.size != (matrix.width, matrix.height)):
+         self._build(matrix.width, matrix.height)
+         self.root.update_idletasks()
+      if (self.resized):
+         self._layout()
+      c = self.canvas
+      i = 0
+      for row in matrix.pixels:
+         for color in row:
+            if (color != self.shown[i]):
+               c.itemconfigure(self.leds[i], fill = self.color(color))
+               self.shown[i] = color
+            i += 1
+      if (status != self.status):
+         self.label.configure(text = " " + status)
+         self.status = status
+      self.root.update()
+      self._ready()
+
+   ########################################################################
+
+   def _ready(self):
+      """
+         use:  tells the console that started this process (-dgui) that
+               the window is showing, once
+      """
+      path = os.environ.pop(READY_ENV, "")
+      if (path):
+         try:
+            with open(path, "w", encoding = "utf-8") as handle:
+               handle.write(str(os.getpid()))
+         except OSError:
+            pass
+
+   ########################################################################
+
+   def wait(self, seconds):
+      """
+         use:  keeps the window responsive (moving, resizing, closing)
+               while the display loop waits
+      """
+      end = time.time() + seconds
+      while (time.time() < end):
+         if (self.closed):
+            raise(WindowClosed())
+         self.root.update()
+         if (self.resized and self.size):
+            self._layout()
+         time.sleep(0.02)
+
+###########################################################################
+
 class TextRenderer:
    """
       name: TextRenderer
@@ -2776,6 +3129,10 @@ class TextRenderer:
 
    def stop(self):
       pass
+
+   @staticmethod
+   def wait(seconds):
+      time.sleep(seconds)
 
    ########################################################################
 
@@ -2821,12 +3178,14 @@ where options are:
                 separated, e.g. -fUAL1179,DL402,N512GA
    -cFILE       settings file (default flightwall.ini beside the
                 script; created with defaults on first run)
-   -sSTYLE      half (LED matrix, default) or text (plain lines)
+   -dDISPLAY    half (LED matrix in the terminal, default), gui (a
+                window drawn as an LED board) or text (plain lines);
+                the .ini's style setting
    -gWxH        panel size in pixels for layout = classic, e.g. -g160x48
                 (the wall layout is always 128x72)
    -lFILE       write the firmware's serial log to FILE
    -o           fetch once, print the flights as text and exit
-   -d           demo data, no network needed
+   -D           demo data, no network needed
    -v           verbose log; more -v for more verbosity
    -h           help
 and place is where to centre the area instead of -x: a three-letter
@@ -2891,7 +3250,8 @@ Ctrl+C stops it.""")
             "text_color"       : dsp.get("text_color").strip().lstrip("#"),
             "route_codes"      : dsp.get("route_codes").strip().lower(),
             "show_unidentified": dsp.getboolean("show_unidentified"),
-            "style"            : dsp.get("style").strip().lower(),
+            "style"            : self.choice(dsp, "style",
+                                             ("half", "gui", "text")),
                                # "full" was the 1.1 name of the new layout
             "layout"           : self.choice(dsp, "layout",
                                              ("wall", "classic", "full")
@@ -3073,7 +3433,7 @@ Ctrl+C stops it.""")
 
    def execute(self, args):
       try:
-         opts, rest = getopt.gnu_getopt(args, "x:r:f:c:s:g:l:odvh")
+         opts, rest = getopt.gnu_getopt(args, "x:r:f:c:d:g:l:oDvh")
       except getopt.GetoptError as error:
          self.usage()
          raise(ExceptionClass(str(error), self.self_name, E_USAGE))
@@ -3106,8 +3466,8 @@ Ctrl+C stops it.""")
                   raise(ValueError(value))
             elif (option == "-c"):
                ini_path = value
-            elif (option == "-s"):
-               if (value not in ("half", "text")):
+            elif (option == "-d"):
+               if (value not in ("half", "gui", "text")):
                   raise(ValueError(value))
                override["style"] = value
             elif (option == "-g"):
@@ -3116,7 +3476,7 @@ Ctrl+C stops it.""")
                log_path = value
             elif (option == "-o"):
                once = True
-            elif (option == "-d"):
+            elif (option == "-D"):
                demo = True
             elif (option == "-v"):
                Log.verbose += 1
@@ -3151,6 +3511,13 @@ Ctrl+C stops it.""")
       except ValueError:
          raise(ExceptionClass(f"bad text_color {st['text_color']}",
                               self.self_name))
+      if ((st["style"] == "gui") and (not once) and
+          (not os.environ.get(DETACHED_ENV))):
+                               # settings and place were checked above, in
+                               # this console; the window runs on its own
+         started = self.detach(args)
+         if (started is not None):
+            return(started)
       if (log_path):
          try:
             Log.handle = open(log_path, "a", encoding = "utf-8")
@@ -3198,7 +3565,7 @@ Ctrl+C stops it.""")
 
       if ((st["style"] == "half") and (not enable_ansi())):
          print(f"{self.self_name}: this console cannot show colours; "
-               "using -stext", file = sys.stderr)
+               "using -dtext", file = sys.stderr)
          st["style"] = "text"
       st["sixel"] = False
       cell        = (10, 20)
@@ -3209,9 +3576,20 @@ Ctrl+C stops it.""")
          st["sixel"], cell = sixel_support()
          if (st["logo_graphics"] == "sixel"):
             st["sixel"] = True
-      renderer = (     TerminalRenderer(st["brightness"], st["sixel"], cell)
-                  if (st["style"] == "half")
-                  else TextRenderer(display))
+      if (st["style"] == "gui"):
+         try:
+            renderer = GuiRenderer(st["brightness"])
+         except ImportError:
+                               # Linux without the tk package
+            print(f"{self.self_name}: no tkinter, so no window; using "
+                  "-dhalf", file = sys.stderr)
+            st["style"] = "half"
+            enable_ansi()
+      if (st["style"] != "gui"):
+         renderer = (     TerminalRenderer(st["brightness"], st["sixel"],
+                                           cell)
+                     if (st["style"] == "half")
+                     else TextRenderer(display))
 
       threading.Thread(target = self.fetch_loop, daemon = True,
                        args = (fetcher, source,
@@ -3219,7 +3597,7 @@ Ctrl+C stops it.""")
       renderer.start()
       try:
          self.run(renderer, display, st)
-      except KeyboardInterrupt:
+      except (KeyboardInterrupt, WindowClosed):
          pass
       finally:
          self.stop.set()
@@ -3228,12 +3606,108 @@ Ctrl+C stops it.""")
 
    ########################################################################
 
+   def detach(self, args):
+      """
+         use:  -dgui: starts flightwall again as a separate process with
+               the same arguments and waits until its window is showing,
+               so the command prompt comes back only then (the Windows
+               equivalent of running it in the background with &)
+         post: returns E_SUCCESS once the window is up, E_FAIL when the
+               new process ended first, or None when there is no tkinter
+               (the panel is then drawn in this console instead)
+         imp:  Windows: pythonw.exe when it is beside python.exe, and
+               CREATE_NO_WINDOW with a hidden window, so no console
+               window flashes up; Linux: a new session. The new process
+               writes the file named in FLIGHTWALL_READY after its first
+               frame; its errors go to flightwall_gui.log beside the
+               script, since it has no console to show them in
+      """
+      try:
+         import tkinter
+      except ImportError:
+         return(None)
+      python  = sys.executable
+      flags   = 0
+      startup = None
+      if (os.name == "nt"):
+         windowed = os.path.join(os.path.dirname(python), "pythonw.exe")
+         if (os.path.isfile(windowed)):
+            python = windowed
+                               # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+                               # no console of its own, none borrowed
+         flags   = 0x08000000 | 0x00000200
+         startup = subprocess.STARTUPINFO()
+         startup.dwFlags     |= subprocess.STARTF_USESHOWWINDOW
+         startup.wShowWindow  = 0
+      ready = os.path.join(tempfile.gettempdir(),
+                           f"flightwall_ready_{os.getpid()}.txt")
+      try:
+         os.remove(ready)
+      except OSError:
+         pass
+      env               = dict(os.environ)
+      env[DETACHED_ENV] = "1"
+      env[READY_ENV]    = ready
+      log_path          = data_path("flightwall_gui.log")
+      log_start         = (     os.path.getsize(log_path)
+                           if (os.path.isfile(log_path))
+                           else 0)
+      log = open(log_path, "a", encoding = "utf-8")
+      try:
+         child = subprocess.Popen(
+                    [python, os.path.abspath(__file__)] + list(args),
+                    stdin             = subprocess.DEVNULL,
+                    stdout            = log,
+                    stderr            = log,
+                    env               = env,
+                    close_fds         = True,
+                    creationflags     = flags,
+                    startupinfo       = startup,
+                    start_new_session = (os.name != "nt"))
+      finally:
+         log.close()
+      print(f"{self.self_name}: starting the window...", end = "",
+            file = sys.stderr, flush = True)
+                               # first-run downloads (town and airport
+                               # lists) can take a while; keep waiting as
+                               # long as the process is alive
+      shown = False
+      while (child.poll() is None):
+         if (os.path.isfile(ready)):
+            shown = True
+            break
+         time.sleep(0.1)
+      try:
+         os.remove(ready)
+      except OSError:
+         pass
+      if (shown):
+         print(f" running (process {child.pid})", file = sys.stderr)
+         return(E_SUCCESS)
+      print(" failed", file = sys.stderr)
+      try:
+         with open(log_path, "r", encoding = "utf-8",
+                   errors = "replace") as handle:
+            handle.seek(log_start)
+            text = handle.read().strip()
+      except OSError:
+         text = ""
+      if (text):
+         print(text, file = sys.stderr)
+      else:
+         print(f"{self.self_name}: the window's process ended (exit "
+               f"code {child.returncode}); see {log_path}",
+               file = sys.stderr)
+      return(E_FAIL)
+
+   ########################################################################
+
    def run(self, renderer, display, st):
       """
          use:  display loop; the firmware only redraws after a fetch,
                here cards cycle every display_cycle_seconds as intended
       """
-      half  = isinstance(renderer, TerminalRenderer)
+      panel = isinstance(renderer, (TerminalRenderer, GuiRenderer))
       start = time.time()
       index = 0
       page  = 0
@@ -3267,11 +3741,11 @@ Ctrl+C stops it.""")
          else:
             display.show_loading()
             lines = ["..."]
-         if (half):
+         if (panel):
             renderer.draw(display.matrix, status, display.overlay)
          else:
             renderer.draw_card(lines, status)
-         time.sleep(0.25)
+         renderer.wait(0.25)
 
 if ( __name__ == "__main__" ):
    try:

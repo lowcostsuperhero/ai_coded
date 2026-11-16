@@ -13,11 +13,15 @@ Run
    python flightwall.py -x40.484,-80.037 -r8    around a position
    python flightwall.py -fUAL1179,N512GA        follow flights
    python flightwall.py                         use the .ini
-   python flightwall.py -d                      demo, no network
+   python flightwall.py -D                      demo, no network
+   python flightwall.py -dgui PIT               in a window
    python flightwall.py -o PIT                  print once, exit
    python flightwall.py -h                      all options
 
-Ctrl+C stops it.
+Ctrl+C stops it. With -dgui the window runs as a separate process
+(like & on Linux): the command prompt comes back as soon as the window
+is showing, or with the error if it could not start. Close the window
+to stop it.
 
 Options
 -------
@@ -26,12 +30,13 @@ Options
    -fIDENTS     follow up to 5 flights anywhere: callsigns (UAL1179),
                 flight numbers (UA1179) or tail numbers (N512GA)
    -cFILE       settings file (default flightwall.ini)
-   -sSTYLE      half (LED panel, default) or text (plain lines)
+   -dDISPLAY    half (LED panel in the terminal, default), gui (a
+                window drawn as an LED board) or text (plain lines)
    -gWxH        panel size for layout = classic (the wall layout is
                 always 128x72)
    -lFILE       write the log to FILE
    -o           fetch once, print the flights as text and exit
-   -d           demo data, no network needed
+   -D           demo data, no network needed
    -v           more detail in the log (-vv for more)
    -h           help
 
@@ -81,6 +86,16 @@ scaled, because a bitmap font can't be resized and stay crisp. In a
 smaller window you see its top left part, with the right and/or
 bottom edge cut off; in a larger one it is centred at full size.
 
+In a window (-dgui, or style = gui in the .ini) the panel is drawn as
+an LED board: square LEDs in a tight grid with thin dark gaps, unlit
+LEDs dimly visible, with the status line below. Resize the window
+freely: the LEDs grow or shrink with it and stay square and sharp.
+The logo is drawn in LEDs there. The window uses tkinter, which comes
+with Python on Windows; on Linux it may need the python3-tk package
+(without it flightwall falls back to the terminal). Errors from the
+window's process, which has no console, go to flightwall_gui.log
+beside the script.
+
 layout = classic in the .ini gives the original firmware's three-line
 card on the [hardware] panel (160 x 32) instead.
 
@@ -99,6 +114,14 @@ as a backup when you set aeroapi_key. Airline logos: images.kiwi.com
 (the 128-pixel logo, else the 64-pixel one). To use your own, put
 <ICAO>.png or <IATA>.png (e.g. UAL.png) in a "logos" folder beside
 the script; any size works.
+
+A flight with no logo (private planes, or an airline without one)
+shows a grey outline of the kind of craft instead: airliner, business
+jet, turboprop, light aircraft, helicopter, glider, balloon or drone.
+The kind comes from the aircraft's type code (B738, C172, EC35...) or,
+failing that, the ADS-B category the free feed reports (OpenSky gives
+none). When neither tells, the space is left dark; the flight number,
+route and aircraft lines never move.
 
 The logo is drawn as a real picture in terminals that can show Sixel
 images (Windows Terminal 1.22 or later, and many Linux terminals):
