@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id$
+# name: $Id: video_restore.py 2.main-2 11:47:04 22-Nov-2026 claude-opus-5-5 $
 # use: enhance videos locally: remove grain and noise, upscale, steady
 #      and sharpen
 """
@@ -65,13 +65,13 @@ E_USAGE   = 3
 
 SELF       = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 SELFPREFIX = os.path.dirname(os.path.abspath(sys.argv[0]))
-REVISION   = "$Revision$"
+REVISION   = "$Revision: 2.main-2 $"
 
 ESRGAN = "https://github.com/xinntao/Real-ESRGAN/releases/download/"
-                               # photo:   RRDB net, best quality, heavy
-                               # general: compact net, fast, with an
-                               #          adjustable denoise strength
-                               # anime:   RRDB net tuned for cartoons
+                                # photo:   RRDB net, best quality, heavy
+                                # general: compact net, fast, with an
+                                #          adjustable denoise strength
+                                # anime:   RRDB net tuned for cartoons
 WEIGHTS = {
    "photo"       : ESRGAN + "v0.1.0/RealESRGAN_x4plus.pth",
    "general"     : ESRGAN + "v0.2.5.0/realesr-general-x4v3.pth",
@@ -79,15 +79,15 @@ WEIGHTS = {
    "anime"       : ESRGAN + "v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
 }
 
-                               # optical flow is worked out at no more
-                               # than this size: plenty for lining
-                               # frames up, and much faster
+                                # optical flow is worked out at no more
+                                # than this size: plenty for lining
+                                # frames up, and much faster
 FLOW_SIZE = 960
 
-                               # work is saved in chunks, each closed
-                               # after this much processing time or
-                               # this many frames, whichever is first;
-                               # an interruption loses at most one
+                                # work is saved in chunks, each closed
+                                # after this much processing time or
+                                # this many frames, whichever is first;
+                                # an interruption loses at most one
 CHUNK_SECONDS = 60
 CHUNK_FRAMES  = 600
 
@@ -196,8 +196,8 @@ class Engine:
          if (self.model_name == "general"):
             strong = load_state(fetch_weights("general",     verbose))
             weak   = load_state(fetch_weights("general-wdn", verbose))
-                               # deep network interpolation, as done
-                               # by real-esrgan's own -dn option
+                                # deep network interpolation, as done
+                                # by real-esrgan's own -dn option
             s      = 0.5 * self.opts.d
             state  = {key: s * strong[key] + (1 - s) * weak[key]
                       for key in strong}
@@ -364,8 +364,8 @@ class Checkpoint:
       with open(partial, "w") as stream:
          json.dump(state, stream, indent = 1)
       os.replace(partial, self.path)
-                               # the previous last frame is no longer
-                               # referenced
+                                # the previous last frame is no longer
+                                # referenced
       if (self.last):
          try:
             os.remove(os.path.join(self.folder, self.last))
@@ -811,9 +811,9 @@ def join_chunks(folder, chunks, source, trim, fps, target):
              trim + ["-i", source,
               "-map", "0:v", "-map", "1:a?", "-c:v", "copy",
               "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-                               # the video's own length: -shortest
-                               # would cut frames when the audio track
-                               # ends a little early
+                                # the video's own length: -shortest
+                                # would cut frames when the audio track
+                                # ends a little early
               "-t", f"{total / fps:.3f}", partial]
    result = subprocess.run(command, capture_output = True, text = True)
    os.remove(listing)
@@ -888,8 +888,8 @@ def duration(seconds):
       hours, rest    = divmod(total, 60 * 60)
       minutes, rest  = divmod(rest, 60)
       units          = [(hours, "hr"), (minutes, "min"), (rest, "sec")]
-                               # drop leading zeros, always keeping
-                               # the last unit
+                                # drop leading zeros, always keeping
+                                # the last unit
    while ((len(units) > 1) and (units[0][0] == 0)):
       units.pop(0)
    return(" ".join(f"{number}{unit}" for number, unit in units))
@@ -906,10 +906,10 @@ def open_chunk(folder, number, size, fps, opts):
    writer = imageio_ffmpeg.write_frames(
                temp, size, fps = fps, codec = "libx264", quality = None,
                macro_block_size = 2, ffmpeg_log_level = "error",
-                               # veryfast: much quicker than the
-                               # default for little size cost at this
-                               # crf; the ai, not the encoder, is
-                               # where the time goes
+                                # veryfast: much quicker than the
+                                # default for little size cost at this
+                                # crf; the ai, not the encoder, is
+                                # where the time goes
                output_params = ["-crf", str(opts.q), "-preset", "veryfast"])
    writer.send(None)
    return(name, temp, writer)
@@ -960,8 +960,8 @@ def restore_file(engine, source, target):
    size   = (even(w * opts.s), even(h * opts.s))
    radius = 1 + round(2 * opts.d)
    log(0, 1, f"{source}: {w}x{h} at {fps:g} fps, about {count} frames")
-                               # "->" goes on the next line, placed so
-                               # the new size lines up under the old
+                                # "->" goes on the next line, placed so
+                                # the new size lines up under the old
    column = len(f"{SELF}: {source}: ")
    print(" " * max(0, column - 3) + f"-> {size[0]}x{size[1]}"
          + ("" if (meta.get("audio_codec")) else ", no audio"),
@@ -978,11 +978,11 @@ def restore_file(engine, source, target):
    previous = checkpoint.previous
    aligner  = Aligner(w, h)
 
-                               # frames are read a few ahead of the
-                               # one being worked on, so how many have
-                               # been read corrects the estimated
-                               # total, and the end of the video gives
-                               # the exact one
+                                # frames are read a few ahead of the
+                                # one being worked on, so how many have
+                                # been read corrects the estimated
+                                # total, and the end of the video gives
+                                # the exact one
    reading = {"seen" : 0, "ended" : False}
 
    def frames():
@@ -1054,8 +1054,8 @@ def restore_file(engine, source, target):
          os.replace(temp, os.path.join(checkpoint.folder, name))
          checkpoint.add(name, in_chunk, previous, sigma)
    except KeyboardInterrupt:
-                               # the chunk in progress is incomplete:
-                               # drop it; everything before is kept
+                                # the chunk in progress is incomplete:
+                                # drop it; everything before is kept
       if (writer is not None):
          try:
             writer.close()
@@ -1080,7 +1080,7 @@ def restore_file(engine, source, target):
    total = join_chunks(checkpoint.folder, checkpoint.chunks, source,
                        trim_params(opts.p, opts.l), fps, target)
    checkpoint.clear()
-                               # a -a preview is out of date now
+                                # a -a preview is out of date now
    if (os.path.exists(preview_path(target))):
       os.remove(preview_path(target))
    elapsed = time.time() - started
@@ -1137,7 +1137,7 @@ def parse(argv):
       raise(ExceptionClass("-a and -x do not go together",
                            code = E_USAGE))
 
-                               # cmd.exe does not expand wildcards
+                                # cmd.exe does not expand wildcards
    videos = []
    for pattern in opts.videos:
       videos.extend(sorted(glob.glob(pattern)) or [pattern])

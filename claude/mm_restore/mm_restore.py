@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id$
+# name: $Id: mm_restore.py 2.main-2 11:47:04 22-Nov-2026 claude-opus-5-5 $
 # use: restore images and videos alike, handing each file to
 #      image_restore.py or video_restore.py
 """
@@ -42,14 +42,14 @@ E_USAGE   = 3
 
 SELF       = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 SELFPREFIX = os.path.dirname(os.path.abspath(sys.argv[0]))
-REVISION   = "$Revision$"
+REVISION   = "$Revision: 2.main-2 $"
 
 IMAGE_SCRIPT = os.path.join(SELFPREFIX, "image_restore.py")
 VIDEO_SCRIPT = os.path.join(SELFPREFIX, "video_restore.py")
 
-                               # option letter: (applies to, letter
-                               # in the target script, takes a value)
-                               # "both", "image" or "video"
+                                # option letter: (applies to, letter
+                                # in the target script, takes a value)
+                                # "both", "image" or "video"
 OPTIONS = {
    "s" : ("both",  "s", True),
    "d" : ("both",  "d", True),
@@ -71,8 +71,8 @@ OPTIONS = {
    "a" : ("video", "a", False),
 }
 
-                               # extensions python's mimetypes table
-                               # misses or gets wrong on some systems
+                                # extensions python's mimetypes table
+                                # misses or gets wrong on some systems
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp",
                     ".gif", ".tif", ".tiff", ".webp", ".ppm", ".pgm",
                     ".pbm", ".pnm", ".tga", ".ico", ".dib", ".pcx"}
@@ -177,9 +177,9 @@ def sniff(path):
        head[:4] in (b"II*\x00", b"MM\x00*")        or
        riff     == b"WEBP"):
       return("image")
-                               # mp4/mov/3gp keep "ftyp" at offset 4,
-                               # except heic/avif stills, which are
-                               # images in an mp4-style box
+                                # mp4/mov/3gp keep "ftyp" at offset 4,
+                                # except heic/avif stills, which are
+                                # images in an mp4-style box
    if (head[4:8] == b"ftyp"):
       brand = head[8:12]
       if (brand in (b"heic", b"heix", b"mif1", b"msf1", b"avif")):
@@ -193,8 +193,8 @@ def sniff(path):
        head[:4] == b"\x30\x26\xb2\x75"             or
        head[:4] == b"OggS"                         or
        head[:4] == b".RMF"                         or
-                               # mpeg transport stream: a 0x47 sync
-                               # byte every 188 bytes
+                                # mpeg transport stream: a 0x47 sync
+                                # byte every 188 bytes
        ((len(head) > 376) and
         (head[0] == head[188] == head[376] == 0x47))):
       return("video")
@@ -246,9 +246,9 @@ def parse(argv):
    if (not opts.files):
       raise(ExceptionClass(f"no files given\n{USAGE}", code = E_USAGE))
 
-                               # cmd.exe does not expand wildcards;
-                               # a pattern like *.* may also match
-                               # directories, which are skipped
+                                # cmd.exe does not expand wildcards;
+                                # a pattern like *.* may also match
+                                # directories, which are skipped
    files = []
    for pattern in opts.files:
       matched = sorted(glob.glob(pattern)) or [pattern]
@@ -268,8 +268,8 @@ def arguments(opts, kind):
       if (applies not in ("both", kind)):
          continue
       value = getattr(opts, letter)
-                               # -mnone is video-only: images keep
-                               # their default model
+                                # -mnone is video-only: images keep
+                                # their default model
       if ((letter == "m") and (value == "none") and (kind == "image")):
          continue
       if (valued and (value is not None)):
@@ -340,7 +340,7 @@ def main(argv):
    worst = E_WARN if (unknown) else E_SUCCESS
    if (not (images or videos)):
       return(E_FAIL)
-                               # -a only looks at unfinished videos
+                                # -a only looks at unfinished videos
    if (opts.a and images):
       print(f"{SELF}: -a is for videos only; {len(images)} image(s) "
             "left alone", file = sys.stderr)

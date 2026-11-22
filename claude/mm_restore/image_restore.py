@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id$
+# name: $Id: image_restore.py 2.main-2 11:47:04 22-Nov-2026 claude-opus-5-5 $
 # use: restore old or damaged photos locally: remove scratches and dust,
 #      deblur, denoise, upscale, rebuild faces and sharpen
 """
@@ -63,17 +63,17 @@ E_USAGE   = 3
 
 SELF       = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 SELFPREFIX = os.path.dirname(os.path.abspath(sys.argv[0]))
-REVISION   = "$Revision$"
+REVISION   = "$Revision: 2.main-2 $"
 
 ESRGAN = "https://github.com/xinntao/Real-ESRGAN/releases/download/"
-                               # photo:   RRDB net, best quality, heavy
-                               # general: compact net, fast, with an
-                               #          adjustable denoise strength
-                               #          (blend of the two "general"
-                               #          weight sets)
-                               # anime:   RRDB net tuned for line art
-                               # yunet is stored in git lfs, so the
-                               # media host is used rather than /raw/
+                                # photo:   RRDB net, best quality, heavy
+                                # general: compact net, fast, with an
+                                #          adjustable denoise strength
+                                #          (blend of the two "general"
+                                #          weight sets)
+                                # anime:   RRDB net tuned for line art
+                                # yunet is stored in git lfs, so the
+                                # media host is used rather than /raw/
 WEIGHTS = {
    "photo"       : ESRGAN + "v0.1.0/RealESRGAN_x4plus.pth",
    "general"     : ESRGAN + "v0.2.5.0/realesr-general-x4v3.pth",
@@ -90,9 +90,9 @@ WEIGHTS = {
                    "face_detection_yunet_2023mar.onnx",
 }
 
-                               # eye, eye, nose, mouth corner, mouth
-                               # corner positions in a 512x512 ffhq
-                               # face, the layout gfpgan was trained on
+                                # eye, eye, nose, mouth corner, mouth
+                                # corner positions in a 512x512 ffhq
+                                # face, the layout gfpgan was trained on
 FACE_SIZE     = 512
 FACE_TEMPLATE = [[192.98138, 239.94708],
                  [318.90277, 240.19360],
@@ -230,8 +230,8 @@ class Engine:
       if (self.model_name == "general"):
          strong = load_state(fetch_weights("general",     verbose))
          weak   = load_state(fetch_weights("general-wdn", verbose))
-                               # deep network interpolation, as done
-                               # by real-esrgan's own -dn option
+                                # deep network interpolation, as done
+                                # by real-esrgan's own -dn option
          s      = self.strength
          state  = {key: s * strong[key] + (1 - s) * weak[key]
                    for key in strong}
@@ -419,9 +419,9 @@ def pick_tile(requested, device, free, model_name):
               else  512 if (gib >= 3)
               else  256)
    else:
-                               # cpu and mps: memory is rarely the
-                               # limit, but moderate tiles keep ram use
-                               # and swap in check on large images
+                                # cpu and mps: memory is rarely the
+                                # limit, but moderate tiles keep ram use
+                                # and swap in check on large images
       tile = 512
    return(tile if (heavy) else tile * 2)
 
@@ -512,9 +512,9 @@ def detect_scratches(rgb, strength, eyes, verbose):
                                                        (length, length)))
       thin     = numpy.maximum(thin, response)
 
-                               # robust spread: median absolute
-                               # deviation, so busy pictures do not
-                               # raise the bar as std would
+                                # robust spread: median absolute
+                                # deviation, so busy pictures do not
+                                # raise the bar as std would
    median = float(numpy.median(score))
    spread = float(numpy.median(numpy.abs(score - median))) * 1.4826 + 1e-6
    binary = (score > median + (7 - 4 * strength) * spread)
@@ -530,10 +530,10 @@ def detect_scratches(rgb, strength, eyes, verbose):
       yy = (ys + ny * offset).round().astype(int).clip(0, sh - 1)
       return(near[yy, xx].mean())
 
-                               # a scratch is a lone line: most of the
-                               # segment detected, and clearly more
-                               # than in parallel strips either side
-                               # (wood grain, fabric, hair fail this)
+                                # a scratch is a lone line: most of the
+                                # segment detected, and clearly more
+                                # than in parallel strips either side
+                                # (wood grain, fabric, hair fail this)
    standout = 0.45 - 0.3 * strength
    mask     = numpy.zeros((sh, sw), numpy.uint8)
    kept     = 0
@@ -549,19 +549,19 @@ def detect_scratches(rgb, strength, eyes, verbose):
       if ((on >= 0.5) and (on - side >= standout)):
          cv2.line(mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
          kept += 1
-                               # widen each segment to the scratch's
-                               # real width: detected thin pixels near
-                               # the segment
+                                # widen each segment to the scratch's
+                                # real width: detected thin pixels near
+                                # the segment
    band = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                      (size, size)))
    mask = numpy.maximum(mask, numpy.where((band > 0) & (binary > 0),
                                           255, 0).astype(numpy.uint8))
 
-                               # dust: small, very strong specks, not
-                               # in eyes, as catchlights look exactly
-                               # like dust
-                               # judged against the neighbourhood, so
-                               # one grain among many is not dust
+                                # dust: small, very strong specks, not
+                                # in eyes, as catchlights look exactly
+                                # like dust
+                                # judged against the neighbourhood, so
+                                # one grain among many is not dust
    window = (5 * size, 5 * size)
    local  = cv2.blur(thin, window)
    spread = numpy.sqrt(numpy.maximum(cv2.blur(thin * thin, window) -
@@ -578,15 +578,15 @@ def detect_scratches(rgb, strength, eyes, verbose):
       if any(math.hypot(cx - ex, cy - ey) <= radius
              for ex, ey, radius in eyes):
          continue
-                               # a wider margin than scratches get:
-                               # any halo left showing gets continued
-                               # back into the hole
+                                # a wider margin than scratches get:
+                                # any halo left showing gets continued
+                                # back into the hole
       x0, y0 = max(x - 1, 0), max(y - 1, 0)
       mask[y0:y + bh + 1, x0:x + bw + 1] = 255
       dust += 1
 
-                               # grow to cover each mark's soft edges,
-                               # then back to full size
+                                # grow to cover each mark's soft edges,
+                                # then back to full size
    grow = max(1, size // 4)
    mask = cv2.dilate(mask, cv2.getStructuringElement(
                               cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2))
@@ -633,9 +633,9 @@ def inpaint(engine, rgb, mask):
             result[y:ey, x:ex][keep] = out[core][keep]
       return(result)
 
-                               # lama was trained on ~512px images; it
-                               # copes with more, but tiles keep memory
-                               # in hand on big scans
+                                # lama was trained on ~512px images; it
+                                # copes with more, but tiles keep memory
+                                # in hand on big scans
    tile = 1024 if (max(h, w) > 1536) else 0
    return(engine.oom_retry(run, tile, max(h, w)))
 
@@ -726,9 +726,9 @@ def upscale(engine, rgb, scale):
    tensor = to_tensor(rgb)
    passes = max(1, math.ceil(math.log(scale, factor) - 1e-9))
 
-                               # convolutional: a 16px margin plus a
-                               # 32px cross-fade is wider than any
-                               # tile-edge effect
+                                # convolutional: a 16px margin plus a
+                                # 32px cross-fade is wider than any
+                                # tile-edge effect
    def run_tiled(tile):
       return(run_tiles(engine, model, dtype, tensor, tile, 48))
 
@@ -757,15 +757,15 @@ def deblur(engine, rgb, strength):
    h, w   = rgb.shape[:2]
    source = to_tensor(rgb)
 
-                               # restormer's attention takes in the
-                               # whole tile, so tiles differ in tone:
-                               # a quarter-tile cross-fade hides it
+                                # restormer's attention takes in the
+                                # whole tile, so tiles differ in tone:
+                                # a quarter-tile cross-fade hides it
    def run(tile):
       return(run_tiles(engine, model, dtype, source, tile,
                        max(48, tile // 4)))
 
-                               # restormer's attention needs far more
-                               # memory per pixel than the upscalers
+                                # restormer's attention needs far more
+                                # memory per pixel than the upscalers
    if (engine.device.type == "cuda"):
       gib  = engine.free / 2**30
       tile = 768 if (gib >= 10) else 512 if (gib >= 5) else 256
@@ -833,8 +833,8 @@ def restore_faces(engine, source, target, faces, weight):
    template = numpy.array(FACE_TEMPLATE, dtype = numpy.float32)
    result   = target.astype(numpy.float32)
 
-                               # feathered square: the crop's own edge
-                               # fades out so the seam does not show
+                                # feathered square: the crop's own edge
+                                # fades out so the seam does not show
    edge = numpy.zeros((FACE_SIZE, FACE_SIZE), numpy.float32)
    edge[24:-24, 24:-24] = 1
    edge = cv2.GaussianBlur(edge, (0, 0), 12)
@@ -853,15 +853,15 @@ def restore_faces(engine, source, target, faces, weight):
          face = model(to_tensor(crop).to(engine.device, dtype))
       face = to_array(face.float().cpu()).astype(numpy.float32)
 
-                               # same mapping, but from target pixels:
-                               # divide out the enlargement
+                                # same mapping, but from target pixels:
+                                # divide out the enlargement
       scaled = matrix.copy()
       scaled[:, 0] /= sx
       scaled[:, 1] /= sy
       back   = cv2.invertAffineTransform(scaled)
 
-                               # only warp into the face's bounding box
-                               # rather than a whole-image canvas
+                                # only warp into the face's bounding box
+                                # rather than a whole-image canvas
       corners = numpy.array([[0, 0, 1], [FACE_SIZE, 0, 1],
                              [0, FACE_SIZE, 1], [FACE_SIZE, FACE_SIZE, 1]],
                             numpy.float32) @ back.T
@@ -936,8 +936,8 @@ def restore_file(engine, source, target):
    h, w = rgb.shape[:2]
    size = (max(1, round(w * opts.s)), max(1, round(h * opts.s)))
 
-                               # faces first: dust detection must
-                               # leave the catchlights in eyes alone
+                                # faces first: dust detection must
+                                # leave the catchlights in eyes alone
    faces = detect_faces(engine, rgb) if (opts.f > 0 or opts.r > 0) else []
 
    mask = numpy.zeros((h, w), numpy.uint8)
@@ -965,11 +965,11 @@ def restore_file(engine, source, target):
       rgb = inpaint(engine, rgb, mask)
 
    if (opts.b > 0):
-                               # grain off first, using the upscaler
-                               # as a denoiser: enlarge, then shrink
-                               # back; opencv's denoise was tried and
-                               # leaves restormer a painted-looking
-                               # image
+                                # grain off first, using the upscaler
+                                # as a denoiser: enlarge, then shrink
+                                # back; opencv's denoise was tried and
+                                # leaves restormer a painted-looking
+                                # image
       log(1, opts.v, f"{source}: denoising before deblur")
       model, _ = engine.get("upscaler")
       clean    = upscale(engine, rgb, model.scale)
@@ -995,9 +995,9 @@ def restore_file(engine, source, target):
       result = sharpen(result, opts.k, opts.s, opts.v)
    if (alpha is not None):
       result.putalpha(alpha.resize(size, Image.LANCZOS))
-                               # a half-written file is never left
-                               # under the real name, where a rerun
-                               # would take it for a finished one
+                                # a half-written file is never left
+                                # under the real name, where a rerun
+                                # would take it for a finished one
    base, extension = os.path.splitext(target)
    partial = f"{base}.partial{extension}"
    try:
@@ -1052,7 +1052,7 @@ def parse(argv):
    if (opts.t < 0):
       raise(ExceptionClass("-t must be 0 or more", code = E_USAGE))
 
-                               # cmd.exe does not expand wildcards
+                                # cmd.exe does not expand wildcards
    images = []
    for pattern in opts.images:
       images.extend(sorted(glob.glob(pattern)) or [pattern])
@@ -1086,9 +1086,9 @@ def main(argv):
       raise(ExceptionClass(f"{error.name} is not installed; run\n"
                            "   pip install torch spandrel pillow numpy "
                            "opencv-python"))
-                               # quiet the library chatter: torch warns
-                               # that the lama file format is old, and
-                               # opencv logs dnn backend notes
+                                # quiet the library chatter: torch warns
+                                # that the lama file format is old, and
+                                # opencv logs dnn backend notes
    warnings.filterwarnings("ignore", category = FutureWarning)
    try:
       cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
