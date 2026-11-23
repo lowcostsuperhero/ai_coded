@@ -67,10 +67,11 @@ CACHE = os.path.join(HOME, "prices.pkl")
 LEDGER = os.path.join(HOME, "ledger.json")
 STATE = os.path.join(HOME, "state.json")
 PREDS = os.path.join(HOME, "predictions.json")
+WATCH = os.path.join(HOME, "watchlist.json")
 MIN_PAIRS = 150                # past predictions needed to calibrate
 BENCH = "SPY"
 
-UNIVERSE = """
+SMALL_UNIVERSE = """
 AAPL MSFT GOOGL AMZN NVDA META AVGO ORCL ADBE CRM CSCO IBM TXN QCOM
 INTC AMAT ACN INTU
 JPM BAC WFC GS MS AXP BLK SPGI V MA BRK-B
@@ -80,6 +81,29 @@ XOM CVX COP LIN
 HON UNP UPS CAT DE GE MMM LMT RTX
 VZ T CMCSA TMUS DIS SO DUK NEE
 """.split()
+
+# About 300 large, established US stocks (--universe large, the
+# default). Symbols that Yahoo no longer serves are skipped with a
+# message at download time.
+LARGE_UNIVERSE = sorted(set(SMALL_UNIVERSE + """
+AMD NOW PANW SNPS CDNS KLAC LRCX ADI MU MCHP NXPI FTNT ANET ADSK ROP
+APH TEL GLW HPQ HPE DELL NTAP STX WDC KEYS TYL FICO PTC ZBRA TSLA NFLX
+PYPL UBER BKNG EA TTWO
+C SCHW CB PGR MMC AON ICE CME MCO USB PNC TFC COF MET PRU AIG ALL TRV
+AFL BK STT FITB HBAN RF KEY MTB NTRS CFG
+ISRG SYK BSX VRTX REGN ZTS CI ELV HUM CVS MCK COR CAH BDX EW IQV A IDXX
+MTD RMD HCA BIIB DXCM STE ZBH WAT
+KMB GIS KHC HSY SYY KR ADM STZ KDP MNST EL CHD CLX TSN HRL
+TJX ROST ORLY AZO DG DLTR MAR HLT YUM CMG LULU F GM DHI LEN NVR PHM EBAY
+BBY ULTA DRI RCL
+EOG SLB OXY PSX MPC VLO KMI WMB OKE HAL BKR DVN FANG
+SHW ECL APD FCX NEM NUE DD DOW PPG VMC MLM
+NOC GD BA ETN EMR ITW PH CMI PCAR FDX CSX NSC WM RSG ADP PAYX CTAS FAST
+ODFL URI JCI TT CARR OTIS GWW IR XYL LHX
+CHTR
+D AEP EXC SRE XEL PEG ED WEC EIX ES DTE ETR AEE CMS
+PLD AMT EQIX CCI PSA O SPG WELL DLR AVB EQR VICI
+""".split()))
 
 # Quality gate applied to every stock on every date (trailing data only):
 # no low-priced stocks, median 60-day dollar volume must be liquid,
@@ -121,25 +145,32 @@ HELP = dict(
    nextday="nextday              advance the as-of date to the next "
            "business day",
    recommend="recommend [N]        top N picks with gain, confidence, "
-             "sells for held positions",
+             "sells for held positions\n                          "
+             "('recommendation(s)' work too)",
    track="track [N]            record the BUY picks as open positions",
    buy="buy TICKER [price]   record a position you opened",
    sell="sell TICKER          close a recorded position",
-   positions="positions            show open positions and SELL/HOLD",
-   realpositions="realpositions        the real ledger's positions and "
-                 "SELL/HOLD on the latest\n                          "
-                 "date (ignores asof and the practice timeline)",
-   savepositions="savepositions        save the current positions, "
-                 "overwriting the ledger file",
-   mergepositions="mergepositions       (practice timeline) add the real "
-                  "ledger's positions owned\n"
-                  "                          on the as-of date",
+   positions="positions            positions held on the as-of date "
+             "(from your real ledger by\n                          "
+             "buy/sell date) and SELL/HOLD; 'position' works too",
+   realpositions="realpositions        the real ledger's open positions "
+                 "and SELL/HOLD on the\n                          latest "
+                 "date (ignores asof)",
+   savepositions="savepositions        write practice buys/sells made "
+                 "while an as-of date was\n                          "
+                 "active into the real ledger",
    compare="compare [N]          judge picks at the as-of date against "
            "what really happened",
    follow="follow TICKER [steps] [step_days]   walk one stock forward "
           "period by period",
    simulate="simulate [days] [capital]   trade the model over the last "
             "N days (default 90)",
+   watch="watch TICKER ...    add newly listed (IPO) stocks to the "
+         "watchlist; they are\n                          tracked but "
+         "never recommended until they pass the quality gate",
+   unwatch="unwatch TICKER ...  remove stocks from the watchlist",
+   watchlist="watchlist            price, history and gate status of "
+             "watched stocks",
    universe="universe             show which stocks pass the quality gate",
    refresh="refresh              re-download price history",
    calibrate="calibrate [days]      replay history to measure how reliable "
@@ -191,33 +222,63 @@ def hold_text(c):
    return "no holding limit"
 
 
+# The IPO / new-listing watchlist: [{"ticker": "XYZ", "added": date}].
+def load_watch():
+   try:
+      with open(WATCH) as fh:
+         return [w for w in json.load(fh) if w.get("ticker")]
+   except Exception:
+      return []
+
+
+def save_watch(w):
+   dump_json(WATCH, w)
+
+
 # ---------------------------------------------------------------- data
+# Write the price cache (frames and the list of symbols asked for).
+def save_cache(frames, requested, years, stamp=None):
+   os.makedirs(HOME, exist_ok=True)
+   with open(CACHE, "wb") as fh:
+      pickle.dump(dict(time=stamp or time.time(), requested=sorted(
+         set(requested)), years=years, frames=frames), fh)
+
+
 # Download (or load from cache) daily OHLCV for the tickers + benchmark.
-def load_frames(tickers, years, force=False, synthetic=False):
+# ipo lists watched symbols: they are kept however short their history.
+# A fresh cache that lacks some symbols only downloads the missing ones.
+def load_frames(tickers, years, force=False, synthetic=False, ipo=()):
    if synthetic:
-      return synth_frames()
-   want = sorted(set(tickers) | set([BENCH]))
+      return synth_frames(set(tickers) | set(ipo))
+   want = sorted(set(tickers) | set([BENCH]) | set(ipo))
    if os.path.exists(CACHE) and not force:
       try:
          with open(CACHE, "rb") as fh:
             c = pickle.load(fh)
          fresh = time.time() - c["time"] < 20 * 3600
          deep = c.get("years", 0) >= years
-         if fresh and deep and set(want) <= set(c["requested"]):
-            print("Using cached prices (use 'refresh' to re-download).")
+         if fresh and deep:
+            # new symbols, plus watched ones that had no data last time
+            # (an IPO that was not trading yet)
+            miss = sorted((set(want) - set(c["requested"])) |
+                          (set(ipo) - set(c["frames"])))
+            if miss:
+               c["frames"].update(download(miss, years, ipo, False))
+               save_cache(c["frames"], set(c["requested"]) | set(want),
+                          years, c["time"])
+            else:
+               print("Using cached prices (use 'refresh' to "
+                     "re-download).")
             return dict((t, c["frames"][t]) for t in want
                         if t in c["frames"])
       except Exception:
          pass
-   frames = download(want, years)
-   os.makedirs(HOME, exist_ok=True)
-   with open(CACHE, "wb") as fh:
-      pickle.dump(dict(time=time.time(), requested=want, years=years,
-                       frames=frames), fh)
+   frames = download(want, years, ipo)
+   save_cache(frames, want, years)
    return frames
 
 
-def download(want, years):
+def download(want, years, ipo=(), need_bench=True):
    try:
       import yfinance as yf
    except ImportError:
@@ -225,6 +286,8 @@ def download(want, years):
    print("Downloading %d symbols of public price history..." % len(want))
    raw = yf.download(want, period="%dy" % years, auto_adjust=True,
                      group_by="ticker", progress=False, threads=True)
+   if len(want) == 1 and not isinstance(raw.columns, pd.MultiIndex):
+      raw = pd.concat({want[0]: raw}, axis=1)
    frames = {}
    for t in want:
       try:
@@ -235,18 +298,18 @@ def download(want, years):
       for col in ("Open", "High", "Low"):
          df[col] = df[col].fillna(df["Close"])
       df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-      if len(df) > 400:
+      if len(df) > 400 or (t in ipo and len(df) >= 2):
          frames[t] = df
    bad = [t for t in want if t not in frames]
    if bad:
       print("No usable data for: %s" % " ".join(bad))
-   if BENCH not in frames:
+   if need_bench and BENCH not in frames:
       sys.exit("Could not download benchmark %s." % BENCH)
    return frames
 
 
 # Random-walk stocks with slow drift regimes, for offline testing only.
-def synth_frames():
+def synth_frames(want=None):
    rng = np.random.default_rng(42)
    n = 8 * 252
    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
@@ -268,6 +331,16 @@ def synth_frames():
       v = rng.uniform(4e6, 9e6, n)
       frames[t] = pd.DataFrame(dict(Open=o, High=hi, Low=lo, Close=c,
                                     Volume=v), index=dates)
+   # SYNIPO: a stock that began trading 40 days ago (for testing watch)
+   m = 40
+   c = 30 * np.exp(np.cumsum(rng.normal(0.004, 0.03, m)))
+   o = np.roll(c, 1) * (1 + rng.normal(0, 0.01, m))
+   o[0] = c[0] * 1.1
+   frames["SYNIPO"] = pd.DataFrame(dict(
+      Open=o, High=np.maximum(o, c) * 1.01, Low=np.minimum(o, c) * 0.99,
+      Close=c, Volume=rng.uniform(4e6, 9e6, m)), index=dates[-m:])
+   if want is not None and "SYNIPO" not in want:
+      del frames["SYNIPO"]
    return frames
 
 
@@ -676,12 +749,11 @@ class Picker(object):
       self.cache = {}
       self.real = self.load_ledger()
       self.pretend = []
-      # True once 'asof' has moved to a past date. From then on this
-      # session is its own practice timeline with its own positions: it
-      # is never auto-saved and the real ledger is never mixed in, even
-      # after returning to the latest date. Only 'savepositions' (write)
-      # and 'mergepositions' (read) touch the ledger file.
-      self.forked = False
+      # pretend_exit maps a real position's key to (day index, price)
+      # of a sale made while an as-of date was active. Practice buys
+      # (pretend) and these sales live only in this session until
+      # 'savepositions' writes them into the real ledger.
+      self.pretend_exit = {}
       self.last_buys = []
       self.warm = {}
       self.preds = []
@@ -887,13 +959,61 @@ class Picker(object):
          return []
 
    def save_ledger(self):
-      if not self.forked:
-         os.makedirs(HOME, exist_ok=True)
-         with open(LEDGER, "w") as fh:
-            json.dump(self.real, fh, indent=1)
+      os.makedirs(HOME, exist_ok=True)
+      with open(LEDGER, "w") as fh:
+         json.dump(self.real, fh, indent=1)
 
-   def ledger(self):
-      return self.pretend if self.forked else self.real
+   # Identity of a real position, used to record practice sales.
+   def pkey(self, q):
+      return (q["ticker"], q["mode"], q["entry_date"], q["entry_price"])
+
+   # Positions held at the close of day idx: real ledger entries bought
+   # on or before it and not yet sold (a sale records exit_date and
+   # exit_price in the ledger), plus practice buys, minus practice
+   # sales. Moving 'asof' therefore shows what was held on that date.
+   def held(self, idx=None):
+      d = self.d
+      i = self.cur() if idx is None else idx
+      out = []
+      for q in self.real:
+         if d.idx_of(q["entry_date"]) > i:
+            continue
+         if q.get("exit_date") and d.idx_of(q["exit_date"]) <= i:
+            continue
+         x = self.pretend_exit.get(self.pkey(q))
+         if x and x[0] <= i:
+            continue
+         out.append(q)
+      for q in self.pretend:
+         if d.idx_of(q["entry_date"]) <= i:
+            out.append(q)
+      return out
+
+   ledger = held
+
+   def practice(self):
+      return bool(self.pretend or self.pretend_exit)
+
+   # Record a buy: into the real ledger on the latest date, otherwise
+   # as a practice trade.
+   def add_pos(self, q):
+      if self.asof is None:
+         self.real.append(q)
+         self.save_ledger()
+      else:
+         self.pretend.append(q)
+
+   # Record a sale of position q at price px on the current date.
+   def close_pos(self, q, px):
+      i = self.cur()
+      if any(q is x for x in self.pretend):
+         self.pretend = [x for x in self.pretend if x is not q]
+      elif self.asof is None:
+         q["exit_date"] = self.d.date_str(i)
+         q["exit_price"] = float(px)
+         self.save_ledger()
+      else:
+         self.pretend_exit[self.pkey(q)] = (i, float(px))
 
    def cfg(self, mode=None):
       m = mode or self.mode
@@ -1137,7 +1257,7 @@ class Shell(cmd.Cmd):
       a = "latest" if self.p.asof is None else \
          self.p.d.date_str(self.p.asof)
       self.prompt = "[%s | as of %s%s] > " % (
-         self.p.mode, a, " | practice" if self.p.forked else "")
+         self.p.mode, a, " | practice" if self.p.practice() else "")
 
    def postcmd(self, stop, line):
       self.set_prompt()
@@ -1156,8 +1276,8 @@ class Shell(cmd.Cmd):
       for k in ("mode", "horizon", "asof", "nextday", "recommend",
                 "track", "buy",
                 "sell", "positions", "realpositions",
-                "savepositions", "mergepositions", "compare",
-                "follow", "simulate",
+                "savepositions", "compare",
+                "follow", "simulate", "watch", "unwatch", "watchlist",
                 "universe", "refresh", "calibrate", "scorecard",
                 "learn", "set", "effort", "status", "quit"):
          print("  " + HELP[k])
@@ -1244,19 +1364,16 @@ class Shell(cmd.Cmd):
             return
          p.asof = None if i == last else i
       i = p.cur()
-      new = p.asof is not None and not p.forked
-      if p.asof is not None:
-         p.forked = True
-      # positions bought after the new date do not exist yet there
-      p.pretend = [q for q in p.pretend
-                   if d.idx_of(q["entry_date"]) <= i]
       print("Pretending today is %s; %d trading days of 'future' data "
             "exist for checking." % (d.date_str(i), last - i))
-      if new:
-         print("Practice timeline started: positions here are separate "
-               "from your real ledger\nand are not saved ('savepositions'"
-               " saves them, 'mergepositions' adds\nreal ones owned on "
-               "this date).")
+      h = p.held(i)
+      print("Positions held on %s (real ledger by buy/sell date): %s" % (
+         d.date_str(i),
+         " ".join("%s[%s]" % (q["ticker"], q["mode"]) for q in h)
+         or "none"))
+      if p.asof is not None:
+         print("Buys/sells you make while pretending are practice "
+               "trades; 'savepositions'\nwrites them to the real ledger.")
 
    # Step the pretend date forward one business day (the next trading
    # day in the price history; weekends and market holidays are skipped).
@@ -1281,10 +1398,140 @@ class Shell(cmd.Cmd):
             print("  excluded %-6s %s" % (t, ", ".join(why) or
                                           "insufficient data"))
 
+   # Download price history for symbols that are not loaded yet, add it
+   # to the session and to the price cache, and rebuild the data.
+   def load_new(self, syms):
+      p = self.p
+      if ARGS.synthetic:
+         allf = synth_frames(set(syms) | set([BENCH]))
+         got = dict((t, allf[t]) for t in syms if t in allf)
+         miss = [t for t in syms if t not in got]
+         if miss:
+            print("No usable data for: %s" % " ".join(miss))
+      else:
+         got = download(syms, ARGS.years, syms, False)
+      if not got:
+         return got
+      FRAMES.update(got)
+      if not ARGS.synthetic:
+         try:
+            with open(CACHE, "rb") as fh:
+               c = pickle.load(fh)
+            c["frames"].update(got)
+            save_cache(c["frames"], set(c["requested"]) | set(syms),
+                       c.get("years", ARGS.years), c["time"])
+         except Exception:
+            pass
+      p.d = Data(FRAMES)
+      p.models, p.cache = {}, {}
+      return got
+
+   def do_watch(self, arg):
+      p = self.p
+      ts = [x.upper() for x in arg.replace(",", " ").split()]
+      ts = [t for t in ts if t.replace("-", "").replace(".", "").isalnum()]
+      if not ts:
+         print("usage: watch TICKER [TICKER ...]   (a newly listed "
+               "stock, e.g. 'watch ABCD')")
+         return
+      w = load_watch()
+      have = set(x["ticker"] for x in w)
+      for t in ts:
+         if t not in have:
+            w.append(dict(ticker=t, added=time.strftime("%Y-%m-%d")))
+            have.add(t)
+      save_watch(w)
+      need = [t for t in ts if t not in p.d.col]
+      if need:
+         self.load_new(need)
+      print("Watching: %s" % " ".join(x["ticker"] for x in w))
+      self.show_watch(ts)
+
+   def do_unwatch(self, arg):
+      ts = set(x.upper() for x in arg.replace(",", " ").split())
+      w = load_watch()
+      keep = [x for x in w if x["ticker"] not in ts]
+      if len(keep) == len(w):
+         print("Not on the watchlist: %s" % " ".join(sorted(ts)))
+         return
+      save_watch(keep)
+      print("Removed %s. (A stock that passes the quality gate is still "
+            "picked up if it is in the universe.)" % " ".join(
+               sorted(x["ticker"] for x in w if x["ticker"] in ts)))
+
+   def do_watchlist(self, arg):
+      w = load_watch()
+      if not w:
+         print("The watchlist is empty. Use 'watch TICKER' to add a "
+               "newly listed stock.")
+         return
+      self.show_watch([x["ticker"] for x in w])
+
+   # One block per watched symbol as of the current date: when it began
+   # trading, how it has done, and why it can or cannot be recommended.
+   def show_watch(self, tickers):
+      p, d = self.p, self.p.d
+      i = p.cur()
+      f = FILTERS
+      by, c = None, p.cfg()
+      try:
+         res = p.scores(p.mode, i)
+         by = dict((r["t"], r) for r in res["rows"]) if res else None
+      except ValueError:
+         pass
+      print("\n--- watchlist as of %s ---" % d.date_str(i))
+      for t in tickers:
+         if t not in d.col:
+            print("%-6s no price data yet (not trading, or unknown "
+                  "symbol); retried at start-up and on 'refresh'" % t)
+            continue
+         j = d.col[t]
+         col = d.C[:, j]
+         ok = np.where(np.isfinite(col))[0]
+         first = int(ok[0])
+         n = int(np.isfinite(col[:i + 1]).sum())
+         if i < first:
+            print("%-6s first traded %s; not trading yet on this date" %
+                  (t, d.date_str(first)))
+            continue
+         px = col[i]
+         op = d.O[first, j] if np.isfinite(d.O[first, j]) else col[first]
+         line = "%-6s first traded %s (%d trading days) | %.2f | " \
+            "since IPO-day open %s" % (t, d.date_str(first), n, px,
+                                       pct(px / op - 1))
+         for k in (5, 21):
+            if n > k and np.isfinite(col[i - k]):
+               line += " | %dd %s" % (k, pct(px / col[i - k] - 1))
+         print(line)
+         if d.el[i, j]:
+            r = (by or {}).get(t)
+            msg = "ELIGIBLE: passes the quality gate"
+            if r:
+               msg += " | model: %s conf %.0f%% rank %d/%d -> %s" % (
+                  pctd(r["exp"], r["price"]), r["conf"], r["rank"],
+                  r["n"], "BUY" if p.is_buy(r, c) else "watch")
+            print("      " + msg)
+            continue
+         why = []
+         for k, v in d.why_not.items():
+            if v[i, j]:
+               if k == "history":
+                  why.append("history %d of %d days (about %d more "
+                             "trading days)" % (n, f["min_history"],
+                                                max(0, f["min_history"]
+                                                    - n)))
+               else:
+                  why.append(k)
+         print("      WATCH ONLY, not recommended: %s" % (
+            "; ".join(why) or "too little data for the model"))
+
    def do_refresh(self, arg):
       p = self.p
-      frames = load_frames(p.d.tickers, ARGS.years, force=True,
-                           synthetic=ARGS.synthetic)
+      frames = load_frames(
+         p.d.tickers, ARGS.years, force=True, synthetic=ARGS.synthetic,
+         ipo=[w["ticker"] for w in load_watch()])
+      global FRAMES
+      FRAMES = frames
       p.d = Data(frames)
       p.models, p.cache = {}, {}
       p.resolve()
@@ -1474,14 +1721,16 @@ class Shell(cmd.Cmd):
             " ".join(r["t"] for r in buys), len(p.last_buys)))
       self.show_positions(i)
 
+   do_recommendation = do_recommend
+   do_recommendations = do_recommend
+
    # SELL / HOLD lines for positions on date index i. By default these
-   # are the session's positions bought by that date; 'realpositions'
-   # passes the real ledger instead, with its own title.
+   # are the positions held on that date (see Picker.held);
+   # 'realpositions' passes the real ledger instead, with its own title.
    def show_positions(self, i, led=None, title=None):
       p, d = self.p, self.p.d
       if led is None:
-         led = [q for q in p.ledger()
-                if d.idx_of(q["entry_date"]) <= i]
+         led = p.held(i)
       if not led:
          return
       print("\n--- %s ---" % (title or "open positions: sell / hold "
@@ -1504,10 +1753,13 @@ class Shell(cmd.Cmd):
                   high, "%.2f" % stop if stop > 0 else "off", dip))
 
    def do_positions(self, arg):
-      if not self.p.ledger():
-         print("No open positions. Use 'track' or 'buy TICKER'.")
+      if not self.p.held():
+         print("No positions held on %s. Use 'track' or 'buy TICKER'." %
+               self.p.d.date_str(self.p.cur()))
          return
       self.show_positions(self.p.cur())
+
+   do_position = do_positions
 
    # The real positions in the ledger file, judged on the latest date,
    # whatever the as-of date or timeline of this session.
@@ -1516,6 +1768,8 @@ class Shell(cmd.Cmd):
       last = len(d.dates) - 1
       led, skip = [], []
       for q in p.load_ledger():
+         if q.get("exit_date"):
+            continue
          (led if q["ticker"] in d.col else skip).append(q)
       if not led and not skip:
          print("No real positions in %s." % LEDGER)
@@ -1526,54 +1780,30 @@ class Shell(cmd.Cmd):
          print("%-6s in %s @ %.2f: no price data loaded for this ticker"
                % (q["ticker"], q["entry_date"], q["entry_price"]))
 
-   # Force a save: write the positions currently shown (the practice
-   # ones when an as-of date is active) over the ledger file. Nothing
-   # else about saving changes.
-   def do_savepositions(self, arg):
-      led = self.p.ledger()
-      os.makedirs(HOME, exist_ok=True)
-      with open(LEDGER, "w") as fh:
-         json.dump(led, fh, indent=1)
-      print("Saved %d position%s to %s" % (
-         len(led), "" if len(led) == 1 else "s", LEDGER))
-      for q in led:
-         print("  %-6s [%s] in %s @ %.2f" % (
-            q["ticker"], q["mode"], q["entry_date"], q["entry_price"]))
+   do_realposition = do_realpositions
 
-   # Practice timeline only: copy in the positions from the real ledger
-   # file that were already owned on the current as-of date (bought on
-   # or before it). Positions already in the timeline are skipped.
-   def do_mergepositions(self, arg):
+   # Commit practice trades into the real ledger: practice buys are
+   # appended and practice sales get their exit date and price.
+   def do_savepositions(self, arg):
       p, d = self.p, self.p.d
-      if not p.forked:
-         print("Nothing to merge: this session is on the real timeline. "
-               "Use 'asof DATE' first.")
+      if not p.practice():
+         print("No practice trades to save.")
          return
-      i = p.cur()
-      have = set((q["ticker"], q["mode"], q["entry_date"])
-                 for q in p.pretend)
-      added, later = [], 0
-      for q in p.load_ledger():
-         if q["ticker"] not in d.col:
-            continue
-         if d.idx_of(q["entry_date"]) > i:
-            later += 1
-            continue
-         key = (q["ticker"], q["mode"], q["entry_date"])
-         if key in have:
-            continue
-         have.add(key)
-         p.pretend.append(dict(q))
-         added.append(q)
-      print("Merged %d position%s from %s owned as of %s:" % (
-         len(added), "" if len(added) == 1 else "s", LEDGER,
-         d.date_str(i)))
-      for q in added:
-         print("  %-6s [%s] in %s @ %.2f" % (
-            q["ticker"], q["mode"], q["entry_date"], q["entry_price"]))
-      if later:
-         print("(%d bought after %s %s left out)" % (
-            later, d.date_str(i), "was" if later == 1 else "were"))
+      n = len(p.pretend)
+      for q in p.pretend:
+         p.real.append(q)
+      m = 0
+      for q in p.real:
+         x = p.pretend_exit.get(p.pkey(q))
+         if x and not q.get("exit_date"):
+            q["exit_date"], q["exit_price"] = d.date_str(x[0]), x[1]
+            m += 1
+      p.pretend, p.pretend_exit = [], {}
+      p.save_ledger()
+      print("Saved %d practice buy%s and %d sale%s to %s" % (
+         n, "" if n == 1 else "s", m, "" if m == 1 else "s", LEDGER))
+
+   do_saveposition = do_savepositions
 
    def do_track(self, arg):
       p, d = self.p, self.p.d
@@ -1586,9 +1816,8 @@ class Shell(cmd.Cmd):
       for r in p.last_buys[:n]:
          if (r["t"], p.mode) in have:
             continue
-         p.ledger().append(p.make_pos(p.mode, r["t"], i, r["price"], r))
+         p.add_pos(p.make_pos(p.mode, r["t"], i, r["price"], r))
          print("Tracking %s @ %.2f" % (r["t"], r["price"]))
-      p.save_ledger()
 
    def do_buy(self, arg):
       p, d = self.p, self.p.d
@@ -1605,8 +1834,7 @@ class Shell(cmd.Cmd):
          r = dict((x["t"], x) for x in res["rows"]).get(t)
       except Exception:
          pass
-      p.ledger().append(p.make_pos(p.mode, t, i, px, r))
-      p.save_ledger()
+      p.add_pos(p.make_pos(p.mode, t, i, px, r))
       print("Recorded %s @ %.2f (%s mode)." % (t, px, p.mode))
 
    def do_sell(self, arg):
@@ -1622,8 +1850,7 @@ class Shell(cmd.Cmd):
          print("Closed %s: %.2f -> %.2f (%s)" % (
             t, q["entry_price"], px,
             pctd(px / q["entry_price"] - 1, q["entry_price"])))
-         led.remove(q)
-      p.save_ledger()
+         p.close_pos(q, px)
 
    # ------------------------------------------------------ hindsight
    def do_compare(self, arg):
@@ -1822,8 +2049,9 @@ class Shell(cmd.Cmd):
 # Point every persistent file at another directory (used by --synthetic
 # so test data never mixes with real predictions).
 def set_home(path):
-   global HOME, CACHE, LEDGER, STATE, PREDS
+   global HOME, CACHE, LEDGER, STATE, PREDS, WATCH
    HOME = path
+   WATCH = os.path.join(HOME, "watchlist.json")
    CACHE = os.path.join(HOME, "prices.pkl")
    LEDGER = os.path.join(HOME, "ledger.json")
    STATE = os.path.join(HOME, "state.json")
@@ -1834,6 +2062,10 @@ def main():
    global ARGS
    ap = argparse.ArgumentParser(description="Local stock picker lab")
    ap.add_argument("--mode", choices=["short", "long"], default="short")
+   ap.add_argument("--universe", choices=["large", "small"],
+                   default="large",
+                   help="built-in list: ~300 large caps or the original "
+                   "~75 (default large)")
    ap.add_argument("--tickers", help="comma separated custom universe")
    ap.add_argument("--universe-file", help="text file of tickers")
    ap.add_argument("--years", type=int, default=10)
@@ -1846,14 +2078,18 @@ def main():
    ARGS = ap.parse_args()
    if ARGS.synthetic:
       set_home(HOME + "-synthetic")
-   tickers = UNIVERSE
+   tickers = LARGE_UNIVERSE if ARGS.universe == "large" \
+      else SMALL_UNIVERSE
    if ARGS.tickers:
       tickers = [t.strip().upper() for t in ARGS.tickers.split(",")]
    elif ARGS.universe_file:
       with open(ARGS.universe_file) as fh:
          tickers = fh.read().upper().replace(",", " ").split()
+   watch = [w["ticker"] for w in load_watch()]
    frames = load_frames(tickers, ARGS.years, ARGS.refresh,
-                        ARGS.synthetic)
+                        ARGS.synthetic, watch)
+   global FRAMES
+   FRAMES = frames
    data = Data(frames)
    sh = Shell(Picker(data, ARGS.mode, ARGS.effort))
    if ARGS.learn:

@@ -21,15 +21,23 @@ Run
 ---
    python stock_picker.py                          short mode, built-in list
    python stock_picker.py --mode long --effort high
+   python stock_picker.py --universe small         the original 78 stocks
    python stock_picker.py --tickers AAPL,MSFT,KO,JNJ
    python stock_picker.py --universe-file my_tickers.txt
    python stock_picker.py --synthetic              offline demo, fake prices
    python stock_picker.py -h                       all options
 
-Options: --mode short|long, --tickers LIST, --universe-file FILE,
---years N (price history to download), --effort low|normal|high (how hard
-the genetic search works), --refresh (re-download), --synthetic.
-Prices are cached in ~/.stock_picker so later starts are quick.
+On Windows, stock_picker.bat runs the script with the same arguments.
+
+Options: --mode short|long, --universe large|small (built-in list: about
+280 large caps, the default, or the original 78), --tickers LIST,
+--universe-file FILE, --years N (price history to download), --effort
+low|normal|high (how hard the genetic search works), --refresh
+(re-download), --learn (run "learn" at start-up), --synthetic.
+--tickers and --universe-file override the built-in lists. Symbols Yahoo
+no longer serves are skipped with a message.
+Prices are cached in ~/.stock_picker so later starts are quick; a fresh
+cache only downloads the symbols it does not have yet.
 
 Modes
 -----
@@ -47,16 +55,23 @@ Commands
                             forward, or return to now
    recommend [N]            top N picks with expected gain, confidence and
                             SELL advice for positions you hold
+                            ("recommendation" and "recommendations" work
+                            too)
    track [N]                record the BUY picks as open positions
    buy TICKER [price]       record a position you opened
    sell TICKER              close a recorded position
-   positions                open positions with SELL / HOLD advice
+   positions                positions held on the as-of date, with SELL /
+                            HOLD advice ("position" works too)
    compare [N]              judge the picks at the as-of date against what
                             really happened afterwards
    follow TICKER [n] [d]    walk one stock forward period by period and
                             show what the picker would say and why
    simulate [days] [cap]    trade the model over the last N days (default
                             90) and report profit/loss against actual
+   watch TICKER ...         add newly listed (IPO) stocks to the watchlist
+   unwatch TICKER ...       remove stocks from the watchlist
+   watchlist                price, history and gate status of watched
+                            stocks
    universe                 which stocks pass the quality gate
    refresh                  re-download price history
    effort low|normal|high   genetic search effort
@@ -70,11 +85,11 @@ Commands
    set NAME VALUE           change a threshold for the current mode
 
    nextday                  advance the as-of date one business day
-   realpositions            the real ledger's positions, judged on the
-                            latest date (ignores asof and practice)
-   savepositions            write the positions shown over the ledger file
-   mergepositions           (practice timeline) add the real positions
-                            that were already owned on the as-of date
+   realpositions            the real ledger's open positions, judged on
+                            the latest date (ignores asof and practice
+                            trades; "realposition" works too)
+   savepositions            write practice buys and sells into the real
+                            ledger ("saveposition" works too)
 
 Which stocks are considered
 ---------------------------
@@ -86,6 +101,19 @@ on every date, using only data known by then:
    252-day high, and at least about 15 months of history
 
 No penny stocks, thin stocks or junk. "universe" shows who passes.
+
+New listings (IPOs)
+-------------------
+A newly listed stock fails the history test for about 15 months. To
+follow one anyway, "watch TICKER" adds it to a watchlist kept in
+~/.stock_picker/watchlist.json. Its prices are downloaded however short
+the history, and "watchlist" shows its first trade date, trading days,
+price, return since the IPO-day open, 5- and 21-day moves, and why it is
+watch-only (with about how many trading days of history remain). It is
+never recommended until it passes the normal quality gate; then
+"watchlist" also shows the model's expected gain, confidence and rank.
+A watched symbol with no data yet (not trading, or a typo) stays on the
+list and is retried at start-up and on "refresh".
 
 How it scores
 -------------
@@ -116,8 +144,9 @@ The first answer is honest, not flattering. Files live in ~/.stock_picker:
 
    predictions.json   journal of every prediction and, later, its outcome
    state.json         evolved weights that seed the next search
-   ledger.json        your positions
+   ledger.json        your positions, open and sold
    prices.pkl         cached price history
+   watchlist.json     watched new listings
 
 Every "recommend" on the latest date is journaled and later scored
 against what really happened ("scorecard"). "calibrate" and "learn"
@@ -152,26 +181,33 @@ Defaults: short mode stop_atr 1.5, dip_atr 0.75; long mode 3.0 and 1.5.
 There is no maximum holding period unless you set one ("set max_hold N").
 Reaching the target never forces a sale; it is only noted.
 
-Practice timeline
------------------
-The first time "asof" moves to a past date, the session becomes its own
-practice timeline. Practice positions are kept apart from your real
-ledger and are never saved automatically, even after you return to the
-latest date. The prompt shows "practice". "nextday" steps forward one
-business day. "savepositions" writes the practice positions over the
-ledger file, "mergepositions" copies in the real positions that were
-already owned on the as-of date, and "realpositions" always shows the real
-ledger judged on the latest date.
+Past dates and practice trades
+------------------------------
+"positions" shows what your real ledger says you held on the as-of date:
+bought on or before it and not yet sold. Moving "asof" back and forward
+changes the list, and "asof" prints the holdings for the new date. A
+sale keeps the position in the ledger with its exit date and price, so
+past holdings can be rebuilt (positions sold by versions before
+23-Nov-2026 were deleted and cannot be shown on past dates).
+
+Buys and sells made while an as-of date is active are practice trades.
+They live only in the session, the prompt shows "practice" while any
+exist, and nothing is saved automatically. "savepositions" writes them
+into the real ledger: practice buys are added and practice sales get
+their exit date and price. "nextday" steps forward one business day, and
+"realpositions" always shows the real ledger's open positions judged on
+the latest date.
 
 What to expect
 --------------
-On real price history of large caps, in tests with this code, the picks
-showed no demonstrated edge in either mode, so BUY calls were mostly
-suppressed. That is the program being honest. A wider universe (a few
-hundred large caps, via --universe-file) gives the calibration more to
-work with.
+On real price history of 78 large caps, in tests with this code, the
+picks showed no demonstrated edge in either mode, so BUY calls were
+mostly suppressed. That is the program being honest. The default
+universe is now about 280 large caps, which gives the calibration more
+to work with; it has not yet been tested on real prices.
 
 Files
 -----
-   stock_picker.py   the program (single file)
-   README.txt        this file
+   stock_picker.py           the program (single file)
+   stock_picker.bat          Windows launcher
+   README-stock_picker.txt   this file
