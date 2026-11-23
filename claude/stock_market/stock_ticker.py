@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id: stock_ticker.py 2.main-2 17:05:10 23-Nov-2026 claude-opus-5-5 $
+# name: $Id: stock_ticker.py 3.main-3 18:28:03 23-Nov-2026 claude-opus-5-5 $
 # use: track one or more stock tickers with a live-updating chart
 # usage: stock_ticker.py [-c] [-f] [-r seconds] [-p period]
 #                        [-i interval] [TICKER ...]
@@ -15,33 +15,19 @@ import subprocess
 import sys
 import tempfile
 import threading
-import tkinter
-from tkinter import ttk
-
-import matplotlib
-matplotlib.use("TkAgg")
-import numpy
-import pandas
-import yfinance
-from matplotlib.collections            import LineCollection
-from matplotlib.dates                  import DateFormatter
-from matplotlib.dates                  import date2num
-from matplotlib.dates                  import num2date
-from matplotlib.figure                 import Figure
-from matplotlib.ticker                 import FuncFormatter
-from matplotlib.ticker                 import Locator
-from matplotlib.ticker                 import MaxNLocator
-from matplotlib.transforms             import blended_transform_factory
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+                                # tkinter, matplotlib, numpy, pandas and
+                                # yfinance are imported by gui_modules(),
+                                # only in the process that opens the
+                                # window, so the console copy that starts
+                                # it in the background returns quickly
 
 E_SUCCESS = 0
 E_WARN    = 1
 E_FAIL    = 2
 E_USAGE   = 3
 
-                               # set in the background copy so it does not
-                               # launch yet another copy of itself
+                                # set in the background copy so it does not
+                                # launch yet another copy of itself
 CHILD     = "STOCK_TICKER_CHILD"
 READY     = "ready"
 LOG       = os.path.join(tempfile.gettempdir(), "stock_ticker.log")
@@ -52,9 +38,9 @@ UP        = "#26a69a"
 FLAT      = "#a0a0a0"
 DOWN      = "#ef5350"
 HINT      = "Hover over chart for details"
-                               # quote table columns: (alignment, (left,
-                               # right) padding); "w" = left justify,
-                               # "e" = right justify
+                                # quote table columns: (alignment, (left,
+                                # right) padding); "w" = left justify,
+                                # "e" = right justify
 QUOTE_COLUMNS = [("w", (4, 4)),          # symbol
                  ("e", (6, 0)),          # price
                  ("e", (12, 0)),         # change
@@ -66,18 +52,18 @@ QUOTE_COLUMNS = [("w", (4, 4)),          # symbol
                  ("w", (8, 0)),          # High
                  ("e", (4, 0))]          # high price
 
-                               # crosshair shows only when the mouse is
-                               # this many screen pixels from a candle or
-                               # a point on a line
+                                # crosshair shows only when the mouse is
+                                # this many screen pixels from a candle or
+                                # a point on a line
 NEAR      = 20
-                               # horizontal grid: panel split into 3, 6, 9..
-                               # equal gaps, as many as fit with each gap at
-                               # least this many screen pixels tall
+                                # horizontal grid: panel split into 3, 6, 9..
+                                # equal gaps, as many as fit with each gap at
+                                # least this many screen pixels tall
 GRID_GAP  = 40
 
-                               # period => (line interval, candle interval)
-                               # used when the interval is "auto"; candles
-                               # use coarser bars so each one is readable
+                                # period => (line interval, candle interval)
+                                # used when the interval is "auto"; candles
+                                # use coarser bars so each one is readable
 PERIODS   = {"1d"  : ("1m" , "5m" ),
              "5d"  : ("5m" , "30m"),
              "1mo" : ("30m", "1d" ),
@@ -89,9 +75,9 @@ PERIODS   = {"1d"  : ("1m" , "5m" ),
              "5y"  : ("1wk", "1mo"),
              "max" : ("1mo", "3mo")}
 
-                               # bar sizes yahoo will serve for each
-                               # period: 1m only goes back ~7 days, other
-                               # minute bars ~60 days, 1h ~730 days
+                                # bar sizes yahoo will serve for each
+                                # period: 1m only goes back ~7 days, other
+                                # minute bars ~60 days, 1h ~730 days
 INTERVALS = {"1d"  : ["1m", "2m", "5m", "15m", "30m", "1h"],
              "5d"  : ["1m", "2m", "5m", "15m", "30m", "1h", "1d"],
              "1mo" : ["2m", "5m", "15m", "30m", "1h", "1d", "1wk"],
@@ -103,16 +89,16 @@ INTERVALS = {"1d"  : ["1m", "2m", "5m", "15m", "30m", "1h"],
              "5y"  : ["1d", "1wk", "1mo", "3mo"],
              "max" : ["1d", "1wk", "1mo", "3mo"]}
 
-                               # oracle "hh24:mi Dy dd-Mon-yy"; daily and
-                               # longer bars have no meaningful time of day
-                               # so they drop the hh24:mi part
+                                # oracle "hh24:mi Dy dd-Mon-yy"; daily and
+                                # longer bars have no meaningful time of day
+                                # so they drop the hh24:mi part
 TIME_FMT  = "%H:%M %a %d-%b-%y"
 DATE_FMT  = "%a %d-%b-%y"
-                               # instrument types that trade with volume;
-                               # indexes and mutual funds report none
+                                # instrument types that trade with volume;
+                                # indexes and mutual funds report none
 TRADED    = ("EQUITY", "ETF")
 
-                               # auto-refresh choices, label => seconds
+                                # auto-refresh choices, label => seconds
 REFRESH   = {"5s"  : 5,
              "10s" : 10,
              "15s" : 15,
@@ -198,46 +184,105 @@ def seconds_label(seconds):
    return(label)
 
 ###########################################################################
+def gui_modules(prog):
+   """
+   name: gui_modules
+   use: imports tkinter, matplotlib, numpy, pandas and yfinance, and
+        defines GridLocator, which needs matplotlib
+   usage: gui_modules(parser.prog)
+   post: returns True when they are available, else prints why to
+         stderr and returns False
+   imp: called only in the process that opens the window; together
+        these take about 2 seconds to load, which the console copy
+        that starts the window in the background (see detach) no
+        longer waits for
+   """
+   global tkinter, ttk, matplotlib, numpy, pandas, yfinance
+   global LineCollection, DateFormatter, date2num, num2date, Figure
+   global FuncFormatter, Locator, MaxNLocator, blended_transform_factory
+   global FigureCanvasTkAgg, NavigationToolbar2Tk, GridLocator
+   try:
+      import tkinter
+      from tkinter import ttk
+      import matplotlib
+      matplotlib.use("TkAgg")
+      import numpy
+      import pandas
+      import yfinance
+      from matplotlib.collections            import LineCollection
+      from matplotlib.dates                  import DateFormatter
+      from matplotlib.dates                  import date2num
+      from matplotlib.dates                  import num2date
+      from matplotlib.figure                 import Figure
+      from matplotlib.ticker                 import FuncFormatter
+      from matplotlib.ticker                 import Locator
+      from matplotlib.ticker                 import MaxNLocator
+      from matplotlib.transforms             import \
+           blended_transform_factory
+      from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+      from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+   except ImportError as error:
+      print(f"{prog}: missing module ({error}); run: pip install "
+            f"yfinance matplotlib pandas\n   tkinter ships with python "
+            f"(on RHEL/Alma/Oracle Linux: dnf install python3-tkinter)",
+            file = sys.stderr)
+      return(False)
+   GridLocator = grid_locator_class()
+   return(True)
+
+###########################################################################
 ###
 ### c l a s s e s
 ###
 ###########################################################################
 
-class GridLocator(Locator):
+def grid_locator_class():
    """
-   name: GridLocator
-   use: tick (and so grid line) positions that divide an axis into a
-        multiple of 3 equal gaps: 3 gaps (2 lines) on a short panel, 6
-        gaps (5 lines) once it is twice as tall, then 9, 12 ...
-   usage: axes.yaxis.set_major_locator(GridLocator())
-   post: lines fall on exact fractions of the visible range, not on
-         round numbers, so labels read like 236.94
-   imp: recomputed on every redraw, so resizing the window, zooming or
-        new prices move the lines with the panel
+   name: grid_locator_class
+   use: builds the GridLocator class
+   pre: gui_modules() has imported matplotlib's Locator
+   post: returns the class; gui_modules() stores it as GridLocator
+   imp: built here, not at the top level, because Locator is only
+        imported in the process that opens the window
    """
 
-   ########################################################################
-   def __call__(self):
-      low, high = self.axis.get_view_interval()
-      return(self.tick_values(low, high))
-
-   ########################################################################
-   def tick_values(self, vmin, vmax):
-      gaps = self.gaps()
-      step = (vmax - vmin) / gaps
-      return([vmin + step * line for line in range(1, gaps)])
-
-   ########################################################################
-   def gaps(self):
+   class GridLocator(Locator):
       """
-      post: the largest multiple of 3 gaps, minimum 3, that keeps each
-            gap at least GRID_GAP pixels tall
+      name: GridLocator
+      use: tick (and so grid line) positions that divide an axis into a
+           multiple of 3 equal gaps: 3 gaps (2 lines) on a short panel,
+           6 gaps (5 lines) once it is twice as tall, then 9, 12 ...
+      usage: axes.yaxis.set_major_locator(GridLocator())
+      post: lines fall on exact fractions of the visible range, not on
+            round numbers, so labels read like 236.94
+      imp: recomputed on every redraw, so resizing the window, zooming
+           or new prices move the lines with the panel
       """
-      if (self.axis is None):
-         return(3)
-      height = self.axis.axes.get_window_extent().height
-      count  = int(height // GRID_GAP)
-      return(max(3, count - count % 3))
+
+      #####################################################################
+      def __call__(self):
+         low, high = self.axis.get_view_interval()
+         return(self.tick_values(low, high))
+
+      #####################################################################
+      def tick_values(self, vmin, vmax):
+         gaps = self.gaps()
+         step = (vmax - vmin) / gaps
+         return([vmin + step * line for line in range(1, gaps)])
+
+      #####################################################################
+      def gaps(self):
+         """
+         post: the largest multiple of 3 gaps, minimum 3, that keeps
+               each gap at least GRID_GAP pixels tall
+         """
+         if (self.axis is None):
+            return(3)
+         height = self.axis.axes.get_window_extent().height
+         count  = int(height // GRID_GAP)
+         return(max(3, count - count % 3))
+
+   return(GridLocator)
 
 ###########################################################################
 
@@ -257,8 +302,8 @@ class StockTicker(object):
       self.root     = root
       self.after_id = None
       self.busy     = False
-                               # what is on screen, used by the hover
-                               # readout: [(axes, symbol, history), ...]
+                                # what is on screen, used by the hover
+                                # readout: [(axes, symbol, history), ...]
       self.panels   = []
       self.crosshair = {}
       self.hosts    = {}
@@ -444,8 +489,8 @@ class StockTicker(object):
       self.hosts     = {}
       self.interval  = interval
       self.candles   = (chart == "Candles")
-                               # with several tickers on a line chart plot
-                               # % change so they share one scale
+                                # with several tickers on a line chart plot
+                                # % change so they share one scale
       self.relative  = (len(real) > 1 and not self.candles)
       self.hover_var.set(HINT)
 
@@ -456,11 +501,11 @@ class StockTicker(object):
       if (not self.candles):
          axes = self.figure.add_subplot(111)
       self.waiting = []
-                               # stacked candle panels share one timeline,
-                               # every bar time seen for any ticker, so a
-                               # ticker that started trading late (an ipo)
-                               # lines up under the others and an empty
-                               # panel shows the span it will fill in
+                                # stacked candle panels share one timeline,
+                                # every bar time seen for any ticker, so a
+                                # ticker that started trading late (an ipo)
+                                # lines up under the others and an empty
+                                # panel shows the span it will fill in
       self.timeline = pandas.DatetimeIndex([])
       for history in real.values():
          self.timeline = self.timeline.union(history.index)
@@ -468,7 +513,7 @@ class StockTicker(object):
 
       for number, (symbol, history) in enumerate(results.items(), 1):
          if (self.candles):
-                               # one stacked panel per ticker
+                                # one stacked panel per ticker
             axes = self.figure.add_subplot(
                       len(results), 1, number,
                       sharex = top)
@@ -490,10 +535,10 @@ class StockTicker(object):
          color = "green" if (delta >= 0) else "red"
          low   = float(history["Low"].min())
          high  = float(history["High"].max())
-                               # split low..high into thirds: the price in
-                               # the lower third colours the low, in the top
-                               # third the high (the other one black), in
-                               # the middle third both are blue
+                                # split low..high into thirds: the price in
+                                # the lower third colours the low, in the top
+                                # third the high (the other one black), in
+                                # the middle third both are blue
          third = (last - low) / (high - low) if (high > low) else 0.5
          if (third < 1 / 3):
             low_color, high_color = color, "black"
@@ -521,17 +566,17 @@ class StockTicker(object):
                       else close)
             price  = axes.plot(history.index, series, label = symbol,
                                linewidth = 1.5)[0]
-                               # several tickers share one volume scale, so
-                               # each keeps its own colour to tell them apart
+                                # several tickers share one volume scale, so
+                                # each keeps its own colour to tell them apart
             self.draw_volume(axes, date2num(history.index.to_pydatetime()),
                              history,
                              price.get_color() if (self.relative) else None)
          self.panels.append((axes, symbol, history))
 
       if (self.candles):
-                               # slant the long date labels like the line
-                               # chart does; autofmt_xdate is not used
-                               # because it hides labels on upper panels
+                                # slant the long date labels like the line
+                                # chart does; autofmt_xdate is not used
+                                # because it hides labels on upper panels
          for axes in self.figure.axes:
             if (not real):
                axes.set_xticks([])
@@ -543,9 +588,9 @@ class StockTicker(object):
          axes.grid(True, alpha = 0.3)
          axes.legend(loc = "upper left")
          if (self.waiting):
-                               # one shared chart, so tickers without data
-                               # are listed in a box in the middle of it;
-                               # their lines appear here once they trade
+                                # one shared chart, so tickers without data
+                                # are listed in a box in the middle of it;
+                                # their lines appear here once they trade
             axes.text(0.5, 0.5, "\n".join(self.waiting),
                       transform = axes.transAxes,
                       horizontalalignment = "center",
@@ -564,19 +609,19 @@ class StockTicker(object):
             axes.set_xticks([])
             axes.set_yticks([])
 
-                               # hidden crosshair per price axes, moved and
-                               # shown by on_hover: a vertical line on the
-                               # bar, a horizontal line edge to edge, a tag
-                               # on the price scale and one on the volume
-                               # scale; they start at the lower left corner,
-                               # at 0 they would stretch a date axis to 1970
+                                # hidden crosshair per price axes, moved and
+                                # shown by on_hover: a vertical line on the
+                                # bar, a horizontal line edge to edge, a tag
+                                # on the price scale and one on the volume
+                                # scale; they start at the lower left corner,
+                                # at 0 they would stretch a date axis to 1970
       for axes in {panel[0] for panel in self.panels}:
          left, bottom = axes.get_xlim()[0], axes.get_ylim()[0]
-                               # solid, one screen pixel wide: linewidth is
-                               # in points (72 per inch) and the window's
-                               # dpi varies, so aim for 0.75 pixel, which
-                               # agg draws as 1 pixel with antialiasing
-                               # off (a full 1.0 pixel comes out as 3)
+                                # solid, one screen pixel wide: linewidth is
+                                # in points (72 per inch) and the window's
+                                # dpi varies, so aim for 0.75 pixel, which
+                                # agg draws as 1 pixel with antialiasing
+                                # off (a full 1.0 pixel comes out as 3)
          style        = {"color"       : "#a0a0a0",
                          "linewidth"   : 0.75 * 72 / self.figure.dpi,
                          "linestyle"   : "-",
@@ -645,8 +690,8 @@ class StockTicker(object):
       before   = numpy.concatenate([closes[:1], closes[:-1]])
       move     = numpy.sign(closes - opens)
       move     = numpy.where(move != 0, move, numpy.sign(closes - before))
-                               # a list, not numpy.full: color may be an
-                               # (r, g, b) tuple, which numpy would spread
+                                # a list, not numpy.full: color may be an
+                                # (r, g, b) tuple, which numpy would spread
       colors   = (     [color] * len(closes)
                   if (color is not None)
                   else list(numpy.where(move > 0, UP,
@@ -675,17 +720,17 @@ class StockTicker(object):
       twin.set_ylabel("volume", color = "gray")
       twin.tick_params(axis = "y", labelsize = 8, colors = "gray")
       twin.yaxis.set_major_formatter(FuncFormatter(volume_label))
-                               # same lines as the price scale, so each
-                               # grid line has a volume label on the right
+                                # same lines as the price scale, so each
+                                # grid line has a volume label on the right
       twin.yaxis.set_major_locator(GridLocator())
       twin.grid(False)
-                               # twinx puts volume in front; swap so the
-                               # price line and candles stay on top, and
-                               # clear host's background so volume shows
+                                # twinx puts volume in front; swap so the
+                                # price line and candles stay on top, and
+                                # clear host's background so volume shows
       host.set_zorder(twin.get_zorder() + 1)
       host.patch.set_visible(False)
-                               # toolbar's (x, y) readout shows the price,
-                               # not the volume, under the mouse
+                                # toolbar's (x, y) readout shows the price,
+                                # not the volume, under the mouse
       def coordinates(x, y):
          x, y = host.transData.inverted().transform(
                    twin.transData.transform((x, y)))
@@ -769,8 +814,8 @@ class StockTicker(object):
       x      = timeline.get_indexer(history.index)
       colors = numpy.where(closes >= opens, UP, DOWN)
 
-                               # a doji (open == close) still needs a
-                               # visible sliver of body
+                                # a doji (open == close) still needs a
+                                # visible sliver of body
       sliver = max(highs.max() - lows.min(), 0.01) * 0.002
       axes.vlines(x, lows, highs, colors = colors, linewidth = 1)
       axes.bar(x, numpy.maximum(numpy.abs(closes - opens), sliver),
@@ -832,8 +877,8 @@ class StockTicker(object):
          self.on_leave(event)
          return
       x, y = host.transData.inverted().transform((event.x, event.y))
-                               # volume at the mouse height, if this panel
-                               # has a volume scale
+                                # volume at the mouse height, if this panel
+                                # has a volume scale
       at_volume = None
       for twin, owner in self.hosts.items():
          if (owner is host and twin is not host):
@@ -849,8 +894,8 @@ class StockTicker(object):
             continue
          moment = history.index[row]
          if (self.candles):
-                               # nearest point of the candle's wick: the
-                               # mouse height clamped to low..high
+                                # nearest point of the candle's wick: the
+                                # mouse height clamped to low..high
             spot  = self.timeline.get_loc(moment)
             value = min(max(y, float(history["Low"].iloc[row])),
                         float(history["High"].iloc[row]))
@@ -866,7 +911,7 @@ class StockTicker(object):
             best = (gap, symbol, history, row)
 
       if (best is None):
-                               # blank spot, nowhere near the data
+                                # blank spot, nowhere near the data
          self.on_leave(event)
          return
 
@@ -882,14 +927,14 @@ class StockTicker(object):
                          f"Low {bar['Low']:,.2f}   "
                          f"High {bar['High']:,.2f}   "
                          f"Volume {volume}")
-                               # snap the vertical line to the bar itself
+                                # snap the vertical line to the bar itself
       vertical = (     self.timeline.get_loc(moment) if (self.candles)
                   else date2num(moment))
 
-                               # crosshair only in the panel being hovered;
-                               # the horizontal line runs from the price
-                               # scale on the left to the volume scale on
-                               # the right, each with a value tag
+                                # crosshair only in the panel being hovered;
+                                # the horizontal line runs from the price
+                                # scale on the left to the volume scale on
+                                # the right, each with a value tag
       for axes, (upright, level, price, size) in self.crosshair.items():
          here = (axes is host)
          upright.set_visible(here)
@@ -958,7 +1003,7 @@ def detach(prog, argv):
       quiet = os.path.join(os.path.dirname(python), "pythonw.exe")
       if (os.path.exists(quiet)):
          python = quiet
-                               # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                                # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
       extra["creationflags"] = 0x00000008 | 0x00000200
    else:
       extra["start_new_session"] = True
@@ -972,8 +1017,8 @@ def detach(prog, argv):
                                close_fds = True,
                                text      = True,
                                **extra)
-                               # blocks until the window is up or the copy
-                               # dies (end of file)
+                                # blocks until the window is up or the copy
+                                # dies (end of file)
    line = child.stdout.readline().strip()
    child.stdout.close()
    if (line == READY):
@@ -1011,6 +1056,8 @@ def main(argv):
    if (not args.foreground and not child):
       return(detach(parser.prog, argv))
 
+   if (not gui_modules(parser.prog)):
+      return(E_FAIL)
    try:
       root = tkinter.Tk()
    except tkinter.TclError as exception:
@@ -1022,9 +1069,9 @@ def main(argv):
                args.period, args.interval)
 
    if (child):
-                               # window is on screen: tell the waiting
-                               # parent, then stop using the pipe (the
-                               # parent is gone); later output goes to LOG
+                                # window is on screen: tell the waiting
+                                # parent, then stop using the pipe (the
+                                # parent is gone); later output goes to LOG
       root.update()
       sys.stdout.write(READY + "\n")
       sys.stdout.flush()

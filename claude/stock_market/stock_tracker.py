@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id: stock_tracker.py 1.main-1 17:10:58 23-Nov-2026 claude-opus-5-5 $
+# name: $Id: stock_tracker.py 2.main-2 18:28:03 23-Nov-2026 claude-opus-5-5 $
 # use: local INTRADAY stock tracker with a live chart window in the style
 #      of stock_ticker.py. It polls 5-minute bars
 #      for the stocks on its own watchlist (plus any open positions),
@@ -64,7 +64,7 @@ E_WARN     = 1
 E_FAIL     = 2
 E_USAGE    = 3
 
-REVISION   = "$Revision: 1.main-1 $"
+REVISION   = "$Revision: 2.main-2 $"
 SELF       = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 SELFPREFIX = os.path.dirname(os.path.abspath(sys.argv[0]))
 
@@ -2359,7 +2359,9 @@ def gui_modules():
    post: returns True when they are available, else prints why and
          returns False
    imp: imported here, not at the top, so the text prompt (-t) still
-        works on a machine without tkinter or matplotlib
+        works on a machine without tkinter or matplotlib, and only in
+        the process that opens the window, so the console copy that
+        starts it in the background (see detach) does not wait for them
    """
    global tkinter, ttk, simpledialog, Figure, FuncFormatter, Locator
    global MaxNLocator, FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -2436,8 +2438,11 @@ class TrackerWindow(object):
 
    ########################################################################
    def __init__(self, root, tracker, refresh_seconds = 60, chart = "Line",
-                span = "1d"):
+                span = "1d", reload = False):
       self.tr        = tracker
+                                # -d: the first fetch re-downloads all
+                                # history, after the window is open
+      self.reload    = reload
       self.root      = root
       self.after_id  = None
       self.busy      = False
@@ -2603,7 +2608,8 @@ class TrackerWindow(object):
             tr.source.advance()
          self.first = False
          held = [t for t in tr.tickers() if (t not in symbols)]
-         tr.sync(symbols + held)
+         tr.sync(symbols + held, force = self.reload)
+         self.reload = False
          results = {}
          for t in symbols + held:
             df = tr.frame(t)
@@ -3266,11 +3272,14 @@ class MAIN(object):
          ap.error("-r must be 0 or more")
 
       child = (os.environ.get(CHILD) == "1")
-      if (not args.text):
-         if (not gui_modules()):
-            return(E_FAIL)
-         if (not args.foreground and not child):
-            return(detach(ap.prog, argv))
+                                # the console copy starts the window in
+                                # the background before loading tkinter
+                                # and matplotlib, so the prompt comes
+                                # back as soon as the window is open
+      if (not args.text and not args.foreground and not child):
+         return(detach(ap.prog, argv))
+      if (not args.text and not gui_modules()):
+         return(E_FAIL)
       if (args.synthetic):
          set_home(HOME + "-synthetic")
       tr = Tracker(args.synthetic, args.verbose)
@@ -3286,8 +3295,6 @@ class MAIN(object):
          Shell(tr).cmdloop()
          return(E_SUCCESS)
 
-      if (args.reload and tr.tickers()):
-         tr.sync(force = True)
       if (not tr.watch()):
          tr.save_watch(["AAPL"])
       try:
@@ -3297,7 +3304,8 @@ class MAIN(object):
                file = sys.stderr)
          return(E_FAIL)
       TrackerWindow(root, tr, args.refresh,
-                    "Candles" if (args.candles) else "Line", args.span)
+                    "Candles" if (args.candles) else "Line", args.span,
+                    args.reload)
       if (child):
                                 # window is on screen: tell the waiting
                                 # parent, then stop using the pipe (the
