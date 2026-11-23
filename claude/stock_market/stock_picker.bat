@@ -1,5 +1,5 @@
 @echo off
-rem name: $Id: stock_picker.bat 1.main-1 01:26:41 15-Nov-2026 rudyz $
+rem name: $Id: stock_picker.bat 2.main-2 17:05:10 23-Nov-2026 claude-opus-5-5 $
 
 setlocal
    set SELF=%~n0%

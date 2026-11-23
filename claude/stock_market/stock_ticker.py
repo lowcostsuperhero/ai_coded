@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id$
+# name: $Id: stock_ticker.py 2.main-2 17:05:10 23-Nov-2026 claude-opus-5-5 $
 # use: track one or more stock tickers with a live-updating chart
 # usage: stock_ticker.py [-c] [-f] [-r seconds] [-p period]
 #                        [-i interval] [TICKER ...]
@@ -23,6 +23,7 @@ matplotlib.use("TkAgg")
 import numpy
 import pandas
 import yfinance
+from matplotlib.collections            import LineCollection
 from matplotlib.dates                  import DateFormatter
 from matplotlib.dates                  import date2num
 from matplotlib.dates                  import num2date
@@ -48,7 +49,7 @@ LOG       = os.path.join(tempfile.gettempdir(), "stock_ticker.log")
 AUTO      = "auto"
 CHARTS    = ["Line", "Candles"]
 UP        = "#26a69a"
-VOLUME    = "#7e57c2"
+FLAT      = "#a0a0a0"
 DOWN      = "#ef5350"
 HINT      = "Hover over chart for details"
                                # quote table columns: (alignment, (left,
@@ -514,14 +515,17 @@ class StockTicker(object):
          if (self.candles):
             self.draw_candles(axes, history, interval, self.timeline)
             self.draw_volume(axes, self.timeline.get_indexer(history.index),
-                             history, VOLUME)
+                             history)
          else:
             series = (     (close / first - 1) * 100 if (self.relative)
                       else close)
             price  = axes.plot(history.index, series, label = symbol,
                                linewidth = 1.5)[0]
-            self.draw_volume(axes, history.index, history,
-                             price.get_color())
+                               # several tickers share one volume scale, so
+                               # each keeps its own colour to tell them apart
+            self.draw_volume(axes, date2num(history.index.to_pydatetime()),
+                             history,
+                             price.get_color() if (self.relative) else None)
          self.panels.append((axes, symbol, history))
 
       if (self.candles):
@@ -607,17 +611,28 @@ class StockTicker(object):
                                "edgecolor" : "#20242c"}))
 
    ########################################################################
-   def draw_volume(self, host, x, history, color):
+   def draw_volume(self, host, x, history, color = None):
       """
-      use: overlay volume as a line on a second y axis, scale on the right
-      pre: x holds the plot positions of history's rows on host
+      use: overlay volume as a line on a second y axis, scale on the right,
+           each stretch coloured by whether buyers or sellers led it
+      usage: color None for buy/sell colouring, or one colour for the
+             whole line
+      pre: x holds the numeric plot positions of history's rows on host
       post: twin axes registered in self.hosts so hovering over it acts
             as hovering over host
       imp: the line chart has one twin shared by every ticker; candle
            panels get one each. the volume scale is stretched to 3x the
            peak so the line keeps to the bottom third, under the prices.
            stocks before their first trade, indexes and funds report no
-           volume, so nothing is drawn for them
+           volume, so nothing is drawn for them.
+           yahoo has no buy/sell split (every share traded has a buyer
+           and a seller), so as chart packages do, a bar that closed
+           above its open counts as buying (UP), below as selling
+           (DOWN); a bar that closed at its open is judged against the
+           previous bar's close instead, and only one unchanged on both
+           counts (or the first bar, with nothing before it) is even
+           (FLAT). the line segment leading into each bar takes that
+           bar's colour
       """
       if ("Volume" not in history.columns):
          return
@@ -625,8 +640,26 @@ class StockTicker(object):
       if (not volume.any()):
          return
 
+      opens    = history["Open"].to_numpy(dtype = float)
+      closes   = history["Close"].to_numpy(dtype = float)
+      before   = numpy.concatenate([closes[:1], closes[:-1]])
+      move     = numpy.sign(closes - opens)
+      move     = numpy.where(move != 0, move, numpy.sign(closes - before))
+                               # a list, not numpy.full: color may be an
+                               # (r, g, b) tuple, which numpy would spread
+      colors   = (     [color] * len(closes)
+                  if (color is not None)
+                  else list(numpy.where(move > 0, UP,
+                                        numpy.where(move < 0, DOWN, FLAT))))
+      points   = numpy.column_stack([numpy.asarray(x, dtype = float),
+                                     volume])
+      segments = numpy.stack([points[:-1], points[1:]], axis = 1)
+
       twin = self.twin_of(host)
-      twin.plot(x, volume, color = color, linewidth = 1, alpha = 0.55)
+      twin.add_collection(LineCollection(segments,
+                                         colors    = colors[1:],
+                                         linewidth = 1,
+                                         alpha     = 0.75))
       top  = max(twin.get_ylim()[1] / 3, volume.max())
       twin.set_ylim(0, top * 3)
 
