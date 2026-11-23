@@ -1,22 +1,31 @@
 @echo off
-rem name: $Id: stock_picker.bat 2.main-2 17:05:10 23-Nov-2026 claude-opus-5-5 $
+rem name: $Id: stock_picker.bat 3.main-3 17:26:43 23-Nov-2026 rudyz $
+rem use: DOS batch file wrapper for running python script
 
-setlocal
-   set SELF=%~n0%
+setlocal EnableExtensions DisableDelayedExpansion
+   set "SELF=%~n0%"
    set "SELFPREFIX=%~dp0%"
-
-rem calling make from GnuEmacs uses the MS cmd.exe, so we have to check
-rem what command processor we're using
-   if "%ComSpec%" == "%SystemRoot%\system32\cmd.exe" goto CMD
+   if "%SELFPREFIX:~-1%" equ "\" set "SELFPREFIX=%SELFPREFIX:~0,-1%"
+   set "EXITCODE="
+                                rem TCC and uSoft cmd.exe use different
+                                rem syntax to pass full command line
+                                rem arguments. TCC has an internal
+                                rem _CMDPROC variable naming itself, which
+                                rem cmd.exe does not, so in cmd.exe it is
+                                rem empty
+   if "%_CMDPROC%" == "" goto CMD
                                 rem for use from TCC command line
-      python.exe %SELFPREFIX%\%SELF%.py %1% %2% %3% %4% %5% %6% %7% %8% %9%
+      python.exe "%SELFPREFIX%\%SELF%.py" %$
+      set "EXITCODE=%ERRORLEVEL%"
    goto END
 
 :CMD
                                 rem for use in GnuEmacs make
-   python.exe %SELFPREFIX%\%SELF%.py %*%
+   python.exe "%SELFPREFIX%\%SELF%.py" %*%
+   set "EXITCODE=%ERRORLEVEL%"
    goto END
 
 :END
+   if "%EXITCODE%" neq "" exit /B %EXITCODE%
 
 endlocal
