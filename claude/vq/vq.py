@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id$
+# name: $Id: vq.py 2.main-2 22:18:31 23-Nov-2026 claude-opus-5-5 $
 # use: draws the structure of an Oracle SQL query (tables, referenced
 #      columns, returned columns, join and filter predicates, and the
 #      AND/OR grouping of those predicates) as an interactive HTML page
@@ -7,6 +7,7 @@
 
 import getopt
 import html
+import itertools
 import math
 import os
 import re
@@ -26,7 +27,7 @@ except ImportError:
          " (pip install sqlglot)", file = sys.stderr)
    sys.exit(E_FAIL)
 
-REVISION     = "$Revision$"
+REVISION     = "$Revision: 2.main-2 $"
 FORMATS      = ("html",)
 
 CHAR_PX      = 7.9
@@ -34,22 +35,42 @@ NAME_CHAR_PX = 8.7
 SMALL_PX     = 6.7
 SLOT_PX      = 7
 COL_GAP_PX   = 24
-BAND_PX      = 11
+BAND_PX      = 14
+                               # row just off the column names that
+                               # holds the join operators
+OP_ROW_PX    = 18
+                               # how far a bracket or arc runs past
+                               # its top and bottom terms
+ENCLOSE_PX   = 6
 ROW_PX       = 13
-GAP_PX       = 78
+GAP_PX       = 36
 MARGIN_PX    = 30
 PASS_PX      = 6
 CHECK_PX     = 9
 ORDER_PX     = 6.6
                                # a value compared to a column hangs off
-                               # it at 15 degrees from vertical
-FILTER_TILT  = math.tan(math.radians(15))
+                               # it at 45 degrees from vertical
+FILTER_TILT  = math.tan(math.radians(45))
+                               # gap left between a value's arrowhead
+                               # and the point it aims at
+ARROW_GAP_PX = 4
+                               # least drop of the slanted part of a
+                               # value's line, so its arrow has room
+FILTER_REACH_PX = 14
 CORNER_PX    = 3
 INDENT_PX    = 28
 BOX_PAD_PX   = 14
 BOX_TITLE_PX = 24
 LABEL_MAX    = 30
+                               # False: a CTE reference or inline view
+                               # always folds into its query, and lines
+                               # go to the real tables there; True: one
+                               # that would mislead when folded stays as
+                               # a virtual table in a dotted box
+VIRTUAL_TABLES = False
 
+                               # colour of the horizontal grouping bars
+BAR_COLOR    = "#111827"
 PALETTE      = ("#2563eb", "#d97706", "#059669", "#db2777",
                 "#7c3aed", "#0891b2", "#65a30d", "#dc2626")
 
@@ -141,6 +162,11 @@ class TableRef:
       self.name_right = 0.0
       self.bands      = {"up": 0, "down": 0}
       self.rows       = 0
+                               # the query that fills a CTE reference or
+                               # inline view; None for everything else,
+                               # including tables made up for columns
+                               # that match no FROM table
+      self.body       = None
                                # a CTE reference / inline view that
                                # could not be folded into its query
       self.virtual    = False
@@ -173,6 +199,14 @@ class Endpoint:
       self.table     = table
       self.column    = column
       self.join_mark = join_mark
+                               # bar the end is drawn on as a stub; the
+                               # next layout run gives stubs of one
+                               # column on one bar a single slot
+      self.merge     = None
+                               # for a value compared to a column: how
+                               # far below the column names its slanted
+                               # line leaves the column
+      self.join_off  = 0.0
       self.column_key = next((k for (k, c) in table.columns.items()
                               if (c is column)), None)
       self.side      = "down"
@@ -195,6 +229,11 @@ class Segment:
                       else "join")
       self.upper   = a
       self.lower   = b
+                               # the trunk this join is drawn on, if any
+      self.trunk   = None
+                               # endpoints sharing a merge key share one
+                               # stub (set by one layout run for the next)
+      self.members = []
       self.row     = 0
                                # x where the line crosses each table
                                # between its two ends
@@ -208,6 +247,47 @@ class Segment:
 
    def ends(self):
       return((self.a,) if (self.b is None) else (self.a, self.b))
+
+###########################################################################
+
+class Unit:
+   """
+   use: one horizontal bar at one side of one table: the conditions of
+        one AND group, or of one OR alternative, that touch that side;
+        everything on one bar is AND'ed together
+   """
+   def __init__(self, ident, node, table, side, ends):
+      self.ident  = ident
+      self.node   = node
+      self.table  = table
+      self.side   = side
+      self.ends   = ends
+      self.color  = node.color if (node is not None) else "#4b5563"
+                               # inside a bracket or arc it is drawn
+                               # even for a single line, to anchor it
+      self.forced = False
+      self.drawn  = False
+      self.band   = 0
+
+###########################################################################
+
+class Mark:
+   """
+   use: encloses bars and single lines at one side of one table when
+        parentheses nest, with a delimiter left and right: [ ] for AND
+        (the vertical equivalent of a bar), ( ) for OR, dash-dot [ ]
+        for NOT; a nested enclosure sits inside its parent
+   """
+   def __init__(self, kind, node, children, depth):
+      self.kind     = kind
+      self.node     = node
+      self.children = children
+      self.depth    = depth
+      self.color    = node.color
+      self.table    = None
+      self.side     = None
+      self.left     = 0.0
+      self.right    = 0.0
 
 ###########################################################################
 
@@ -241,7 +321,6 @@ class Node:
       self.depth    = 0
       self.color    = PALETTE[0]
       self.is_root  = False
-      self.bars     = []
                                # dotted lines tying an OR's alternatives
       self.links    = []
 
@@ -329,6 +408,10 @@ class Diagram:
       self.notes_y  = 0.0
       self.seps     = []
       self.feeds    = []
+      self.units    = []
+      self.marks    = []
+      self.trunks   = []
+      self.layout   = None
 
 ###########################################################################
 ###
@@ -517,11 +600,11 @@ class QueryModel:
    def collapse(self, scopes):
       """
       use: draws each table only once: a CTE reference or inline view
-           whose columns are all plain columns of its query is removed,
-           and every line to it is moved to those columns inside the
-           query's box
-      post: references that cannot be folded are left in place and
-            marked virtual (drawn in a dotted box)
+           is removed, and every line to it is moved to the columns
+           that produce it inside its query's box
+      post: with VIRTUAL_TABLES on, a reference that would mislead when
+            folded is left in place and marked virtual (drawn in a
+            dotted box); with it off every reference is folded
       imp: repeated until nothing changes, so a CTE built on another
            CTE folds all the way down
       """
@@ -530,8 +613,6 @@ class QueryModel:
          for table in scope.tables.values():
             if (table.kind == "cte"):
                uses[table.name] = uses.get(table.name, 0) + 1
-      ends = [end for scope in scopes for leaf in scope.leaves
-                  for segment in leaf.segments for end in segment.ends()]
       changed = True
       while (changed):
          changed = False
@@ -539,21 +620,21 @@ class QueryModel:
             for (key, table) in list(scope.tables.items()):
                if (table.body is None or table.virtual):
                   continue
-               targets = self.fold_targets(table, uses)
+               targets = (     self.fold_targets(table, uses)
+                          if (VIRTUAL_TABLES)
+                          else self.fold_all_targets(table))
                if (targets is None):
                   table.virtual = True
                   continue
                for (name, column) in table.columns.items():
-                  (_, target) = targets[name]
-                  target.returned = target.returned or column.returned
-                  if (target.order_by is None):
-                     target.order_by = column.order_by
-               for end in ends:
-                  if (end.table is table):
-                     (end.table, end.column) = targets[end.column_key]
-                     end.column_key = next(
-                        k for (k, c) in end.table.columns.items()
-                        if (c is end.column))
+                  for (_, target) in targets.get(name, []):
+                     target.returned = target.returned or column.returned
+                     if (target.order_by is None):
+                        target.order_by = column.order_by
+               for other in scopes:
+                  for leaf in other.leaves:
+                     leaf.segments = self.retarget(leaf.segments, table,
+                                                   targets)
                del scope.tables[key]
                changed = True
       for scope in scopes:
@@ -564,12 +645,86 @@ class QueryModel:
                                else "self" if (  segment.a.table
                                                is segment.b.table)
                                else "join")
+                               # a condition on a column made from no
+                               # column at all (rownum, a literal) has
+                               # nowhere left to be drawn
+            if (    not leaf.segments
+                and not leaf.silent
+                and leaf.sql not in scope.notes):
+               scope.notes.append(leaf.sql)
+
+   ########################################################################
+
+   def retarget(self, segments, table, targets):
+      """
+      post: returns segments with every end on table moved to the
+            column(s) that produce it; an end produced by several
+            columns becomes one segment per column, and a segment with
+            an end produced by none is dropped
+      """
+      result = []
+      for segment in segments:
+         ends = segment.ends()
+         if (all(end.table is not table for end in ends)):
+            result.append(segment)
+            continue
+         choices = [     targets.get(end.column_key, [])
+                    if (end.table is table)
+                    else [(end.table, end.column)]
+                    for end in ends]
+         for picks in itertools.product(*choices):
+            moved = [Endpoint(target, column, end.join_mark)
+                     for ((target, column), end) in zip(picks, ends)]
+            result.append(Segment(moved[0],
+                                  moved[1] if (len(moved) > 1) else None,
+                                  segment.op))
+      return(result)
+
+   ########################################################################
+
+   def fold_all_targets(self, table):
+      """
+      post: returns {column key: [(table, column), ...]}: for each
+            column read through a CTE reference / inline view, every
+            column inside its query that the select list entry is made
+            from; an expression gives all its columns, rownum or a
+            literal none, and each branch of a set operation adds its
+            entry at the same position
+      """
+      body = table.body
+      while (isinstance(body, exp.Subquery)):
+         body = body.this
+      branches = [select for select in self.branches(body)
+                  if (id(select) in self.scopes)]
+      if (not branches):
+         return({})
+      names   = [self.output_name(p) for p in branches[0].expressions]
+      targets = {}
+      for key in table.columns:
+         found = []
+         for select in branches:
+            inner = self.scopes[id(select)]
+            if (key == "*"):
+               for source in inner.sources:
+                  found.append((source, source.column("*")))
+            elif (    key in names
+                  and names.index(key) < len(select.expressions)):
+               projection = select.expressions[names.index(key)]
+               for column in own_columns(projection):
+                  end = self.endpoint(inner, column)
+                  found.append((end.table, end.column))
+            elif ("*" in names and len(inner.sources) == 1):
+               source = inner.sources[0]
+               found.append((source,
+                             source.column(key, table.columns[key].name)))
+         targets[key] = found
+      return(targets)
 
    ########################################################################
 
    def fold_targets(self, table, uses):
       """
-      post: returns {column key: (table, column)} inside the query of
+      post: returns {column key: [(table, column)]} inside the query of
             a CTE reference / inline view when every column read
             through it is a plain column there, else None
       """
@@ -594,7 +749,7 @@ class QueryModel:
              or isinstance(target.this, exp.Star)):
             return(None)
          end = self.endpoint(inner, target)
-         targets[key] = (end.table, end.column)
+         targets[key] = [(end.table, end.column)]
       return(targets)
 
    ########################################################################
@@ -1165,20 +1320,25 @@ class Layout:
          for column in table.columns.values():
             column.slots = {"up": [], "down": []}
       for node in self.nodes:
-         node.bars  = []
          node.links = []
       for segment in self.segments():
-         segment.via = []
+         segment.via   = []
+         segment.trunk = None
       self.place_endpoints()
       self.place_columns()
       self.place_slots()
       self.place_leans()
-      self.place_bars()
+      self.place_groups()
+      self.place_trunks()
+      self.diagram.units  = self.units
+      self.diagram.marks  = self.marks
+      self.diagram.trunks = self.trunks
       self.place_rows()
       self.place_vertical()
                                # needs table heights, changes none
       self.place_passes()
       self.place_links()
+      self.place_marks()
 
    ########################################################################
 
@@ -1219,8 +1379,9 @@ class Layout:
          cursor     = table.left + 14
          for name in names:
             column       = table.columns[name]
-            slots        = max(len(column.slots["up"]),
-                               len(column.slots["down"])) * SLOT_PX
+            slots        = max(len(self.slot_groups(column, "up")),
+                               len(self.slot_groups(column, "down"))
+                               ) * SLOT_PX
                                # the check sits at the top right corner
                                # of the name, so it widens the column
             check        = (  (CHECK_PX if (column.returned) else 0)
@@ -1297,11 +1458,27 @@ class Layout:
       for table in self.tables:
          for column in table.columns.values():
             for side in ("up", "down"):
-               ends  = sorted(column.slots[side], key = self.direction)
-               count = len(ends)
-               for (position, end) in enumerate(ends):
-                  end.x = (  column.x
-                           + (position - (count - 1) / 2) * SLOT_PX)
+               groups = sorted(self.slot_groups(column, side),
+                               key = lambda g: sum(self.direction(e)
+                                                   for e in g) / len(g))
+               count  = len(groups)
+               for (position, group) in enumerate(groups):
+                  for end in group:
+                     end.x = (  column.x
+                              + (position - (count - 1) / 2) * SLOT_PX)
+
+   ########################################################################
+
+   def slot_groups(self, column, side):
+      """
+      post: returns the ends at one side of a column, grouped so that
+            stubs to the same bar share one slot
+      """
+      groups = {}
+      for end in column.slots[side]:
+         key = end.merge if (end.merge is not None) else id(end)
+         groups.setdefault(key, []).append(end)
+      return(list(groups.values()))
 
    ########################################################################
 
@@ -1468,56 +1645,366 @@ class Layout:
 
    ########################################################################
 
-   def place_bars(self):
+   def place_groups(self):
       """
-      use: gives each AND/NOT node a horizontal bar on every table
-           side its predicates touch: just above the column names for
-           lines coming from a table above, just below them for lines
-           going down; nested nodes sit nearer the columns than their
-           parents
-      imp: a top level OR gets no bar: separate, unconnected lines
-           (or separately barred AND groups) already read as
-           alternatives
+      use: works out the bars at each side of each table: for every
+           condition tree, the part touching that side is cut out; each
+           AND group's own conditions become one bar, and nested groups
+           are enclosed in [ ] (AND) or ( ) (OR)
+      imp: top level OR alternatives that sit side by side on one level
+           need no marks: separate bars are alternatives; stacked on
+           different levels they are enclosed in one ( )
       """
-      placed = {}
-      bands  = {}
-      for node in sorted(self.nodes, key = lambda n: -n.depth):
-                               # an OR is shown by dotted links between
-                               # its alternatives (place_links), not a
-                               # bar
-         if (node.kind == "OR"):
+      self.units     = []
+      self.marks     = []
+      self.unit_of   = {}
+      self.single_of = {}
+      roots = [scope.root for scope in self.diagram.scopes
+               if (scope.root is not None)]
+      for table in self.tables:
+         for side in ("down", "up"):
+            band = 0
+            for root in roots:
+               item = self.restrict(root, table, side)
+               if (item is None):
+                  continue
+               if (item[0] != "or"):
+                  band = self.assign_bands(self.shape(item, table, side, 0),
+                                           band)
+                  continue
+               kids = [self.shape(k, table, side, 1) for k in item[2]]
+               if (self.side_by_side(kids)):
+                  used = False
+                  for kid in kids:
+                     if (len(kid.ends) >= 2):
+                        self.make_bar(kid, band)
+                        used = True
+                  band += 1 if (used) else 0
+               else:
+                  mark = self.new_mark("OR", item[1], kids, 0, table, side)
+                  band = self.assign_bands(mark, band)
+            table.bands[side] = max(table.bands[side], band)
+                               # an operator row is kept only where an
+                               # operator sits in it, not on a level
+      for table in self.tables:
+         table.ops = {"down": False, "up": False}
+      for segment in self.segments():
+         if (segment.kind != "join" or not segment.op):
             continue
-         groups = {}
-         for end in node.endpoints():
-                               # a bar meets a filter line where the
-                               # slant has carried it to, so mark them
-            slant = (end.segment.kind == "filter")
-            groups.setdefault((end.table.key, id(end.table), end.side),
-                              (end.table, []))[1].append(
-               (round(end.x, 1), slant))
-         for (key, (table, xs)) in groups.items():
-            xs = sorted(set(xs))
-                               # a nested group touching a table with
-                               # one line still needs a tick there, or
-                               # the grouping is lost across tables
-            if (len(xs) < 2 and node.is_root):
+         for end in segment.ends():
+            shown = (   end is segment.a
+                     or segment.op in ("=", "<>", "!=")
+                     or end.join_mark)
+            if (shown and id(end) not in self.single_of):
+               end.table.ops[end.side] = True
+                               # a value's line leaves its column where
+                               # the column meets its bar, its own level
+                               # in an enclosure, or where the nearest
+                               # bar would be
+      for segment in self.segments():
+         if (segment.kind != "filter"):
+            continue
+         end  = segment.a
+         unit = (   self.unit_of.get(id(end))
+                 or self.single_of.get(id(end)))
+         ops  = OP_ROW_PX if (end.table.ops["down"]) else 0
+                               # with no bar of its own: below every bar
+                               # there, so it is not read as a member
+         band = (     unit.band if (unit is not None)
+                 else end.table.bands["down"])
+         end.join_off = 3 + ops + (band + 0.5) * BAND_PX
+
+   ########################################################################
+
+   def side_by_side(self, kids):
+      """
+      post: true when every alternative is a plain bar or line and no
+            two bars overlap horizontally, so all fit on one level; a
+            single line is separate from any bar already
+      """
+      if (any(not isinstance(k, Unit) for k in kids)):
+         return(False)
+      spans = sorted(self.unit_span(k, 0) for k in kids
+                     if (len(k.ends) >= 2))
+      return(all(b[0] > a[1] + 6 for (a, b) in zip(spans, spans[1:])))
+
+   ########################################################################
+
+   def make_bar(self, unit, band):
+      unit.drawn = True
+      unit.band  = band
+      for end in unit.ends:
+         self.unit_of[id(end)] = unit
+
+   ########################################################################
+
+   def restrict(self, item, table, side):
+      """
+      post: returns item cut down to the conditions with an end at one
+            side of table, as ("leaf", leaf, ends) or (kind, node,
+            kids), or None when nothing is left
+      """
+      if (isinstance(item, Leaf)):
+         if (item.feed):
+            return(None)
+         ends = [e for s in item.segments for e in s.ends()
+                 if (e.table is table and e.side == side)]
+         return(("leaf", item, ends) if (ends) else None)
+      kids = [k for k in (self.restrict(c, table, side)
+                          for c in item.children) if (k is not None)]
+      if (not kids):
+         return(None)
+      return((item.kind.lower(), item, kids))
+
+   ########################################################################
+
+   def shape(self, item, table, side, depth):
+      """
+      post: returns the Unit or Mark that draws a cut down item
+      """
+      if (item[0] == "leaf"):
+         leaf  = item[1]
+         owner = leaf.ancestors[-1] if (leaf.ancestors) else None
+         return(self.new_unit(owner, item[2], table, side))
+      if (item[0] == "and"):
+         leaves   = [k for k in item[2] if (k[0] == "leaf")]
+         children = []
+         if (leaves):
+            children.append(self.new_unit(item[1],
+                                          [e for k in leaves
+                                             for e in k[2]],
+                                          table, side))
+         children += [self.shape(k, table, side, depth + 1)
+                      for k in item[2] if (k[0] != "leaf")]
+         if (len(children) == 1):
+            return(children[0])
+         return(self.new_mark("AND", item[1], children, depth, table,
+                              side))
+      children = [self.shape(k, table, side, depth + 1) for k in item[2]]
+      return(self.new_mark(item[0].upper(), item[1], children, depth,
+                           table, side))
+
+   ########################################################################
+
+   def new_unit(self, node, ends, table, side):
+      unit = Unit(f"U{len(self.units)}", node, table, side, ends)
+      self.units.append(unit)
+      return(unit)
+
+   ########################################################################
+
+   def new_mark(self, kind, node, children, depth, table, side):
+      mark       = Mark(kind, node, children, depth)
+      mark.table = table
+      mark.side  = side
+      for child in children:
+         if (isinstance(child, Unit)):
+            child.forced = True
+      self.marks.append(mark)
+      return(mark)
+
+   ########################################################################
+
+   def assign_bands(self, element, band):
+      """
+      post: drawn bars get consecutive bands in SQL order, so the bars
+            under one bracket or arc sit together; returns the next
+            free band
+      """
+      if (isinstance(element, Mark)):
+         for child in element.children:
+            band = self.assign_bands(child, band)
+         return(band)
+                               # two or more lines make a bar; a single
+                               # line inside an enclosure gets a level
+                               # of its own for its operator; any other
+                               # single line is left as it is
+      if (len(element.ends) >= 2):
+         self.make_bar(element, band)
+         band += 1
+      elif (element.forced):
+         element.band = band
+         for end in element.ends:
+            self.single_of[id(end)] = element
+         band += 1
+      return(band)
+
+   ########################################################################
+
+   def place_trunks(self):
+      """
+      use: joins between the same two bars (or a bar and a column) are
+           drawn as stubs from their columns to the bar plus a single
+           trunk between the tables; from one bar a trunk goes to each
+           other table
+      imp: when several joins share a trunk their columns must pair up
+           in the same left to right order at both ends, and no other
+           join may sit between them on a bar, or nothing would show
+           which column goes with which; such joins stay separate lines
+           with dots on the bars
+      """
+      self.trunks = []
+      for end in [e for s in self.segments() for e in s.ends()]:
+         end.merge = None
+      groups = {}
+      for leaf in self.leaves:
+         if (leaf.feed):
+            continue
+         for segment in leaf.segments:
+            if (segment.kind != "join"):
                continue
-                               # allow for the slant of filter lines
-            (x0, x1) = (xs[0][0], max(x + (30 if (slant) else 0)
-                                      for (x, slant) in xs))
-            if (x1 - x0 < 14):
-               (x0, x1) = (x0 - 7, x1 + 7)
-            band = 1 + max([bands.get((d.ident, key), -1)
-                            for d in node.descendants()] + [-1])
-            used = placed.setdefault(key, {})
-            while (any(not (x1 + 8 < a or b + 8 < x0)
-                       for (a, b) in used.get(band, []))):
-               band += 1
-            used.setdefault(band, []).append((x0, x1))
-            bands[(node.ident, key)] = band
-            side = key[2]
-            table.bands[side] = max(table.bands[side], band + 1)
-            node.bars.append((table, side, band, x0, x1, xs))
+            top    = self.unit_of.get(id(segment.upper))
+            bottom = self.unit_of.get(id(segment.lower))
+            if (top is None and bottom is None):
+               continue
+            key = (id(top), id(bottom), id(segment.upper.table),
+                   id(segment.lower.table))
+            groups.setdefault(key, (top, bottom, []))[2].append(segment)
+      for (top, bottom, segments) in groups.values():
+         segments.sort(key = lambda s: (s.upper.column.x,
+                                        s.lower.column.x))
+         lowers = [s.lower.column.x for s in segments]
+         if (any(b < a for (a, b) in zip(lowers, lowers[1:]))):
+            continue
+         if (   self.interleaved(top, segments, "upper")
+             or self.interleaved(bottom, segments, "lower")):
+            continue
+         self.trunks.append(self.new_trunk(top, bottom, segments))
+      self.passes = [s for s in self.passes if (s.trunk is None)]
+      for trunk in self.trunks:
+         if (trunk.lower.table.index - trunk.upper.table.index > 1):
+            self.passes.append(trunk)
+
+   ########################################################################
+
+   def interleaved(self, unit, segments, which):
+      """
+      post: true when another join's column sits strictly between the
+            columns these segments use on unit's bar
+      """
+      if (unit is None):
+         return(False)
+      mine   = [getattr(s, which) for s in segments]
+      xs     = [e.column.x for e in mine]
+      (a, b) = (min(xs), max(xs))
+      for end in unit.ends:
+         if (    all(end is not m for m in mine)
+             and end.segment.kind == "join"
+             and a < end.column.x < b):
+            return(True)
+      return(False)
+
+   ########################################################################
+
+   def new_trunk(self, top, bottom, segments):
+      """
+      post: returns the trunk segment between pseudo ends: on a bar,
+            in the middle of its stubs; with no bar, on the column
+      """
+      ends = []
+      for (unit, which, side) in ((top, "upper", "down"),
+                                  (bottom, "lower", "up")):
+         mine = [getattr(s, which) for s in segments]
+         end  = Endpoint(mine[0].table, None)
+         end.side = side
+         if (unit is None):
+            end.x      = mine[0].x
+            end.column = mine[0].column
+         else:
+            end.x = (min(e.x for e in mine) + max(e.x for e in mine)) / 2
+            for e in mine:
+                               # stubs of one column to one bar share a
+                               # slot from the next run on
+               e.merge = unit.ident
+         ends.append(end)
+      trunk         = Segment(ends[0], ends[1], "")
+      trunk.upper   = ends[0]
+      trunk.lower   = ends[1]
+      trunk.members = segments
+      trunk.units   = (top, bottom)
+      trunk.leaves  = [l for l in self.leaves
+                       if (any(s in segments for s in l.segments))]
+      for segment in segments:
+         segment.trunk = trunk
+                               # an operator on a trunk (one join, one
+                               # end on a column) leans to its left
+                               # hand side's end
+      only        = segments[0]
+      trunk.lean  = "upper" if (only.a is only.upper) else "lower"
+      return(trunk)
+
+   ########################################################################
+
+   def place_marks(self):
+      """
+      use: sizes each enclosure to just outside what it holds, so a
+           nested one sits inside its parent's delimiters, and clear of
+           every vertical line at that side of the table
+      """
+      self.verticals = {}
+      for segment in list(self.segments()) + self.trunks:
+         for end in segment.ends():
+            self.verticals.setdefault((id(end.table), end.side),
+                                      []).append(end.x)
+         for (table, x) in segment.via:
+                               # a line passing through runs straight
+                               # down through both sides of the table
+            for side in ("up", "down"):
+               self.verticals.setdefault((id(table), side),
+                                         []).append(x)
+      for mark in self.marks:
+         self.mark_extent(mark)
+
+   ########################################################################
+
+   def mark_extent(self, element):
+      """
+      post: returns (left, right) of a bar, a single line's operator or
+            an enclosure (setting the enclosure's own left and right)
+      """
+      if (isinstance(element, Unit)):
+         if (element.drawn):
+            return(self.unit_span(element))
+         x = element.ends[0].x
+         return(x - 7, x + 7)
+      spans = [self.mark_extent(child) for child in element.children]
+      left  = min(a for (a, _) in spans) - 7
+      right = max(b for (_, b) in spans) + 7
+                               # a side and its stubs take 4 px; step it
+                               # outward until no vertical line runs in
+                               # that strip (lines at an angle are fine)
+      xs    = self.verticals.get((id(element.table), element.side), [])
+      while (any(left - 2 <= x <= left + 6 for x in xs)):
+         left -= 4
+      while (any(right - 6 <= x <= right + 2 for x in xs)):
+         right += 4
+      (element.left, element.right) = (left, right)
+      return(left, right)
+
+   ########################################################################
+
+   def unit_span(self, unit, y = None):
+      """
+      post: returns (x0, x1) of a unit's bar: from its leftmost line to
+            its rightmost, no further
+      imp: when every line meets it at one x (one column's stubs) it
+           is kept 6 wide, so it still shows
+      """
+      if (y is None):
+         y = (     band_y(unit.table, unit.side, unit.band)
+              if (hasattr(unit.table, "down_top")) else 0)
+      xs = [self.member_x(end, y) for end in unit.ends]
+      (x0, x1) = (min(xs), max(xs))
+      if (x1 - x0 < 6):
+         (x0, x1) = ((x0 + x1) / 2 - 3, (x0 + x1) / 2 + 3)
+      return(x0, x1)
+
+   ########################################################################
+
+   def member_x(self, end, y):
+                               # a value's line runs straight down to
+                               # its bar before it slants
+      return(end.x)
 
    ########################################################################
 
@@ -1527,18 +2014,26 @@ class Layout:
            lines, each between the closest points of two neighbouring
            alternatives
       imp: a top level OR is left unmarked: unconnected lines already
-           read as alternatives
+           read as alternatives; two alternatives that meet at a side
+           of a table are already tied there by the OR's arc, so they
+           get no link
       """
       for node in self.nodes:
          if (node.kind != "OR" or node.is_root):
             continue
-         anchors = []
+         alternatives = []
          for child in node.children:
             ends = (     child.endpoints() if (isinstance(child, Node))
                     else [e for s in child.segments for e in s.ends()])
             if (ends):
-               anchors.append([self.anchor(end) for end in ends])
-         for (first, second) in zip(anchors, anchors[1:]):
+               alternatives.append(ends)
+         for (first, second) in zip(alternatives, alternatives[1:]):
+            meet = ({(id(e.table), e.side) for e in first}
+                    & {(id(e.table), e.side) for e in second})
+            if (meet):
+               continue
+            first  = [self.anchor(end) for end in first]
+            second = [self.anchor(end) for end in second]
             node.links.append(min(((a, b) for a in first
                                           for b in second),
                                   key = lambda p: math.hypot(
@@ -1557,8 +2052,7 @@ class Layout:
                                # AND bars further out
       if (end.side == "up"):
          return(end.x, table.col_top - 1)
-      slant = FILTER_TILT * 1 if (end.segment.kind == "filter") else 0
-      return(end.x + slant, table.col_bottom + 1)
+      return(end.x, table.col_bottom + 1)
 
    ########################################################################
 
@@ -1578,9 +2072,19 @@ class Layout:
          rows   = 0
          for segment in sorted(items, key = lambda s: -max(
                                   e.x for e in s.ends())):
-            row = 0
-            while (not self.row_fits(table, segment, row, placed)):
+            row   = 0
+            limit = len(placed) + 1
+            while (    row <= limit
+                   and not self.row_fits(table, segment, row, placed)):
                row += 1
+                               # when its own line must cross a label
+                               # above whatever row it takes, settle for
+                               # the first row where its label is clear
+            if (row > limit):
+               row = 0
+               while (not self.row_fits(table, segment, row, placed,
+                                        strict = False)):
+                  row += 1
             segment.row = row
             placed.append(segment)
             rows = max(rows, row + 1)
@@ -1592,11 +2096,13 @@ class Layout:
 
    ########################################################################
 
-   def row_fits(self, table, segment, row, placed):
+   def row_fits(self, table, segment, row, placed, strict = True):
       """
       post: true when segment's label in row clears every label in its
-            row and every line passing through its row, and its own
-            lines clear the labels in the rows above
+            row and every line passing through its row, and (if strict)
+            its own lines clear the labels in the rows above
+      imp: the non-strict test always passes below every placed row,
+           so a search with it ends
       """
       (a, b) = self.row_span(table, segment, row)
       for other in placed:
@@ -1608,7 +2114,7 @@ class Layout:
             for x in self.lines_at(table, other, row):
                if (a - 2 <= x <= b + 2):
                   return(False)
-         else:
+         elif (strict):
             (c, d) = self.row_span(table, other, other.row)
             for x in self.lines_at(table, segment, other.row):
                if (c - 2 <= x <= d + 2):
@@ -1622,7 +2128,8 @@ class Layout:
       post: returns the x of segment's line(s) at the height of row
       """
       if (segment.kind == "filter"):
-         return([segment.a.x + filter_drop(table, row) * FILTER_TILT])
+         reach = filter_drop(table, row) - segment.a.join_off
+         return([segment.a.x + max(reach, 0) * FILTER_TILT])
       return([segment.a.x, segment.b.x])
 
    ########################################################################
@@ -1634,7 +2141,8 @@ class Layout:
             slanted line, a same-table connector's under its middle
       """
       if (segment.kind == "filter"):
-         x_end = segment.a.x + filter_drop(table, row) * FILTER_TILT
+         reach = filter_drop(table, row) - segment.a.join_off
+         x_end = segment.a.x + max(reach, 0) * FILTER_TILT
          return(x_end, x_end + 4 + text_px(segment.op, SMALL_PX))
       half     = text_px(segment.op, SMALL_PX) / 2 + 4
       (xa, xb) = sorted((segment.a.x, segment.b.x))
@@ -1655,17 +2163,19 @@ class Layout:
       for item in diagram.items:
          kind = item[0]
          if (kind == "open"):
+                               # a box starts a little below whatever
+                               # is above it
             if (previous in ("table", "close")):
-               y -= 30
+               y = last + 14
             item[1].box_top = y
             y += BOX_TITLE_PX
          elif (kind == "close"):
             last += 10
             item[1].box_bottom = last
-            y = last + GAP_PX - 20
+            y = last + GAP_PX
          elif (kind == "sep"):
-            diagram.seps.append((item[1], item[2], last + 38))
-            y = last + 66
+            diagram.seps.append((item[1], item[2], last + 28))
+            y = last + 46
          else:
             self.place_table(item[1], y)
             last = item[1].bottom
@@ -1690,14 +2200,23 @@ class Layout:
                                # the nearest is as far above the names
                                # as the nearest bar below is under them
       bands            = table.bands["up"] * BAND_PX
+      ops_up           = OP_ROW_PX if (table.ops["up"]) else 0
+      ops_down         = OP_ROW_PX if (table.ops["down"]) else 0
       table.up_bottom  = table.name_y + 8 + bands
-      table.col_y      = (     table.name_y + 22 if (not bands)
-                          else table.up_bottom + 14)
+                               # the nearest level is as far from the
+                               # column names as the operator row, so
+                               # every stub to an operator is alike
+      table.col_y      = (     table.name_y + 22 + ops_up if (not bands)
+                          else table.up_bottom + 15 + ops_up)
       table.col_top    = table.col_y - 12
       table.col_bottom = table.col_y + 5
-      table.down_top   = table.col_bottom + 2
+                               # operator rows, then the bar levels
+      table.op_y       = {"up"  : table.col_top - 10,
+                          "down": table.col_bottom + 10}
+      table.down_top   = table.col_bottom + 3 + ops_down
       table.filter_top = (  table.down_top
-                          + table.bands["down"] * BAND_PX + 4)
+                          + table.bands["down"] * BAND_PX + 4
+                          + (FILTER_REACH_PX if (table.rows) else 0))
       table.bottom     = (  table.filter_top
                           + table.rows * ROW_PX
                           + (6 if (table.rows) else 0))
@@ -1710,7 +2229,9 @@ def filter_drop(table, row):
          ends; place_table's spacing, so usable before tables are
          placed
    """
-   return(11 + table.bands["down"] * BAND_PX + row * ROW_PX)
+   ops = OP_ROW_PX if (table.ops["down"]) else 0
+   return(  12 + FILTER_REACH_PX + ops + table.bands["down"] * BAND_PX
+          + row * ROW_PX)
 
 ###########################################################################
 
@@ -1720,7 +2241,8 @@ def filter_end(segment):
    """
    table = segment.a.table
    drop  = filter_drop(table, segment.row)
-   return(segment.a.x + drop * FILTER_TILT, table.col_bottom + drop)
+   reach = max(drop - segment.a.join_off, 0)
+   return(segment.a.x + reach * FILTER_TILT, table.col_bottom + drop)
 
 ###########################################################################
 
@@ -1795,7 +2317,7 @@ class SvgRenderer:
                           f'y="{num(y + 16)}">statement {number + 1}'
                           '</text>')
             y += 28
-         Layout(diagram)
+         diagram.layout = Layout(diagram)
          panels.append(f'<g transform="translate(0,{num(y)})">')
          panels.append(self.diagram_svg(diagram))
          panels.append("</g>")
@@ -1805,11 +2327,11 @@ class SvgRenderer:
              f'width="{num(width)}" height="{num(y)}" '
              f'viewBox="0 0 {num(width)} {num(y)}">'
              f'<style>{SVG_STYLE}</style>'
-             '<defs><marker id="vqArrow" viewBox="0 0 10 10" '
-             'refX="10" refY="5" markerWidth="7" markerHeight="7" '
+             '<defs><marker id="vqArrow" viewBox="0 0 10 12" '
+             'refX="10" refY="6" markerWidth="8" markerHeight="9.6" '
              'markerUnits="userSpaceOnUse" '
              'orient="auto-start-reverse">'
-             '<path d="M0,1 L10,5 L0,9 z" fill="#4b5563"/>'
+             '<path d="M0,0 L10,6 L0,12 z" fill="#4b5563"/>'
              '</marker>'
              '<marker id="vqFeed" viewBox="0 0 10 10" '
              'refX="10" refY="5" markerWidth="7" markerHeight="7" '
@@ -1833,11 +2355,24 @@ class SvgRenderer:
          x = MARGIN_PX + BOX_PAD_PX + indent * INDENT_PX
          out.append(f'<text class="sep" x="{num(x)}" y="{num(y)}">'
                     f'{esc(text)}</text>')
+      self.layout    = diagram.layout
+                               # operators go over every line, so each
+                               # blanks out whatever line runs under it
+      self.ops_layer = []
       for scope in diagram.scopes:
          for leaf in scope.leaves:
             out.append(self.leaf_svg(leaf))
       for leaf in diagram.feeds:
          out.append(self.leaf_svg(leaf))
+      self.layout = diagram.layout
+      for trunk in diagram.trunks:
+         out.append(self.trunk_svg(trunk))
+      for unit in diagram.units:
+         if (unit.drawn):
+            out.append(self.unit_svg(diagram.layout, unit))
+      for mark in diagram.marks:
+         out.append(self.mark_svg(diagram.layout, mark))
+      out.append('<g class="ops">' + "".join(self.ops_layer) + "</g>")
       for scope in diagram.scopes:
          for node in scope.nodes:
             out.append(self.node_svg(node))
@@ -1880,21 +2415,47 @@ class SvgRenderer:
                 f'<title>{esc(leaf.sql)}</title>']
       labels = []
       for segment in leaf.segments:
+         if (segment.trunk is not None):
+            trunk = segment.trunk
+            for (end, unit) in ((segment.upper, trunk.units[0]),
+                                (segment.lower, trunk.units[1])):
+               if (unit is None):
+                  continue
+               table = end.table
+               y_bar = band_y(table, end.side, unit.band)
+               (y0, y1) = (     (table.col_bottom, y_bar)
+                           if (end.side == "down")
+                           else (y_bar, table.col_top))
+               stub = f"M{num(end.x)},{num(y0)} V{num(y1)}"
+               out.append(f'<path class="hit" d="{stub}"/>')
+               out.append(f'<path class="ln" d="{stub}"/>')
+            self.ops_layer += self.op_svg(segment)
+            continue
          if (segment.kind == "join"):
-            (path, where) = self.join_path(segment)
-            if (segment.op):
-               labels.append((where, segment.op, "op", "middle"))
+            (path, _) = self.join_path(segment)
          else:
             table = segment.a.table
             y_end = table.filter_top + segment.row * ROW_PX + 5
             if (segment.kind == "filter"):
-                               # drawn from the column out, so the
-                               # reversed start marker points back at
-                               # the column name
+                               # straight down the column to where it
+                               # meets its bar, then slanted out to the
+                               # value; drawn from that point out, so
+                               # the reversed start marker points back
+                               # at it
                (x_end, y_end) = filter_end(segment)
-               path = rounded_path([(segment.a.x, table.col_bottom),
-                                    (x_end, y_end)])
-               out.append(f'<path class="hit" d="{path}"/>')
+               x_join = segment.a.x
+               y_join = table.col_bottom + segment.a.join_off
+               stub   = (f"M{num(x_join)},{num(table.col_bottom)} "
+                         f"V{num(y_join)}")
+                               # the arrowhead stops short of the point
+                               # it aims at
+               length = math.hypot(x_end - x_join, y_end - y_join) or 1
+               x_tip  = x_join + (x_end - x_join) / length * ARROW_GAP_PX
+               y_tip  = y_join + (y_end - y_join) / length * ARROW_GAP_PX
+               path   = rounded_path([(x_tip, y_tip), (x_end, y_end)])
+               for d in (stub, path):
+                  out.append(f'<path class="hit" d="{d}"/>')
+               out.append(f'<path class="ln" d="{stub}"/>')
                out.append(f'<path class="ln" d="{path}" '
                           'marker-start="url(#vqArrow)"/>')
                labels.append(((x_end + 4, y_end + 4), segment.op,
@@ -1909,15 +2470,17 @@ class SvgRenderer:
                                y_end + 13), segment.op, "flt",
                               "middle"))
                                # oracle style (+) at the column end of
-                               # the line, on the optional table's side
+                               # the line, on the optional table's side;
+                               # a join's goes beside its operator
          for end in segment.ends():
-            if (end.join_mark):
+            if (end.join_mark and segment.kind != "join"):
                y = (     end.table.col_top - 1 if (end.side == "up")
                     else end.table.col_bottom + 11)
-                               # a filter's value is off to the right,
-                               # so its (+) goes on the left
+                               # under its column name, so its (+) goes
+                               # on the left, just above that point
                if (segment.kind == "filter"):
-                  labels.append(((end.x - 3, y), "(+)", "mark", "end"))
+                  y = end.table.col_bottom + end.join_off - 3
+                  labels.append(((end.x - 4, y), "(+)", "mark", "end"))
                else:
                   labels.append(((end.x + 4, y), "(+)", "mark",
                                  "start"))
@@ -1933,6 +2496,8 @@ class SvgRenderer:
          elif (path is not None):
             out.append(f'<path class="hit" d="{path}"/>')
             out.append(f'<path class="ln" d="{path}"/>')
+            if (segment.kind == "join"):
+               self.ops_layer += self.op_svg(segment)
       for ((x, y), text, kind, anchor) in labels:
          out.append(f'<text class="{kind}" x="{num(x)}" y="{num(y)}" '
                     f'text-anchor="{anchor}">{esc(text)}</text>')
@@ -1948,13 +2513,22 @@ class SvgRenderer:
            the tables between, at the x chosen by place_passes
       """
       (upper, lower) = (segment.upper, segment.lower)
-      points = [(upper.x, upper.table.col_bottom),
+      (y0, y3)       = (upper.table.col_bottom, lower.table.col_top)
+      if (segment.members):
+                               # a trunk runs between bars, or to a
+                               # column where a table has no bar
+         (top, bottom) = segment.units
+         if (top is not None):
+            y0 = band_y(upper.table, "down", top.band)
+         if (bottom is not None):
+            y3 = band_y(lower.table, "up", bottom.band)
+      points = [(upper.x, y0),
                 (upper.x, upper.table.bottom)]
       for (table, x) in segment.via:
          points.append((x, table.top))
          points.append((x, table.bottom))
       points.append((lower.x, lower.table.top))
-      points.append((lower.x, lower.table.col_top))
+      points.append((lower.x, y3))
                                # the sloped legs are every other pair
                                # of points after the first stub
       legs = [(points[i], points[i + 1])
@@ -1973,6 +2547,176 @@ class SvgRenderer:
 
    ########################################################################
 
+   def op_svg(self, segment):
+      """
+      post: returns a join's operator, centered on its line just off
+            the column name and blanking the line behind it: at both
+            ends for "=" or "<>", which read the same from either side,
+            else at the left hand side's end; a line that has a level of
+            its own inside an enclosure carries it at that level
+      """
+      out    = []
+      layout = self.layout
+      for end in segment.ends():
+         if (    end is not segment.a
+             and segment.op not in ("=", "<>", "!=")
+             and not end.join_mark):
+            continue
+         unit = layout.single_of.get(id(end))
+         y    = (     band_y(end.table, end.side, unit.band)
+                 if (unit is not None)
+                 else end.table.op_y[end.side])
+         text = segment.op if (end is segment.a or
+                               segment.op in ("=", "<>", "!=")) else ""
+         if (text):
+            width = text_px(text, SMALL_PX) + 3
+            out.append(f'<rect class="opbg" x="{num(end.x - width / 2)}" '
+                       f'y="{num(y - 6)}" width="{num(width)}" '
+                       'height="12"/>'
+                       f'<text class="op stub" x="{num(end.x)}" '
+                       f'y="{num(y + 4)}" text-anchor="middle">'
+                       f'{esc(text)}</text>')
+         if (end.join_mark):
+                               # (+) on the left under a column name,
+                               # on the right above one
+            gap = text_px(text, SMALL_PX) / 2 + 3 if (text) else 3
+            if (end.side == "down"):
+               (x, anchor) = (end.x - gap, "end")
+            else:
+               (x, anchor) = (end.x + gap, "start")
+            out.append(f'<text class="mark" x="{num(x)}" '
+                       f'y="{num(y + 4)}" text-anchor="{anchor}">(+)'
+                       '</text>')
+      return(out)
+
+   ########################################################################
+
+   def trunk_svg(self, trunk):
+      """
+      post: returns a trunk, grouped so hovering it highlights the
+            joins it carries
+      """
+      leaf    = trunk.leaves[0]
+      nodes   = " ".join(n.ident for n in leaf.ancestors)
+      members = " ".join(l.ident for l in trunk.leaves)
+      sql     = " AND ".join(l.sql for l in trunk.leaves)
+      (path, _) = self.join_path(trunk)
+      return(f'<g class="leaf trunk" data-leaf="T{id(trunk)}" '
+             f'data-members="{members}" data-nodes="{nodes}" '
+             f'data-sql="{esc(sql)}"><title>{esc(sql)}</title>'
+             f'<path class="hit" d="{path}"/>'
+             f'<path class="ln" d="{path}"/></g>')
+
+   ########################################################################
+
+   def unit_svg(self, layout, unit):
+      """
+      post: returns a bar, with a dot on each line that crosses it
+            rather than ending on it as a stub
+      """
+      y        = band_y(unit.table, unit.side, unit.band)
+      (x0, x1) = layout.unit_span(unit, y)
+      ident    = unit.node.ident if (unit.node is not None) else ""
+      sql      = (     f"{unit.node.kind}: {unit.node.sql}"
+                  if (unit.node is not None) else "")
+      out = [f'<g class="bar" data-node="{ident}" data-sql="{esc(sql)}" '
+             f'style="--c:{BAR_COLOR}">'
+             f'<title>{esc(shorten(sql, 300))}</title>'
+             f'<line x1="{num(x0)}" y1="{num(y)}" x2="{num(x1)}" '
+             f'y2="{num(y)}"/>']
+      for end in unit.ends:
+         if (end.segment.trunk is None):
+            out.append(f'<circle class="member" '
+                       f'cx="{num(layout.member_x(end, y))}" '
+                       f'cy="{num(y)}" r="2.6"/>')
+      out.append("</g>")
+      return("".join(out))
+
+   ########################################################################
+
+   def mark_svg(self, layout, mark):
+      """
+      post: returns an enclosure, built like a bracket on each side: an
+            upright from a little above its top term to a little below
+            its bottom one, with a stub in at each end and at each term
+            between; for AND (and NOT, dash-dot) the upright is
+            straight, for OR each stretch between stubs is bowed out
+            into its own arc, so there is one arc per OR
+      imp: an OR with one alternative at this side draws nothing here;
+           its other alternatives are elsewhere, tied by a dotted link
+      """
+      kids   = sorted(mark.children, key = self.mark_level)
+      ys     = [self.mark_level(child) for child in kids]
+      (l, r) = (mark.left, mark.right)
+      cls    = {"AND": "brk", "OR": "arc", "NOT": "brk not"}[mark.kind]
+      parts  = []
+                               # both run a little past the top and
+                               # bottom terms (past the edge of an
+                               # enclosure), so they enclose them; terms
+                               # between are met at their level
+      step = lambda k: 3 if (isinstance(k, Mark)) else 0
+      ends = (  [self.mark_rows(kids[0])[0] - step(kids[0])]
+              + ys[1:-1]
+              + [self.mark_rows(kids[-1])[1] + step(kids[-1])])
+      if (mark.kind == "OR"):
+         for (ya, yb) in zip(ends, ends[1:]):
+            if (len(ys) < 2):
+               break
+            ry = (yb - ya) / 2
+            parts.append(f"M{num(l + 4)},{num(ya)} "
+                         f"A4,{num(ry)} 0 0 0 {num(l + 4)},{num(yb)} "
+                         f"M{num(r - 4)},{num(ya)} "
+                         f"A4,{num(ry)} 0 0 1 {num(r - 4)},{num(yb)}")
+      else:
+         parts.append(f"M{num(l)},{num(ends[0])} V{num(ends[-1])} "
+                      f"M{num(r)},{num(ends[0])} V{num(ends[-1])}")
+         for y in ends:
+            parts.append(f"M{num(l)},{num(y)} H{num(l + 4)} "
+                         f"M{num(r)},{num(y)} H{num(r - 4)}")
+      if (not parts):
+         return("")
+                               # grey dots join the corners, closing the
+                               # enclosure into a box
+      inset = 4 if (mark.kind == "OR") else 0
+      box   = " ".join(f"M{num(l + inset)},{num(y)} H{num(r - inset)}"
+                       for y in (ends[0], ends[-1]))
+      return(f'<g class="bar mark" data-node="{mark.node.ident}" '
+             f'data-sql="{esc(mark.kind + ": " + mark.node.sql)}" '
+             f'style="--c:{mark.color}">'
+             f'<title>{esc(mark.kind + ": " + shorten(mark.node.sql, 300))}'
+             f'</title><path class="encl" d="{box}"/>'
+             f'<path class="{cls}" d="{" ".join(parts)}"/></g>')
+
+   ########################################################################
+
+   def mark_level(self, element):
+      """
+      post: returns the level a stub or arc meets an element at: a bar
+            or single line's own level, the middle of an enclosure
+      """
+      if (isinstance(element, Unit)):
+         return(band_y(element.table, element.side, element.band))
+      (top, bottom) = self.mark_rows(element)
+      return((top + bottom) / 2)
+
+   ########################################################################
+
+   def mark_rows(self, element):
+      """
+      post: returns (top, bottom) an element is drawn over: a term's
+            level give or take ENCLOSE_PX, an enclosure from its top
+            end to its bottom end
+      """
+      if (isinstance(element, Unit)):
+         y = band_y(element.table, element.side, element.band)
+         return(y - ENCLOSE_PX, y + ENCLOSE_PX)
+      kids  = sorted(element.children, key = self.mark_level)
+      step  = lambda k: 3 if (isinstance(k, Mark)) else 0
+      return(self.mark_rows(kids[0])[0] - step(kids[0]),
+             self.mark_rows(kids[-1])[1] + step(kids[-1]))
+
+   ########################################################################
+
    def node_svg(self, node):
       cls = f"bar {node.kind.lower()}"
       out = [f'<g class="{cls}" data-node="{node.ident}" '
@@ -1980,18 +2724,6 @@ class SvgRenderer:
              f'style="--c:{node.color}">'
              f'<title>{esc(node.kind + ": " + shorten(node.sql, 300))}'
              '</title>']
-      for (table, side, band, _, _, xs) in node.bars:
-         y      = band_y(table, side, band)
-         points = [x + ((y - table.col_bottom) * FILTER_TILT
-                        if (slant) else 0)
-                   for (x, slant) in xs]
-         (x0, x1) = (min(points), max(points))
-         if (x1 - x0 < 14):
-            (x0, x1) = ((x0 + x1) / 2 - 7, (x0 + x1) / 2 + 7)
-         out.append(f'<line x1="{num(x0 - 3)}" y1="{num(y)}" '
-                    f'x2="{num(x1 + 3)}" y2="{num(y)}"/>')
-         for x in points:
-            out.append(f'<circle cx="{num(x)}" cy="{num(y)}" r="3"/>')
       for ((xa, ya), (xb, yb)) in node.links:
          out.append(f'<line class="link" x1="{num(xa)}" y1="{num(ya)}" '
                     f'x2="{num(xb)}" y2="{num(yb)}"/>'
@@ -2078,15 +2810,21 @@ text { font-family: Consolas, "DejaVu Sans Mono", Menlo, monospace;
 .hit { fill: none; stroke: transparent; stroke-width: 9; }
 .end { fill: #4b5563; }
 .op { font-size: 13px; font-weight: bold; fill: #b91c1c; }
+.op.stub { font-size: 11px; stroke-width: 0; }
+.brk, .arc { fill: none; stroke: var(--c); stroke-width: 1.6; }
+.opbg { fill: #fff; }
+.encl { fill: none; stroke: #9ca3af; stroke-width: 1.3;
+        stroke-dasharray: 0.1 4; stroke-linecap: round; }
+.brk.not { stroke-dasharray: 7 2 1.5 2; }
 .flt { font-size: 11px; fill: #374151; }
 .mark { font-size: 10px; font-weight: bold; fill: #b91c1c;
         stroke-width: 3px; }
 .note { font-size: 11px; fill: #6b7280; stroke-width: 0; }
-.bar line { stroke: var(--c); stroke-width: 2.2; }
+.bar line { stroke: var(--c); stroke-width: 1.6; }
 .bar line.link { stroke-width: 2; stroke-dasharray: 0.1 5;
                  stroke-linecap: round; }
-.bar.not line { stroke-dasharray: 7 2 1.5 2; }
 .bar circle { fill: var(--c); }
+.bar circle.member { fill: #fff; stroke: var(--c); stroke-width: 1.4; }
 svg.dim g.leaf:not(.hl), svg.dim g.bar:not(.hl) { opacity: .15; }
 g.leaf.hl .ln { stroke: #111827; stroke-width: 2.4; }
 """
@@ -2108,13 +2846,15 @@ header h1 { font-size: 15px; margin: 0; font-weight: 600; }
 header .tools { margin-left: auto; display: flex; gap: 10px;
                 align-items: center; font-size: 13px; }
 button { font: inherit; padding: 3px 10px; cursor: pointer; }
-#info { position: sticky; top: 44px; z-index: 1; min-height: 18px;
+#info { position: sticky; top: 44px; z-index: 1; min-height: 15px;
         padding: 6px 16px; background: #fffbeb; font: 12px monospace;
         border-bottom: 1px solid #fde68a; white-space: pre-wrap; }
 #canvas { padding: 12px; overflow: auto; }
 details { margin: 0 16px 16px; }
 pre { background: #fff; padding: 10px; border: 1px solid #d1d5db; }
 .legend { font-size: 12px; margin: 8px 16px 0; color: #4b5563; }
+.legend summary { cursor: pointer; }
+.legend ul { margin: 4px 0 0; padding-left: 20px; }
 </style>
 </head>
 <body>
@@ -2126,18 +2866,27 @@ pre { background: #fff; padding: 10px; border: 1px solid #d1d5db; }
     <button id="pngbtn">PNG</button>
   </div>
 </header>
-<div id="info">hover a line or a bar</div>
-<div class="legend">✓ returned column, 1 2 3 ORDER BY position
-  &nbsp;·&nbsp;
-  a bar ties together the lines of one AND group (dash-dot bar =
-  NOT); a dot marks each member line &nbsp;·&nbsp; a dotted line
-  joins the alternatives of a nested OR &nbsp;·&nbsp; at the top
-  level, groups with nothing connecting them are OR'ed
-  alternatives &nbsp;·&nbsp; (+) outer join
-  &nbsp;·&nbsp; boxes: subqueries (indented), CTEs
-  (outdented); a dotted box marks a CTE / inline view that had to
-  be drawn as a virtual table, and purple arrows show which column
-  inside a CTE or inline view feeds each column read through it</div>
+<div id="info"></div>
+<details class="legend"><summary>Legend</summary><ul>
+<li>&#10003; returned column; 1 2 3 its position in the ORDER BY</li>
+<li>things on one horizontal bar are AND'ed; separate bars are
+  OR'ed</li>
+<li>a column joins its bar by a short stub, and one connector runs
+  from a bar to each other table; an open circle marks a line that
+  meets or crosses a bar instead of ending on it as a stub</li>
+<li>operators sit on the line next to the column: "=" at both ends,
+  others at the left hand side's end; (+) marks an outer join</li>
+<li>an arrow from a value points at the column it is compared
+  to</li>
+<li>where parentheses nest, [ ] encloses what is AND'ed, ( ) what
+  is OR'ed (one arc per OR), dash-dot [ ] a NOT</li>
+<li>a coloured dotted line joins OR'ed alternatives that never meet
+  at one table</li>
+<li>boxes: subqueries (indented), CTEs (outdented); a dotted box
+  marks a CTE / inline view drawn as a virtual table, and purple
+  arrows show which column inside it feeds each column read through
+  it</li>
+</ul></details>
 <div id="canvas">@@SVG@@</div>
 <details><summary>SQL source</summary><pre>@@SQL@@</pre></details>
 <script>
@@ -2148,7 +2897,7 @@ pre { background: #fff; padding: 10px; border: 1px solid #d1d5db; }
   function clear() {
     svg.classList.remove("dim");
     svg.querySelectorAll(".hl").forEach(e => e.classList.remove("hl"));
-    info.textContent = "hover a line or a bar";
+    info.textContent = "";
   }
   svg.querySelectorAll("g.leaf").forEach(g => {
     g.addEventListener("mouseenter", () => {
@@ -2157,6 +2906,14 @@ pre { background: #fff; padding: 10px; border: 1px solid #d1d5db; }
       g.dataset.nodes.split(" ").filter(Boolean).forEach(n =>
         svg.querySelectorAll('g.bar[data-node="' + n + '"]')
            .forEach(b => b.classList.add("hl")));
+      const id = g.dataset.leaf;
+      svg.querySelectorAll("g.trunk").forEach(b => {
+        if ((b.dataset.members || "").split(" ").includes(id))
+          b.classList.add("hl");
+      });
+      (g.dataset.members || "").split(" ").filter(Boolean).forEach(m =>
+        svg.querySelectorAll('g.leaf[data-leaf="' + m + '"]')
+           .forEach(l => l.classList.add("hl")));
       info.textContent = g.dataset.sql;
     });
     g.addEventListener("mouseleave", clear);
