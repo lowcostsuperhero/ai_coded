@@ -1,0 +1,11 @@
+# name: $Id: .gitattributes 1.main-1 12:55:59 26-Nov-2026 claude-opus-5-5 $
+# use: fixes line endings whatever core.autocrlf says: files are
+#      stored with LF; checked out as LF, except Windows batch files,
+#      which cmd.exe wants as CRLF
+
+*                text=auto eol=lf
+*.bat            text eol=crlf
+*.cmd            text eol=crlf
+*.btm            text eol=crlf
+*.png            binary
+*.ods            binary
