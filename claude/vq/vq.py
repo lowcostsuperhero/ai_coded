@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id: vq.py 3.main-3 21:47:24 24-Nov-2026 claude-opus-5-5 $
+# name: $Id: vq.py 4.main-4 01:37:08 26-Nov-2026 claude-opus-5-5 $
 # use: draws the structure of an Oracle SQL query (tables, referenced
 #      columns, returned columns, join and filter predicates, and the
 #      AND/OR grouping of those predicates) as an interactive HTML page
@@ -35,7 +35,7 @@ except ImportError:
          " (pip install sqlglot)", file = sys.stderr)
    sys.exit(E_FAIL)
 
-REVISION     = "$Revision: 3.main-3 $"
+REVISION     = "$Revision: 4.main-4 $"
 FORMATS      = ("html",)
 
 CHAR_PX      = 7.9
@@ -135,6 +135,11 @@ FLIP         = {">" : "<" ,
                                # not columns of any table
 PSEUDO       = {"ROWNUM", "LEVEL", "SYSDATE", "SYSTIMESTAMP", "USER",
                 "UID", "CONNECT_BY_ISLEAF", "CONNECT_BY_ISCYCLE"}
+
+                               # the ones that describe a row: drawn
+                               # as a virtual column, in italics
+ROW_PSEUDO   = {"ROWNUM", "LEVEL", "CONNECT_BY_ISLEAF",
+                "CONNECT_BY_ISCYCLE"}
 
                                # sqlglot renamed Union's base class at
                                # some point; accept either spelling
@@ -503,7 +508,72 @@ class Diagram:
 ###########################################################################
 
 def to_sql(expression):
-   return(expression.sql(dialect = "oracle"))
+   """
+   post: returns expression as oracle sql, with any sql*plus
+         substitution variable (see sqlplus_text) spelled as written
+   """
+   return(re.sub(r":VQAMP([12])_(\w+)",
+                 lambda m: "&" * int(m.group(1)) + m.group(2),
+                 expression.sql(dialect = "oracle")))
+
+###########################################################################
+
+                               # sql*plus commands that may sit in a
+                               # script around the queries, matched on
+                               # their shortest abbreviation
+SQLPLUS_COMMANDS = re.compile(
+   r"(?i)^\s*(@|!|\$|"
+   r"(acc(e(p(t)?)?)?|archive|attr(i(b(u(t(e)?)?)?)?)?"
+   r"|bre(a(k)?)?|bti(t(l(e)?)?)?|cl(e(a(r)?)?)?"
+   r"|col(u(m(n)?)?)?|comp(u(t(e)?)?)?|conn(e(c(t)?)?)?|copy"
+   r"|def(i(n(e)?)?)?|desc(r(i(b(e)?)?)?)?|disc(o(n(n(e(c(t)?)?)?)?)?)?"
+   r"|exec(u(t(e)?)?)?|exit|ho(s(t)?)?"
+   r"|passw(o(r(d)?)?)?|pau(s(e)?)?|pri(n(t)?)?"
+   r"|pro(m(p(t)?)?)?|quit|rem(a(r(k)?)?)?|repf(o(o(t(e(r)?)?)?)?)?"
+   r"|reph(e(a(d(e(r)?)?)?)?)?|set|sho(w)?"
+   r"|spo(o(l)?)?|sta(r(t)?)?|store|timi(n(g)?)?"
+   r"|tti(t(l(e)?)?)?|undef(i(n(e)?)?)?|var(i(a(b(l(e)?)?)?)?)?"
+   r"|whenever)\b)")
+
+###########################################################################
+
+def sqlplus_text(text):
+   """
+   use: makes a sql*plus script parseable: its commands (define, set,
+        prompt, @file, ...) become blank lines, so line numbers in
+        errors still match the file, and each &name or &&name
+        substitution variable becomes a bind placeholder that to_sql
+        spells back as written
+   imp: a command is only looked for between statements, where
+        sql*plus looks for it, so a line of sql that starts like one
+        (set, col, ...) is left alone; a substitution variable's "."
+        terminator is dropped; SET DEFINE OFF stops substitution from
+        there on
+   """
+   lines  = []
+   define = True
+   inside = False
+   for line in text.split("\n"):
+      code = re.sub(r"--.*$", "", line).strip()
+      if (inside):
+                               # a statement ends with ; or a lone /
+         inside = not (code.endswith(";") or code == "/")
+      elif (code and code != "/" and not SQLPLUS_COMMANDS.match(line)):
+         inside = not code.endswith(";")
+      elif (code and code != "/"):
+         words = line.split()
+         if (    len(words) >= 3
+             and words[0].lower() == "set"
+             and words[1].lower().startswith("def")):
+            define = words[2].lower() not in ("off", "")
+         lines.append("")
+         continue
+      if (define):
+         line = re.sub(r"(&&?)(\w+)\.?",
+                       lambda m: f":VQAMP{len(m.group(1))}_{m.group(2)}",
+                       line)
+      lines.append(line)
+   return("\n".join(lines))
 
 ###########################################################################
 
@@ -618,11 +688,13 @@ class QueryModel:
       self.counter  = 0
                                # sql*plus terminators on their own line
                                # are not sql
-      text = re.sub(r"(?m)^\s*/\s*$", ";", sql_text)
+      text = re.sub(r"(?m)^\s*/\s*$", ";", sqlplus_text(sql_text))
       try:
          parsed = sqlglot.parse(text, read = "oracle")
       except ParseError as error:
-         raise(VqError(f"cannot parse sql: {error}"))
+                               # without the terminal's underline
+         detail = re.sub(r"\x1b\[[0-9;]*m", "", str(error))
+         raise(VqError(f"cannot parse sql: {detail}"))
       for statement in parsed:
          if (statement is not None and isinstance(statement, exp.Query)):
             self.diagrams.append(self.build_statement(statement))
@@ -1379,15 +1451,18 @@ class QueryModel:
       leaf   = Leaf(prefix + to_sql(expression))
       if (isinstance(expression, exp.Between)):
          (low, high) = (expression.args["low"], expression.args["high"])
-         if ((own_columns(expression.this)) and
+         pseudo = self.row_end(scope, expression.this)
+         if (((own_columns(expression.this)) or pseudo) and
              (not own_columns(low)) and (not own_columns(high))):
                                # bounds are values: one arrow labelled
                                # with the whole range
             label = shorten(f"{prefix}BETWEEN {to_sql(low)}"
                             f" AND {to_sql(high)}")
-            for column in own_columns(expression.this):
-               leaf.segments.append(
-                  Segment(self.endpoint(scope, column), None, label))
+            ends  = ([pseudo] if (pseudo) else
+                     [self.endpoint(scope, c)
+                      for c in own_columns(expression.this)])
+            for end in ends:
+               leaf.segments.append(Segment(end, None, label))
             return(leaf)
                                # a bound that is a column joins: one
                                # line per bound
@@ -1426,6 +1501,9 @@ class QueryModel:
             single column subquery side links to the column it
             returns inside its box
       """
+      pseudo = self.row_end(scope, side)
+      if (pseudo is not None):
+         return([pseudo])
       aggregate = (     strip_paren(side)
                    if (not isinstance(side, list))
                    else None)
@@ -1451,6 +1529,27 @@ class QueryModel:
 
    ########################################################################
 
+   def row_end(self, scope, side):
+      """
+      post: returns, when side is a pseudo column describing a row
+            (ROWNUM, LEVEL), an endpoint on a virtual column for it on
+            the first table in FROM, else None
+      """
+      value = None if (isinstance(side, list)) else strip_paren(side)
+      if (   not isinstance(value, exp.Column)
+          or value.table
+          or value.name.upper() not in ROW_PSEUDO
+          or not scope.placed):
+         return(None)
+      table  = scope.placed[0][0]
+      name   = value.name.upper()
+      meta   = getattr(value.this, "meta", None) or {}
+      column = table.column(name, name, meta.get("start"))
+      column.virtual = True
+      return(Endpoint(table, column))
+
+   ########################################################################
+
    def projection_ends(self, scope, projection):
       """
       post: as value_ends, for a select list entry; one that is a bare
@@ -1461,6 +1560,9 @@ class QueryModel:
                 if (isinstance(projection, exp.Alias))
                 else projection)
       value  = strip_paren(target)
+      pseudo = self.row_end(scope, value)
+      if (pseudo is not None):
+         return([pseudo])
       if (isinstance(value, exp.Neg)):
          value = value.this
       if (not isinstance(value, exp.Literal) or not scope.placed):
@@ -4542,7 +4644,10 @@ class MAIN:
       try:
          model = QueryModel(sql_text)
       except VqError as error:
-         raise(VqError(error.message.lower(), self.self))
+                               # only its first letter lowered: the
+                               # sql it quotes keeps its case
+         message = error.message
+         raise(VqError(message[:1].lower() + message[1:], self.self))
       if (connection):
          try:
             missing = mark_indexes(model, connection, schema)

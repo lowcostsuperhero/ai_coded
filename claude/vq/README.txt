@@ -74,6 +74,13 @@ view is shown with "(view)" after its alias, as "NAME alias (view)".
 A file may hold several statements, separated by ";" or by a "/" on
 its own line (SQL*Plus style); each gets its own diagram on the page.
 
+The file may be a SQL*Plus script. SQL*Plus commands between the
+statements (DEFINE, SET, COLUMN, PROMPT, SPOOL, @file, ...) are
+skipped. Substitution variables are shown as written, so
+"ROWNUM <= &&ROW_NUM" stays that way rather than taking the DEFINE'd
+value; a variable's "." terminator is dropped, and SET DEFINE OFF
+turns substitution off from there on.
+
 Options
 -------
    -oOutput     output file (default: the .sql file's name, or the
@@ -102,6 +109,11 @@ in the order they first appear in the SQL text.
    'CURRENT'    in italics: a select list entry that is a bare value
                 (a string or number), shown quotes and all as a column
                 of the first table in FROM, checked when returned
+   ROWNUM       in italics: a pseudo column that describes a row
+                (ROWNUM, LEVEL, CONNECT_BY_ISLEAF, CONNECT_BY_ISCYCLE),
+                shown as a column of the first table in FROM; a
+                condition on it gets a value arrow like any column's,
+                e.g. "<= &&ROW_NUM"
    JOB          in italics, no ✓: a GROUP BY column that is not in the
                 select list, so not in the rows returned
    1 2 3        position of the column in the ORDER BY list (before
@@ -263,7 +275,7 @@ Every query block is drawn in the same diagram:
 Each table appears once: a reference to a CTE or an inline view is
 folded into its query, and lines go straight to the real columns
 inside its box. A column made from an expression is drawn to every
-column in it; one made from no column at all (rownum, a literal) has
+column in it; one made from no column at all (SYSDATE, say) has
 nowhere to go, and a condition on it is listed under "not drawn".
 
 A CTE read more than once is the exception: folding both references
