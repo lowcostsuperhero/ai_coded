@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id: stock_tracker.py 2.main-2 18:28:03 23-Nov-2026 claude-opus-5-5 $
+# name: $Id: stock_tracker.py 3.main-3 16:27:45 26-Nov-2026 claude-opus-5-5 $
 # use: local INTRADAY stock tracker with a live chart window in the style
 #      of stock_ticker.py. It polls 5-minute bars
 #      for the stocks on its own watchlist (plus any open positions),
@@ -9,9 +9,11 @@
 #              for the day (a "breakout");
 #         SELL when a held stock reaches its volatility-based profit
 #              target, hits its trailing stop, turns down, or plateaus.
+#      It keeps a log of the buys and sells you record (shares, price,
+#      time; correctable later) and reports profit and loss on them.
 #      Everything is computed on this machine. The only network traffic
 #      is the download of PUBLIC prices from Yahoo Finance through the
-#      yfinance package (ticker symbols only). The watchlist, positions,
+#      yfinance package (ticker symbols only). The watchlist, trade log,
 #      settings and price cache live in ~/.stock_tracker.
 # usage: stock_tracker.py [-c] [-f] [-r seconds] [-p span] [-t] [-s] [-d]
 #                         [TICKER ...]
@@ -64,7 +66,7 @@ E_WARN     = 1
 E_FAIL     = 2
 E_USAGE    = 3
 
-REVISION   = "$Revision: 2.main-2 $"
+REVISION   = "$Revision: 3.main-3 $"
 SELF       = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 SELFPREFIX = os.path.dirname(os.path.abspath(sys.argv[0]))
 
@@ -163,12 +165,24 @@ HELP = dict(
              "target and stop,\n                          then sells for "
              "held positions ('recommendation(s)'\n"
              "                          and 'scan' work too)",
-   track="track [N]            record the BUY signals as open positions",
-   buy="buy TICKER [price] [shares]   record a position you opened",
-   sell="sell TICKER [price]  close a recorded position",
+   track="track [N]            record the BUY signals as open positions "
+         "(1 share each)",
+   buy="buy TICKER [price] [shares]   record a buy (price defaults to the "
+       "current\n                          price, shares to 1)",
+   sell="sell TICKER [price] [shares|all]   record a sale (defaults: the "
+        "current\n                          price, 1 share; the earliest "
+        "shares bought are\n                          sold first)",
    positions="positions            positions held at the as-of time (from "
-             "your real ledger\n                          by buy/sell time) "
-             "and SELL/HOLD; 'position' works too",
+             "your real ledger\n                          by buy/sell time), "
+             "SELL/HOLD, shares sold and profit\n                          "
+             "and loss; 'position' works too",
+   pnl="pnl                  profit and loss per stock: unrealized on the "
+       "shares\n                          held, realized on the shares "
+       "sold ('profit' works too)",
+   trades="trades               every buy and sell recorded, with its #",
+   edittrade="edittrade # [shares=N] [price=P] [time=YYYY-MM-DD HH:MM]\n"
+             "                          correct a trade after the fact",
+   deltrade="deltrade #           remove a trade recorded by mistake",
    realpositions="realpositions        the real ledger's open positions and "
                  "SELL/HOLD on the\n                          latest bar "
                  "(ignores asof)",
@@ -199,7 +213,8 @@ HELP = dict(
    quit="quit")
 
 HELP_ORDER = ("asof", "nextbar", "nextday", "recommend", "track", "buy",
-              "sell", "positions", "realpositions", "savepositions",
+              "sell", "positions", "pnl", "trades", "edittrade",
+              "deltrade", "realpositions", "savepositions",
               "compare", "range", "follow", "monitor", "simulate", "watch",
               "unwatch", "watchlist", "refresh", "set", "status", "quit")
 
@@ -304,6 +319,14 @@ def f2(x):
    if (x is None or not np.isfinite(x)):
       return("n/a")
    return("%.2f" % x)
+
+###########################################################################
+def unique(items):
+   """
+   name: unique
+   use: the items without repeats, in the order they first appear
+   """
+   return(list(dict.fromkeys(items)))
 
 ###########################################################################
 def wrap(text, indent = 8):
@@ -936,6 +959,171 @@ def random_base(df, h):
 
 ###########################################################################
 ###
+### t r a d e s ,    p o s i t i o n s    a n d    p r o f i t
+###
+###########################################################################
+
+def parse_time(text):
+   """
+   name: parse_time
+   use: a trade time typed as YYYY-MM-DD HH:MM (or with a T between)
+   post: returns it as YYYY-MM-DDTHH:MM, the form kept in the ledger;
+         raises ValueError when it is not a valid date and time
+   """
+   ts = pd.Timestamp(text.strip().replace("T", " "))
+   return(ts.strftime("%Y-%m-%dT%H:%M"))
+
+###########################################################################
+def trade_order(x):
+   """
+   name: trade_order
+   use: sort key of a trade: time, buys before sells in the same minute,
+        then the order they were recorded
+   """
+   return((x["time"], 0 if (x["side"] == "buy") else 1, x["id"]))
+
+###########################################################################
+def book(trades):
+   """
+   name: book
+   use: matches every sell against the earliest shares still held of
+        that stock (first in, first out, as brokers do by default)
+   usage: trades is a list of dict(id, ticker, side "buy" or "sell",
+          time, shares, price[, atr, high, practice])
+   post: returns (lots, closed, problems):
+         lots     shares still held, one dict per buy in the order
+                  bought: id (of the buy), ticker, entry_time,
+                  entry_price, shares (left), atr, high, practice and
+                  trade (the buy record itself)
+         closed   one dict per piece of a buy matched to a sell: ticker,
+                  buy, sell (ids), shares, entry_time, entry_price,
+                  exit_time, exit_price, pnl
+         problems sentences about sells of more shares than were held
+   """
+   bought, lots, closed, problems = {}, [], [], []
+   for x in sorted(trades, key = trade_order):
+      t = x["ticker"]
+      if (x["side"] == "buy"):
+         lot = dict(id          = x["id"],
+                    ticker      = t,
+                    entry_time  = x["time"],
+                    entry_price = x["price"],
+                    shares      = x["shares"],
+                    atr         = x.get("atr"),
+                    high        = x.get("high"),
+                    practice    = bool(x.get("practice")),
+                    trade       = x)
+         bought.setdefault(t, []).append(lot)
+         lots.append(lot)
+         continue
+      left = x["shares"]
+      for lot in bought.get(t, []):
+         if (left <= 1e-9):
+            break
+         n = min(left, lot["shares"])
+         if (n <= 1e-9):
+            continue
+         lot["shares"] -= n
+         left          -= n
+         closed.append(dict(ticker      = t,
+                            buy         = lot["id"],
+                            sell        = x["id"],
+                            shares      = n,
+                            entry_time  = lot["entry_time"],
+                            entry_price = lot["entry_price"],
+                            exit_time   = x["time"],
+                            exit_price  = x["price"],
+                            pnl         = n * (x["price"] -
+                                               lot["entry_price"])))
+      if (left > 1e-9):
+         problems.append("sale #%d (%s) sells %g more %s share%s than "
+                         "were held then" % (x["id"], x["time"].replace(
+                            "T", " "), left, t, "" if (left == 1) else
+                            "s"))
+   return([lot for lot in lots if (lot["shares"] > 1e-9)], closed,
+          problems)
+
+###########################################################################
+def profit(lots, closed, prices):
+   """
+   name: profit
+   use: profit and loss per stock and in total
+   usage: prices maps a ticker to its current price (missing = unknown)
+   post: returns (rows, total); one row per stock ever traded, in the
+         order first bought: dict(ticker, shares, cost (average price
+         paid for the shares held), price, value, unreal, unreal_pct,
+         real, total); total has the same money fields summed. unreal
+         is None when a held stock has no price
+   """
+   order = unique([x["ticker"] for x in closed] +
+                  [x["ticker"] for x in lots])
+   order = sorted(order, key = lambda t: min(
+      [x["entry_time"] for x in lots + closed if (x["ticker"] == t)]))
+   rows = []
+   tot  = dict(value = 0.0, paid = 0.0, unreal = 0.0, real = 0.0,
+               known = True)
+   for t in order:
+      mine  = [x for x in lots if (x["ticker"] == t)]
+      sh    = sum(x["shares"] for x in mine)
+      paid  = sum(x["shares"] * x["entry_price"] for x in mine)
+      real  = sum(x["pnl"] for x in closed if (x["ticker"] == t))
+      px    = prices.get(t)
+      known = (px is not None and np.isfinite(px))
+      row   = dict(ticker = t, shares = sh, price = px if (known)
+                   else None, cost = paid / sh if (sh) else None,
+                   value = None, unreal = None, unreal_pct = None,
+                   real = real, total = None)
+      if (sh == 0):
+         row.update(value = 0.0, unreal = 0.0, total = real)
+      elif (known):
+         row.update(value = sh * px, unreal = sh * px - paid,
+                    unreal_pct = px * sh / paid - 1, total = real +
+                    sh * px - paid)
+         tot["value"] += sh * px
+         tot["paid"]  += paid
+         tot["unreal"] += sh * px - paid
+      else:
+         tot["known"] = False
+      tot["real"] += real
+      rows.append(row)
+   tot["total"] = tot["real"] + tot["unreal"]
+   return(rows, tot)
+
+###########################################################################
+def load_ledger(path):
+   """
+   name: load_ledger
+   use: reads the trade log
+   post: returns the list of trades; a ledger written by an older
+         version (a list of positions, each sold one carrying exit_time
+         and exit_price) is converted to trades, and the old file is
+         kept once as <ledger>.v1
+   imp: old positions recorded without a share count are taken as 1
+        share
+   """
+   data = load_json(path, dict(version = 2, trades = []))
+   if (isinstance(data, dict)):
+      return(data.get("trades", []))
+   trades = []
+   nid = max([q.get("id", 0) for q in data] + [0])
+   for q in data:
+      sh = float(q.get("shares") or 1.0)
+      trades.append(dict(id = q["id"], ticker = q["ticker"], side = "buy",
+                         time = q["entry_time"], shares = sh,
+                         price = q["entry_price"], atr = q.get("atr"),
+                         high = q.get("high")))
+      if (q.get("exit_time")):
+         nid += 1
+         trades.append(dict(id = nid, ticker = q["ticker"], side = "sell",
+                            time = q["exit_time"], shares = sh,
+                            price = q["exit_price"]))
+   if (data and not os.path.exists(path + ".v1")):
+      os.replace(path, path + ".v1")
+      dump_json(path, dict(version = 2, trades = trades))
+   return(trades)
+
+###########################################################################
+###
 ### t h e    t r a c k e r
 ###
 ###########################################################################
@@ -945,9 +1133,11 @@ class Tracker(object):
    name: Tracker
    use: the watchlist, positions, settings and prices, and the signals
         evaluated on them at the latest bar or at an as-of (pretend) time
-   imp: as in stock_picker, buys and sells made while an as-of time is
-        active are practice trades; they live only in this session until
-        'savepositions' writes them into the real ledger
+   imp: the ledger is a log of trades (buys and sells with shares and
+        price); what is held, and the profit or loss, is worked out from
+        it (see book). as in stock_picker, buys and sells made while an
+        as-of time is active are practice trades; they live only in this
+        session until 'savepositions' writes them into the real ledger
    """
 
    def __init__(self, synthetic, verbose):
@@ -962,10 +1152,9 @@ class Tracker(object):
       self.daily        = {}
       self.dtime        = 0.0
       self.synced       = 0.0
-      self.ledger       = load_json(LEDGER, [])
+      self.trades       = load_ledger(LEDGER)
       self.asof         = None
       self.pretend      = []
-      self.pretend_exit = {}
       if (synthetic and not os.path.exists(WATCH)):
          self.save_watch(SYNTH)
       if (not synthetic):
@@ -1071,32 +1260,49 @@ class Tracker(object):
    def save_ledger(self):
       """
       name: save_ledger
-      use: writes the positions file
+      use: writes the trade log
       """
-      dump_json(LEDGER, self.ledger)
+      dump_json(LEDGER, dict(version = 2, trades = self.trades))
 
    ########################################################################
-   def held(self, ticker = None):
+   def books(self, upto = True, practice = True):
+      """
+      name: books
+      use: book() over the trades
+      usage: upto True = only trades made by now() (the as-of time);
+             practice False = the real ledger only
+      post: returns (lots, closed, problems)
+      """
+      ts = self.stamp()
+      xs = self.trades + (self.pretend if (practice) else [])
+      return(book([x for x in xs if (not upto or x["time"] <= ts)]))
+
+   ########################################################################
+   def held(self, ticker = None, practice = True):
       """
       name: held
-      use: positions held at now(): real ledger entries bought at or
-           before it and not yet sold by then, plus practice buys, minus
-           practice sales
+      use: the lots held at now(): shares bought by then and not yet sold
+           by then, practice trades included unless practice is False
       post: moving 'asof' therefore shows what was held at that time
       """
-      ts  = self.stamp()
-      out = []
-      for q in self.ledger:
-         if (q["entry_time"] > ts):
-            continue
-         if (q.get("exit_time") and q["exit_time"] <= ts):
-            continue
-         x = self.pretend_exit.get(q["id"])
-         if (x and x[0] <= ts):
-            continue
-         out.append(q)
-      out += [q for q in self.pretend if (q["entry_time"] <= ts)]
-      return([q for q in out if (ticker is None or q["ticker"] == ticker)])
+      lots = self.books(practice = practice)[0]
+      return([q for q in lots if (ticker is None or q["ticker"] == ticker)])
+
+   ########################################################################
+   def closed(self):
+      """
+      name: closed
+      use: the shares sold by now(), each matched to its buy (see book)
+      """
+      return(self.books()[1])
+
+   ########################################################################
+   def shares(self, ticker):
+      """
+      name: shares
+      use: how many shares of ticker are held at now()
+      """
+      return(sum(q["shares"] for q in self.held(ticker)))
 
    ########################################################################
    def practice(self):
@@ -1104,60 +1310,142 @@ class Tracker(object):
       name: practice
       use: predicate; are there unsaved practice trades
       """
-      return(bool(self.pretend or self.pretend_exit))
+      return(bool(self.pretend))
 
    ########################################################################
    def tickers(self):
       """
       name: tickers
-      use: every ticker followed: the watchlist plus positions held now
-           or at the as-of time
+      use: every ticker followed: the watchlist plus every stock held
+      post: in watchlist order (the order given on the command line),
+            then held stocks not on it in the order they were bought;
+            NOT sorted alphabetically
       """
-      return(sorted(set(self.watch()) |
-                    set(q["ticker"] for q in self.ledger
-                        if (not q.get("exit_time"))) |
-                    set(q["ticker"] for q in self.pretend)))
+      lots = book(self.trades + self.pretend)[0]
+      return(unique(self.watch() + [q["ticker"] for q in lots]))
 
    ########################################################################
-   def make_pos(self, t, px, atr, shares = 0.0):
+   def trade(self, tid):
       """
-      name: make_pos
-      use: a new position bought at now()
+      name: trade
+      use: the trade with id tid (real or practice), or None
       """
-      ids = [q.get("id", 0) for q in self.ledger + self.pretend]
-      ok  = (atr is not None and np.isfinite(atr))
-      return(dict(id = max(ids + [0]) + 1, ticker = t,
-                  entry_time = self.stamp(), entry_price = float(px),
-                  shares = float(shares), atr = float(atr) if (ok)
-                  else None, high = float(px)))
+      for x in self.trades + self.pretend:
+         if (x["id"] == tid):
+            return(x)
+      return(None)
 
    ########################################################################
-   def add_pos(self, q):
+   def check(self, trades):
       """
-      name: add_pos
-      use: records a buy: into the real ledger at the latest bar,
-           otherwise as a practice trade
+      name: check
+      use: refuses a trade log in which a sale sells shares not held
+      post: raises ExceptionClass with the reasons
       """
+      problems = book(trades)[2]
+      if (problems):
+         raise(ExceptionClass("; ".join(problems)))
+
+   ########################################################################
+   def record(self, side, t, shares, price, when = None, atr = None):
+      """
+      name: record
+      use: records a buy or a sell: into the real ledger at the latest
+           bar, otherwise as a practice trade
+      usage: when is the trade time (YYYY-MM-DD HH:MM), default now();
+             atr is the stock's daily ATR, kept with a buy for its stop
+             and target
+      post: returns the trade; raises ExceptionClass when the values are
+            not valid or a sale is for more shares than were held
+      """
+      if (not (shares > 0)):
+         raise(ExceptionClass("the number of shares must be more than 0"))
+      if (not (price > 0)):
+         raise(ExceptionClass("the price must be more than 0"))
+      ids = [x["id"] for x in self.trades + self.pretend]
+      x = dict(id = max(ids + [0]) + 1, ticker = t.upper(), side = side,
+               time = parse_time(when) if (when) else self.stamp(),
+               shares = float(shares), price = float(price))
+      if (side == "buy"):
+         ok = (atr is not None and np.isfinite(atr))
+         x.update(atr = float(atr) if (ok) else None, high = float(price))
+      if (self.asof is not None):
+         x["practice"] = True
+      self.check(self.trades + self.pretend + [x])
       if (self.asof is None):
-         self.ledger.append(q)
+         self.trades.append(x)
          self.save_ledger()
       else:
-         self.pretend.append(q)
+         self.pretend.append(x)
+      return(x)
 
    ########################################################################
-   def close_pos(self, q, px):
+   def edit(self, tid, shares = None, price = None, when = None):
       """
-      name: close_pos
-      use: records the sale of position q at price px at now()
+      name: edit
+      use: corrects the shares, price or time of a trade after the fact
+      post: returns the trade; raises ExceptionClass when the values are
+            not valid or the change would leave a sale of shares that
+            were not held
+      imp: a corrected buy price resets the highest price since the buy
+           that the trailing stop is measured from
       """
-      if (any(q is x for x in self.pretend)):
-         self.pretend = [x for x in self.pretend if (x is not q)]
-      elif (self.asof is None):
-         q["exit_time"]  = self.stamp()
-         q["exit_price"] = float(px)
+      x = self.trade(tid)
+      if (x is None):
+         raise(ExceptionClass("there is no trade #%s" % tid))
+      new = dict(x)
+      if (shares is not None):
+         if (not (shares > 0)):
+            raise(ExceptionClass("the number of shares must be more "
+                                 "than 0"))
+         new["shares"] = float(shares)
+      if (price is not None):
+         if (not (price > 0)):
+            raise(ExceptionClass("the price must be more than 0"))
+         new["price"] = float(price)
+         if (new["side"] == "buy"):
+            new["high"] = float(price)
+      if (when):
+         new["time"] = parse_time(when)
+      self.check([new if (y is x) else y
+                  for y in self.trades + self.pretend])
+      x.update(new)
+      if (not x.get("practice")):
          self.save_ledger()
+      return(x)
+
+   ########################################################################
+   def delete(self, tid):
+      """
+      name: delete
+      use: removes a trade recorded by mistake
+      post: raises ExceptionClass when there is no such trade or a sale
+            would be left selling shares that were not held
+      """
+      x = self.trade(tid)
+      if (x is None):
+         raise(ExceptionClass("there is no trade #%s" % tid))
+      self.check([y for y in self.trades + self.pretend if (y is not x)])
+      if (x.get("practice")):
+         self.pretend = [y for y in self.pretend if (y is not x)]
       else:
-         self.pretend_exit[q["id"]] = (self.stamp(), float(px))
+         self.trades = [y for y in self.trades if (y is not x)]
+         self.save_ledger()
+
+   ########################################################################
+   def save_practice(self):
+      """
+      name: save_practice
+      use: writes the practice trades into the real ledger
+      post: returns how many were saved
+      """
+      n = len(self.pretend)
+      for x in self.pretend:
+         x.pop("practice", None)
+         self.trades.append(x)
+      self.pretend = []
+      self.save_ledger()
+      return(n)
 
    ########################################################################
    def sync(self, tickers = None, force = False):
@@ -1228,8 +1516,7 @@ class Tracker(object):
             raised to the latest peak; at an as-of time the stored high
             is ignored (it may come from that time's future)
       """
-      real  = (self.asof is None and
-               not any(q is x for x in self.pretend))
+      real  = (self.asof is None and not q.get("practice"))
       et    = pd.Timestamp(q["entry_time"])
       after = df[df.index + pd.Timedelta(minutes = BAR_MIN) > et]
       highs = after["High"].values
@@ -1249,7 +1536,10 @@ class Tracker(object):
       if (atr is None or not np.isfinite(atr)):
          atr = r["atr"]
       if (real and peak > (q.get("high") or 0.0)):
+                                # kept on the buy itself, so a restart
+                                # remembers it
          q["high"] = float(peak)
+         q["trade"]["high"] = float(peak)
          self.save_ledger()
       return(dict(entry = q["entry_price"], atr = atr, high = high,
                   peak = peak, hiage = hiage, held = held))
@@ -1529,14 +1819,15 @@ class Shell(cmd.Cmd):
    ########################################################################
    def do_unwatch(self, arg):
       tr = self.tr
-      ts = set(self.args(arg))
+      ts = unique(self.args(arg))
       w = tr.watch()
-      if (not ts & set(w)):
-         print("Not on the watchlist: %s" % " ".join(sorted(ts)))
+      gone = [t for t in ts if (t in w)]
+      if (not gone):
+         print("Not on the watchlist: %s" % " ".join(ts))
          return
-      tr.save_watch([t for t in w if (t not in ts)])
+      tr.save_watch([t for t in w if (t not in gone)])
       print("Removed %s. (A stock you hold is still followed until it is "
-            "sold.)" % " ".join(sorted(ts & set(w))))
+            "sold.)" % " ".join(gone))
 
    ########################################################################
    def do_watchlist(self, arg):
@@ -1663,9 +1954,9 @@ class Shell(cmd.Cmd):
    def show_positions(self, led = None, title = None):
       """
       name: show_positions
-      use: SELL / HOLD lines for positions at now()
-      usage: by default the positions held at now() (see Tracker.held);
-             'realpositions' passes the real ledger, with its own title
+      use: SELL / HOLD lines for the lots held at now()
+      usage: by default the lots held at now() (see Tracker.held);
+             'realpositions' passes the real ledger's, with its own title
       """
       tr = self.tr
       if (led is None):
@@ -1676,19 +1967,18 @@ class Shell(cmd.Cmd):
                                "advice"))
       for q in led:
          jp = tr.judge_pos(q)
+         bought = "%g sh bought %s @ %.2f" % (
+            q["shares"], q["entry_time"].replace("T", " "),
+            q["entry_price"])
          if (jp is None):
-            print("HOLD  %-6s in %s @ %.2f: no price data loaded" % (
-               q["ticker"], q["entry_time"].replace("T", " "),
-               q["entry_price"]))
+            print("HOLD  %-6s %s: no price data loaded" % (q["ticker"],
+                                                         bought))
             continue
          px, st = jp["r"]["Close"], jp["st"]
          g = px / q["entry_price"] - 1
-         sh = q.get("shares") or 0
-         line = "%-5s %-6s in %s @ %.2f now %.2f (%s%s): %s" % (
-            jp["act"], q["ticker"], q["entry_time"].replace("T", " "),
-            q["entry_price"], px, pctd(g, q["entry_price"]),
-            ", %s on %g sh" % (usd(g * q["entry_price"] * sh), sh)
-            if (sh) else "", jp["why"])
+         line = "%-5s %-6s %s, now %.2f (%s a share, %s): %s" % (
+            jp["act"], q["ticker"], bought, px, pctd(g, q["entry_price"]),
+            usd(g * q["entry_price"] * q["shares"]), jp["why"])
          print(textwrap.fill(line, 78, subsequent_indent = " " * 6))
          stop = trail_stop(st["high"], st["atr"], tr.cfg)
          tg = target_px(q["entry_price"], st["atr"], tr.cfg)
@@ -1697,40 +1987,183 @@ class Shell(cmd.Cmd):
                               "off", f2(tg) if (tg > 0) else "off"))
 
    ########################################################################
+   def prices(self, tickers):
+      """
+      name: prices
+      use: the price of each ticker at now() (the last completed bar's
+           close)
+      post: returns {ticker: price}; a ticker without data is left out
+      """
+      out = {}
+      for t in tickers:
+         df = self.tr.frame(t)
+         if (df is not None):
+            out[t] = float(df["Close"].iloc[-1])
+      return(out)
+
+   ########################################################################
+   def show_pnl(self):
+      """
+      name: show_pnl
+      use: the profit and loss table: per stock the shares held, the
+           average price paid for them, the current price and value, the
+           unrealized gain on the shares held, the realized gain on the
+           shares sold, and the total
+      """
+      tr = self.tr
+      lots, closed, problems = tr.books()
+      if (not lots and not closed):
+         print("No trades recorded by %s. Use 'buy TICKER [price] "
+               "[shares]'." % tr.now().strftime("%Y-%m-%d %H:%M"))
+         return
+      held = unique(q["ticker"] for q in lots)
+      self.fresh(held)
+      rows, tot = profit(lots, closed, self.prices(held))
+      print("\n--- profit and loss as of %s (first in, first out) ---"
+            % tr.now().strftime("%Y-%m-%d %H:%M"))
+      print("%-6s %7s %8s %8s %19s %11s %11s" % (
+         "Ticker", "Shares", "AvgCost", "Price", "Unrealized", "Realized",
+         "Total"))
+
+      def money(v):
+         return("n/a" if (v is None) else usd(v))
+
+      for r in rows:
+         unreal = ("" if (not r["shares"]) else
+                   money(r["unreal"]) + (" (%s)" % pct(r["unreal_pct"])
+                                         if (r["unreal_pct"] is not None)
+                                         else ""))
+         print("%-6s %7g %8s %8s %19s %11s %11s" % (
+            r["ticker"], r["shares"], f2(r["cost"]) if (r["shares"])
+            else "", f2(r["price"]) if (r["shares"]) else "", unreal,
+            money(r["real"]), money(r["total"])))
+      known = tot["known"]
+      print("%-6s %7s %8s %8s %19s %11s %11s" % (
+         "TOTAL", "", "", "",
+         money(tot["unreal"]) + (" (%s)" % pct(tot["unreal"] /
+                                               tot["paid"])
+                                 if (known and tot["paid"]) else "")
+         if (known) else "n/a", money(tot["real"]),
+         money(tot["total"]) if (known) else "n/a"))
+      if (tr.practice()):
+         print("(includes practice trades not yet saved)")
+      for p in problems:
+         print("WARNING: %s" % p)
+
+   ########################################################################
    def do_positions(self, arg):
       tr = self.tr
       if (not tr.held()):
          print("No positions held at %s. Use 'track' or 'buy TICKER'." %
                tr.now().strftime("%Y-%m-%d %H:%M"))
       else:
-         self.fresh(sorted(set(q["ticker"] for q in tr.held())))
+         self.fresh(unique(q["ticker"] for q in tr.held()))
          self.show_positions()
-      done = [q for q in tr.ledger if (q.get("exit_time") and
-                                       q["exit_time"] <= tr.stamp())]
+      done = tr.closed()
       if (done):
-         print("\n--- closed trades in the real ledger (latest 10) ---")
+         print("\n--- shares sold (latest 10), bought -> sold ---")
          for q in done[-10:]:
             g = q["exit_price"] / q["entry_price"] - 1
-            sh = q.get("shares") or 0
-            print("%-6s %s @ %.2f -> %s @ %.2f  %s%s" % (
-               q["ticker"], q["entry_time"].replace("T", " "),
-               q["entry_price"], q["exit_time"][11:], q["exit_price"],
-               pctd(g, q["entry_price"], " "),
-               "  %s" % usd(g * q["entry_price"] * sh) if (sh) else ""))
+            print("%-6s %5g sh %s @ %.2f -> %s @ %.2f %s %s" % (
+               q["ticker"], q["shares"],
+               q["entry_time"][5:].replace("T", " "), q["entry_price"],
+               q["exit_time"][5:].replace("T", " "), q["exit_price"],
+               pct(g), usd(q["pnl"])))
+      if (tr.held() or done):
+         self.show_pnl()
 
    do_position = do_positions
 
    ########################################################################
+   def do_pnl(self, arg):
+      self.show_pnl()
+
+   do_profit = do_pnl
+
+   ########################################################################
+   def do_trades(self, arg):
+      tr = self.tr
+      xs = sorted(tr.trades + tr.pretend, key = trade_order)
+      if (not xs):
+         print("No trades recorded. Use 'buy TICKER [price] [shares]'.")
+         return
+      closed = book(tr.trades + tr.pretend)[1]
+      print("\n%4s  %-16s %-6s %-4s %8s %9s %12s %11s" % (
+         "#", "Time", "Ticker", "Side", "Shares", "Price", "Amount",
+         "Realized"))
+      for x in xs:
+         real = ""
+         if (x["side"] == "sell"):
+            real = usd(sum(c["pnl"] for c in closed
+                           if (c["sell"] == x["id"])))
+         print("%4d%s %-16s %-6s %-4s %8g %9.2f %12s %11s" % (
+            x["id"], "*" if (x.get("practice")) else " ",
+            x["time"].replace("T", " "), x["ticker"], x["side"],
+            x["shares"], x["price"],
+            format(x["shares"] * x["price"], ",.2f"), real))
+      if (tr.pretend):
+         print("(* = practice trade, not yet saved)")
+      print("Correct one with 'edittrade # shares=N price=P time=YYYY-MM-"
+            "DD HH:MM',\nremove one with 'deltrade #'.")
+
+   ########################################################################
+   def do_edittrade(self, arg):
+      tr = self.tr
+      a = arg.split()
+      usage = ("usage: edittrade # [shares=N] [price=P] [time=YYYY-MM-DD "
+               "HH:MM]   ('trades' lists the #)")
+      try:
+         tid = int(a.pop(0))
+         ch = {}
+         while (a):
+            k, _, v = a.pop(0).partition("=")
+            if (k == "time" and a and ":" in a[0] and "=" not in a[0]):
+               v += " " + a.pop(0)
+            if (k not in ("shares", "price", "time") or not v):
+               raise(ValueError(k))
+            ch[k] = v if (k == "time") else float(v)
+         if (not ch):
+            raise(ValueError("nothing to change"))
+      except (ValueError, IndexError):
+         print(usage)
+         return
+      try:
+         x = tr.edit(tid, ch.get("shares"), ch.get("price"), ch.get("time"))
+      except (ExceptionClass, ValueError) as error:
+         print("Not changed: %s" % error)
+         return
+      print("Trade #%d is now: %s %s %g sh @ %.2f at %s" % (
+         x["id"], x["side"], x["ticker"], x["shares"], x["price"],
+         x["time"].replace("T", " ")))
+
+   ########################################################################
+   def do_deltrade(self, arg):
+      tr = self.tr
+      try:
+         tid = int(arg.strip())
+         x = tr.trade(tid)
+         tr.delete(tid)
+      except ValueError:
+         print("usage: deltrade #   ('trades' lists the #)")
+         return
+      except ExceptionClass as error:
+         print("Not deleted: %s" % error)
+         return
+      print("Deleted trade #%d: %s %s %g sh @ %.2f at %s" % (
+         tid, x["side"], x["ticker"], x["shares"], x["price"],
+         x["time"].replace("T", " ")))
+
+   ########################################################################
    def do_realpositions(self, arg):
       tr = self.tr
-      led = [q for q in tr.ledger if (not q.get("exit_time"))]
-      if (not led):
-         print("No real positions in %s." % LEDGER)
-         return
       keep = tr.asof
       tr.asof = None
       try:
-         self.fresh(sorted(set(q["ticker"] for q in led)))
+         led = tr.held(practice = False)
+         if (not led):
+            print("No real positions in %s." % LEDGER)
+            return
+         self.fresh(unique(q["ticker"] for q in led))
          tl = tr.timeline()
          self.show_positions(led, "real positions (%s) as of the latest "
                              "bar, %s" % (LEDGER, tl[-1].strftime(
@@ -1746,18 +2179,9 @@ class Shell(cmd.Cmd):
       if (not tr.practice()):
          print("No practice trades to save.")
          return
-      n = len(tr.pretend)
-      tr.ledger += tr.pretend
-      m = 0
-      for q in tr.ledger:
-         x = tr.pretend_exit.get(q["id"])
-         if (x and not q.get("exit_time")):
-            q["exit_time"], q["exit_price"] = x
-            m += 1
-      tr.pretend, tr.pretend_exit = [], {}
-      tr.save_ledger()
-      print("Saved %d practice buy%s and %d sale%s to %s" % (
-         n, "" if (n == 1) else "s", m, "" if (m == 1) else "s", LEDGER))
+      n = tr.save_practice()
+      print("Saved %d practice trade%s to %s" % (
+         n, "" if (n == 1) else "s", LEDGER))
 
    do_saveposition = do_savepositions
 
@@ -1773,38 +2197,45 @@ class Shell(cmd.Cmd):
          if (e["t"] in have):
             continue
          r = e["r"]
-         tr.add_pos(tr.make_pos(e["t"], r["Close"], r["atr"]))
-         print("Tracking %s @ %.2f" % (e["t"], r["Close"]))
+         tr.record("buy", e["t"], 1, r["Close"], atr = r["atr"])
+         print("Tracking 1 share of %s @ %.2f ('edittrade' changes the "
+               "count)" % (e["t"], r["Close"]))
 
    ########################################################################
    def do_buy(self, arg):
       tr = self.tr
       a = arg.split()
+      usage = ("usage: buy TICKER [price] [shares]   (price defaults to "
+               "the current price,\n       shares to 1)")
       if (not a):
-         print("usage: buy TICKER [price] [shares]")
+         print(usage)
          return
       t = a[0].upper()
       self.fresh([t])
       df = tr.frame(t)
-      if (df is None):
-         print("usage: buy TICKER [price] [shares]   (no usable price "
-               "data for %s)" % t)
+      if (df is None and len(a) < 2):
+         print("%s\nNo usable price data for %s; give the price." % (
+            usage, t))
          return
       try:
          px = float(a[1]) if (len(a) > 1) else float(df["Close"].iloc[-1])
-         sh = float(a[2]) if (len(a) > 2) else 0.0
+         sh = float(a[2]) if (len(a) > 2) else 1.0
+         atr = float(df["atr"].iloc[-1]) if (df is not None) else None
+         x = tr.record("buy", t, sh, px, atr = atr)
       except ValueError:
-         print("usage: buy TICKER [price] [shares]")
+         print(usage)
          return
-      atr = float(df["atr"].iloc[-1])
-      tr.add_pos(tr.make_pos(t, px, atr, sh))
-      tg = target_px(px, atr, tr.cfg)
-      sp = trail_stop(px, atr, tr.cfg)
-      print("Recorded %s @ %.2f%s%s. Target %s, trailing stop starts at "
-            "%s." % (t, px, " x %g" % sh if (sh) else "",
-                     " (practice)" if (tr.asof is not None) else "",
-                     f2(tg) if (tg > 0) else "off",
-                     f2(sp) if (sp > 0) else "off"))
+      except ExceptionClass as error:
+         print("Not recorded: %s" % error)
+         return
+      tg = target_px(px, atr, tr.cfg) if (atr) else 0.0
+      sp = trail_stop(px, atr, tr.cfg) if (atr) else 0.0
+      print(textwrap.fill("Recorded trade #%d: bought %g %s @ %.2f%s. "
+                          "Target %s, trailing stop starts at %s." % (
+                             x["id"], sh, t, px, " (practice)" if
+                             (x.get("practice")) else "", f2(tg) if
+                             (tg > 0) else "off", f2(sp) if (sp > 0)
+                             else "off"), 78))
       if (t not in tr.watch()):
          print("(%s is not on the watchlist; it is followed while held)"
                % t)
@@ -1813,26 +2244,36 @@ class Shell(cmd.Cmd):
    def do_sell(self, arg):
       tr = self.tr
       a = arg.split()
+      usage = ("usage: sell TICKER [price] [shares|all]   (price defaults "
+               "to the current\n       price, shares to 1)")
       if (not a):
-         print("usage: sell TICKER [price]")
+         print(usage)
          return
       t = a[0].upper()
-      hit = tr.held(t)
-      if (not hit):
+      have = tr.shares(t)
+      if (not have):
          print("No open position in %s." % t)
          return
       df = tr.frame(t)
       try:
          px = (     float(a[1]) if (len(a) > 1)
                else float(df["Close"].iloc[-1]))
+         sh = (     have if (len(a) > 2 and a[2].lower() == "all")
+               else float(a[2]) if (len(a) > 2) else 1.0)
+         x = tr.record("sell", t, sh, px)
       except (ValueError, TypeError):
-         print("usage: sell TICKER [price]")
+         print(usage)
          return
-      for q in hit:
-         print("Closed %s: %.2f -> %.2f (%s)" % (
-            t, q["entry_price"], px,
-            pctd(px / q["entry_price"] - 1, q["entry_price"])))
-         tr.close_pos(q, px)
+      except ExceptionClass as error:
+         print("Not recorded: %s (%g held)" % (error, have))
+         return
+      real = sum(c["pnl"] for c in tr.closed() if (c["sell"] == x["id"]))
+      print(textwrap.fill("Recorded trade #%d: sold %g %s @ %.2f%s, "
+                          "realized %s; %g share%s left." % (
+                             x["id"], sh, t, px, " (practice)" if
+                             (x.get("practice")) else "", usd(real),
+                             have - sh, "" if (have - sh == 1) else "s"),
+                          78))
 
    ########################################################################
    def do_compare(self, arg):
@@ -2276,7 +2717,10 @@ QUOTE_COLUMNS = [("w", (4, 4)),
                  ("e", (4, 0)),
                  ("w", (14, 0)),
                  ("e", (4, 0)),
-                 ("w", (14, 0))]
+                 ("w", (14, 0)),
+                 ("w", (14, 0)),
+                 ("e", (4, 0)),
+                 ("e", (8, 0))]
 
                                 # crosshair shows only when the mouse is
                                 # this many screen pixels from a bar
@@ -2363,12 +2807,12 @@ def gui_modules():
         the process that opens the window, so the console copy that
         starts it in the background (see detach) does not wait for them
    """
-   global tkinter, ttk, simpledialog, Figure, FuncFormatter, Locator
+   global tkinter, ttk, messagebox, Figure, FuncFormatter, Locator
    global MaxNLocator, FigureCanvasTkAgg, NavigationToolbar2Tk
    global blended_transform_factory, LineCollection
    try:
       import tkinter
-      from tkinter import simpledialog
+      from tkinter import messagebox
       from tkinter import ttk
       import matplotlib
       matplotlib.use("TkAgg")
@@ -2429,7 +2873,8 @@ class TrackerWindow(object):
         with the day's low/high, expected range and signal, hover
         readout, an alert log, and one line or candlestick panel per
         stock with VWAP, the expected range, BUY markers and, for held
-        positions, the buy, the target and the trailing stop
+        positions, the buy, the target and the trailing stop; buy and
+        sell dialogs and a trades / profit and loss window
    pre: tkinter display available (DISPLAY set on linux)
    imp: prices are fetched and the signals worked out on a worker thread
         so the window never freezes; results are handed back to the gui
@@ -2455,9 +2900,14 @@ class TrackerWindow(object):
       self.timeline  = pd.DatetimeIndex([])
       self.last      = {}
       self.quote_rows = 0
+                                # latest close and daily ATR per stock,
+                                # for the trade dialogs and profit / loss
+      self.prices    = {}
+      self.atrs      = {}
+      self.trades_win = None
 
       root.title("Stock Tracker")
-      root.geometry("1150x820")
+      root.geometry("1350x820")
 
       ###
       ### row 1: what to track
@@ -2483,6 +2933,9 @@ class TrackerWindow(object):
                                                  padx = 4)
       ttk.Button(bar, text = "Record sell...",
                  command = self.record_sell).pack(side = tkinter.LEFT,
+                                                  padx = 4)
+      ttk.Button(bar, text = "Trades / P&L...",
+                 command = self.show_trades).pack(side = tkinter.LEFT,
                                                   padx = 4)
 
       self.status_var = tkinter.StringVar(value = "")
@@ -2664,6 +3117,10 @@ class TrackerWindow(object):
          self.timeline = self.timeline.union(view.index)
 
       top = None
+      for symbol, res in results.items():
+         if (not isinstance(res, str)):
+            self.prices[symbol] = float(res["df"]["Close"].iloc[-1])
+            self.atrs[symbol]   = float(res["df"]["atr"].iloc[-1])
       for number, (symbol, res) in enumerate(results.items(), 1):
          axes = self.figure.add_subplot(len(results), 1, number,
                                         sharex = top)
@@ -2713,6 +3170,8 @@ class TrackerWindow(object):
                                  self.scale_tag(axes, 1, "left"))
       self.figure.tight_layout()
       self.canvas.draw_idle()
+      if (self.trades_win is not None and self.trades_win.alive()):
+         self.trades_win.fill()
       now = self.tr.source.now()
       self.status_var.set("updated %s | %s" % (
          pd.Timestamp.now().strftime("%H:%M:%S"),
@@ -2751,6 +3210,18 @@ class TrackerWindow(object):
       expected = (     "n/a" if (not np.isfinite(r["projlo"]))
                   else f"{r['projlo']:,.2f} - {r['projhi']:,.2f}")
       signal, shade = self.signal_text(res)
+                                # for a stock held: shares, average price
+                                # paid and the gain or loss on them now
+      own    = ()
+      shares = sum(q["shares"] for q, jp in res["pos"])
+      if (shares):
+         paid = sum(q["shares"] * q["entry_price"] for q, jp in res["pos"])
+         gain = shares * last - paid
+         own  = (("Own", "black"),
+                 (f"{shares:g} @ {paid / shares:,.2f}", "black"),
+                 (f"{usd(gain)} ({pct(gain / paid)})",
+                  BRK_CLR if (gain > 0) else SELL_CLR if (gain < 0)
+                  else "black"))
       self.quote(color, symbol,
                  f"{last:,.2f}",
                  f"{delta:+,.2f}",
@@ -2758,7 +3229,7 @@ class TrackerWindow(object):
                  ("Low",  "black"), (f"{low:,.2f}",  low_color),
                  ("High", "black"), (f"{high:,.2f}", high_color),
                  ("Expected", "black"), (expected, "black"),
-                 (signal, shade))
+                 (signal, shade), *own)
 
       self.hosts[axes] = axes
       axes.yaxis.set_major_locator(grid_locator())
@@ -2893,55 +3364,81 @@ class TrackerWindow(object):
    def record_buy(self):
       """
       name: record_buy
-      use: asks for TICKER [price] [shares] and records the position
+      use: the buy dialog: ticker, shares (default 1), price (default the
+           current price) and time (default now); records the buy
       """
-      text = simpledialog.askstring(
-                "Record buy", "TICKER [price] [shares]\n(price defaults "
-                "to the last close)", parent = self.root)
-      if (not text):
-         return
-      a = text.split()
-      t = a[0].upper()
-      df = self.tr.frame(t)
-      try:
-         if (df is None):
-            raise(ValueError("no price data for %s yet" % t))
-         px = float(a[1]) if (len(a) > 1) else float(df["Close"].iloc[-1])
-         sh = float(a[2]) if (len(a) > 2) else 0.0
-      except (ValueError, IndexError) as error:
-         self.status_var.set("buy not recorded: %s" % error)
-         return
-      self.tr.add_pos(self.tr.make_pos(t, px, float(df["atr"].iloc[-1]),
-                                       sh))
-      self.status_var.set("recorded buy of %s @ %.2f" % (t, px))
-      self.refresh()
+      tr      = self.tr
+      choices = unique(self.tickers() + [q["ticker"] for q in tr.held()])
+      TradeDialog(self.root, "Record buy", "buy", choices,
+                  choices[0] if (choices) else "", 1, None,
+                  tr.stamp().replace("T", " "), self.prices,
+                  self.buy_apply)
+
+   ########################################################################
+   def buy_apply(self, t, shares, price, when):
+      """
+      name: buy_apply
+      use: records a buy entered in the dialog
+      post: raises ExceptionClass when it cannot be recorded
+      """
+      x = self.tr.record("buy", t, shares, price, when, self.atrs.get(t))
+      self.status_var.set("recorded trade #%d: bought %g %s @ %.2f" % (
+         x["id"], shares, x["ticker"], price))
+      self.changed()
 
    ########################################################################
    def record_sell(self):
       """
       name: record_sell
-      use: asks for TICKER [price] and closes its recorded position(s)
+      use: the sell dialog: a held ticker, shares (default 1), price
+           (default the current price) and time (default now); records
+           the sale (the earliest shares bought are sold first)
       """
-      text = simpledialog.askstring(
-                "Record sell", "TICKER [price]\n(price defaults to the "
-                "last close)", parent = self.root)
-      if (not text):
+      tr      = self.tr
+      choices = unique(q["ticker"] for q in tr.held())
+      if (not choices):
+         messagebox.showinfo("Record sell", "No stock is held.",
+                             parent = self.root)
          return
-      a = text.split()
-      t = a[0].upper()
-      hit = self.tr.held(t)
-      df = self.tr.frame(t)
-      try:
-         if (not hit):
-            raise(ValueError("no open position in %s" % t))
-         px = (     float(a[1]) if (len(a) > 1)
-               else float(df["Close"].iloc[-1]))
-      except (ValueError, TypeError) as error:
-         self.status_var.set("sell not recorded: %s" % error)
+      TradeDialog(self.root, "Record sell", "sell", choices, choices[0], 1,
+                  None, tr.stamp().replace("T", " "), self.prices,
+                  self.sell_apply, held = tr.shares)
+
+   ########################################################################
+   def sell_apply(self, t, shares, price, when):
+      """
+      name: sell_apply
+      use: records a sale entered in the dialog
+      post: raises ExceptionClass when it cannot be recorded
+      """
+      x = self.tr.record("sell", t, shares, price, when)
+      real = sum(c["pnl"] for c in self.tr.books(upto = False)[1]
+                 if (c["sell"] == x["id"]))
+      self.status_var.set("recorded trade #%d: sold %g %s @ %.2f, "
+                          "realized %s" % (x["id"], shares, x["ticker"],
+                                           price, usd(real)))
+      self.changed()
+
+   ########################################################################
+   def show_trades(self):
+      """
+      name: show_trades
+      use: opens (or raises) the trades and profit / loss window
+      """
+      if (self.trades_win is not None and self.trades_win.alive()):
+         self.trades_win.top.lift()
          return
-      for q in hit:
-         self.tr.close_pos(q, px)
-      self.status_var.set("recorded sale of %s @ %.2f" % (t, px))
+      self.trades_win = TradesWindow(self)
+
+   ########################################################################
+   def changed(self):
+      """
+      name: changed
+      use: after a trade was recorded, corrected or removed: updates the
+           trades window and redraws the chart
+      """
+      if (self.trades_win is not None and self.trades_win.alive()):
+         self.trades_win.fill()
       self.refresh()
 
    ########################################################################
@@ -3015,7 +3512,8 @@ class TrackerWindow(object):
       name: quote
       use: adds one ticker's row to the quote table above the chart
       usage: quote(color, symbol, price, change, "(", percent, ")",
-                   "Low", low, "High", high, "Expected", range, signal)
+                   "Low", low, "High", high, "Expected", range, signal
+                   [, "Own", shares @ price, gain])
              quote(color, symbol, reason)
              any cell may be a (text, colour) pair to override color
       post: each piece in its own column, aligned per QUOTE_COLUMNS
@@ -3173,6 +3671,351 @@ class TrackerWindow(object):
       self.root.destroy()
 
 ###########################################################################
+class TradeDialog(object):
+   """
+   name: TradeDialog
+   use: a small window to enter or correct one trade: ticker, shares,
+        price and time
+   usage: TradeDialog(parent, title, side, choices, ticker, shares, price,
+                      when, prices, apply[, held][, fixed])
+          choices are the tickers offered; price None takes the
+          ticker's current price from prices; apply(ticker, shares,
+          price, when) records it and raises ExceptionClass to refuse
+          it; held(ticker), when given, gives the shares held, shown as
+          a hint; fixed True keeps the ticker from being changed
+   post: the dialog stays open, showing the reason, until apply accepts
+         the values or Cancel is pressed
+   imp: modal: the main window waits until it is closed
+   """
+
+   ########################################################################
+   def __init__(self, parent, title, side, choices, ticker, shares, price,
+                when, prices, apply, held = None, fixed = False):
+      self.prices = prices
+      self.apply  = apply
+      self.held   = held
+      self.shown  = ticker
+      self.top    = top = tkinter.Toplevel(parent)
+      top.title(title)
+      top.transient(parent)
+      top.resizable(False, False)
+      frame = ttk.Frame(top, padding = 12)
+      frame.pack(fill = tkinter.BOTH, expand = True)
+
+      self.ticker_var = tkinter.StringVar(value = ticker)
+      self.shares_var = tkinter.StringVar(value = "%g" % shares)
+      self.price_var  = tkinter.StringVar(
+                           value = "" if (price is None and
+                                          prices.get(ticker) is None)
+                           else "%.2f" % (price if (price is not None)
+                                          else prices[ticker]))
+      self.when_var   = tkinter.StringVar(value = when)
+      self.hint_var   = tkinter.StringVar(value = "")
+      self.error_var  = tkinter.StringVar(value = "")
+
+      ttk.Label(frame, text = "Ticker:").grid(row = 0, column = 0,
+                                              sticky = "w", pady = 3)
+      box = ttk.Combobox(frame, textvariable = self.ticker_var,
+                         values = choices, width = 12,
+                         state = "disabled" if (fixed) else
+                         "readonly" if (side == "sell") else "normal")
+      box.grid(row = 0, column = 1, sticky = "w", pady = 3)
+      box.bind("<<ComboboxSelected>>", self.ticker_changed)
+      box.bind("<FocusOut>", self.ticker_changed)
+      ttk.Label(frame, textvariable = self.hint_var,
+                foreground = "gray").grid(row = 0, column = 2,
+                                          sticky = "w", padx = (8, 0))
+      rows = (("Shares:", self.shares_var, ""),
+              ("Price:", self.price_var, "per share"),
+              ("Time:", self.when_var, "YYYY-MM-DD HH:MM, New York"))
+      for n, (text, var, note) in enumerate(rows, 1):
+         ttk.Label(frame, text = text).grid(row = n, column = 0,
+                                            sticky = "w", pady = 3)
+         entry = ttk.Entry(frame, textvariable = var, width = 18)
+         entry.grid(row = n, column = 1, sticky = "w", pady = 3)
+         ttk.Label(frame, text = note, foreground = "gray").grid(
+            row = n, column = 2, sticky = "w", padx = (8, 0))
+         if (n == 1):
+            first = entry
+      ttk.Label(frame, textvariable = self.error_var, foreground = "red",
+                wraplength = 380).grid(row = 4, column = 0,
+                                       columnspan = 3, sticky = "w",
+                                       pady = (6, 0))
+      buttons = ttk.Frame(frame)
+      buttons.grid(row = 5, column = 0, columnspan = 3, sticky = "e",
+                   pady = (8, 0))
+      ttk.Button(buttons, text = "OK",
+                 command = self.ok).pack(side = tkinter.LEFT, padx = 4)
+      ttk.Button(buttons, text = "Cancel",
+                 command = top.destroy).pack(side = tkinter.LEFT)
+      top.bind("<Return>", lambda event: self.ok())
+      top.bind("<Escape>", lambda event: top.destroy())
+      self.show_hint()
+      first.focus_set()
+      first.select_range(0, "end")
+      top.grab_set()
+      top.wait_window()
+
+   ########################################################################
+   def show_hint(self):
+      """
+      name: show_hint
+      use: the shares held of the chosen ticker, for a sale
+      """
+      if (self.held is not None):
+         self.hint_var.set("%g held" % self.held(
+            self.ticker_var.get().strip().upper()))
+
+   ########################################################################
+   def ticker_changed(self, event):
+      """
+      name: ticker_changed
+      use: a new ticker brings its current price into the price field
+      """
+      t = self.ticker_var.get().strip().upper()
+      if (t != self.shown):
+         self.shown = t
+         px = self.prices.get(t)
+         if (px is not None):
+            self.price_var.set("%.2f" % px)
+      self.show_hint()
+
+   ########################################################################
+   def ok(self):
+      """
+      name: ok
+      use: checks the fields and hands them to apply
+      """
+      t = self.ticker_var.get().strip().upper()
+      checks = (("Enter a ticker.", lambda: t or None),
+                ("Shares must be a number.",
+                 lambda: float(self.shares_var.get())),
+                ("Price must be a number.",
+                 lambda: float(self.price_var.get())),
+                ("The time must be YYYY-MM-DD HH:MM.",
+                 lambda: parse_time(self.when_var.get())))
+      got = []
+      for text, value in checks:
+         try:
+            got.append(value())
+         except Exception:
+            got.append(None)
+         if (got[-1] is None):
+            self.error_var.set(text)
+            return
+      try:
+         self.apply(*got)
+      except ExceptionClass as error:
+         self.error_var.set("Not recorded: %s" % error)
+         return
+      self.top.destroy()
+
+###########################################################################
+class TradesWindow(object):
+   """
+   name: TradesWindow
+   use: window with the profit and loss per stock and every trade, where
+        a trade can be corrected or removed
+   imp: sales are matched to the earliest shares bought (first in, first
+        out); unrealized gains use the latest prices of the chart window
+   """
+
+   PNL_COLUMNS = (("Ticker", 70, "w"), ("Shares", 70, "e"),
+                  ("Avg cost", 80, "e"), ("Price", 80, "e"),
+                  ("Value", 100, "e"), ("Unrealized", 100, "e"),
+                  ("%", 70, "e"), ("Realized", 100, "e"),
+                  ("Total", 100, "e"))
+   TRADE_COLUMNS = (("#", 50, "e"), ("Time", 130, "w"),
+                    ("Ticker", 70, "w"), ("Side", 50, "w"),
+                    ("Shares", 70, "e"), ("Price", 80, "e"),
+                    ("Amount", 100, "e"), ("Realized", 100, "e"))
+
+   ########################################################################
+   def __init__(self, owner):
+      self.owner = owner
+      self.tr    = owner.tr
+      self.top   = top = tkinter.Toplevel(owner.root)
+      top.title("Trades and profit / loss")
+      top.geometry("820x560")
+      frame = ttk.Frame(top, padding = 8)
+      frame.pack(fill = tkinter.BOTH, expand = True)
+
+      self.title_var = tkinter.StringVar(value = "")
+      ttk.Label(frame, textvariable = self.title_var,
+                font = ("TkDefaultFont", 11, "bold")).pack(anchor = "w")
+      self.pnl = self.table(frame, self.PNL_COLUMNS, 6)
+      self.pnl.tag_configure("total", font = ("TkDefaultFont", 10, "bold"))
+
+      ttk.Label(frame, text = "Trades (double-click one to correct it)",
+                font = ("TkDefaultFont", 11, "bold")).pack(
+                   anchor = "w", pady = (10, 0))
+      self.list = self.table(frame, self.TRADE_COLUMNS, 12, True)
+      self.list.bind("<Double-1>", lambda event: self.edit())
+      for tree in (self.pnl, self.list):
+         tree.tag_configure("gain", foreground = BRK_CLR)
+         tree.tag_configure("loss", foreground = SELL_CLR)
+
+      buttons = ttk.Frame(frame)
+      buttons.pack(fill = tkinter.X, pady = (8, 0))
+      ttk.Button(buttons, text = "Record buy...",
+                 command = owner.record_buy).pack(side = tkinter.LEFT)
+      ttk.Button(buttons, text = "Record sell...",
+                 command = owner.record_sell).pack(side = tkinter.LEFT,
+                                                   padx = 4)
+      ttk.Button(buttons, text = "Correct trade...",
+                 command = self.edit).pack(side = tkinter.LEFT, padx = 4)
+      ttk.Button(buttons, text = "Delete trade",
+                 command = self.delete).pack(side = tkinter.LEFT)
+      ttk.Button(buttons, text = "Close",
+                 command = top.destroy).pack(side = tkinter.RIGHT)
+      self.fill()
+
+   ########################################################################
+   def table(self, parent, columns, height, expand = False):
+      """
+      name: table
+      use: a Treeview with the given (heading, width, anchor) columns
+      post: returns the Treeview, packed with a vertical scroll bar
+      """
+      box  = ttk.Frame(parent)
+      box.pack(fill = tkinter.BOTH, expand = expand, pady = (4, 0))
+      tree = ttk.Treeview(box, columns = [c[0] for c in columns],
+                          show = "headings", height = height,
+                          selectmode = "browse")
+      for name, width, anchor in columns:
+         tree.heading(name, text = name, anchor = anchor)
+         tree.column(name, width = width, anchor = anchor,
+                     stretch = (name in ("Time", "Ticker")))
+      bar = ttk.Scrollbar(box, orient = "vertical", command = tree.yview)
+      tree.configure(yscrollcommand = bar.set)
+      tree.pack(side = tkinter.LEFT, fill = tkinter.BOTH, expand = True)
+      bar.pack(side = tkinter.RIGHT, fill = tkinter.Y)
+      return(tree)
+
+   ########################################################################
+   def alive(self):
+      """
+      name: alive
+      use: predicate; is the window still open
+      """
+      try:
+         return(bool(self.top.winfo_exists()))
+      except tkinter.TclError:
+         return(False)
+
+   ########################################################################
+   def fill(self):
+      """
+      name: fill
+      use: (re)fills both tables from the ledger and the latest prices
+      """
+      tr = self.tr
+      lots, closed, problems = tr.books(upto = False)
+      rows, tot = profit(lots, closed, self.owner.prices)
+      self.title_var.set("Profit and loss as of %s (sales matched to the "
+                         "earliest buys)" % tr.stamp().replace("T", " "))
+
+      def money(v):
+         return("n/a" if (v is None) else usd(v))
+
+      def tag(v):
+         return(() if (not v) else ("gain",) if (v > 0) else ("loss",))
+
+      self.pnl.delete(*self.pnl.get_children())
+      for r in rows:
+         sh = r["shares"]
+         self.pnl.insert("", "end", tags = tag(r["total"]), values = (
+            r["ticker"], "%g" % sh, f2(r["cost"]) if (sh) else "",
+            f2(r["price"]) if (sh) else "",
+            money(r["value"]) if (sh) else "",
+            money(r["unreal"]) if (sh) else "",
+            pct(r["unreal_pct"]) if (r["unreal_pct"] is not None) else "",
+            money(r["real"]), money(r["total"])))
+      if (rows):
+         known = tot["known"]
+         self.pnl.insert("", "end", tags = ("total",) + tag(tot["total"]),
+                         values = (
+            "TOTAL", "", "", "", money(tot["value"]) if (known) else "n/a",
+            money(tot["unreal"]) if (known) else "n/a",
+            pct(tot["unreal"] / tot["paid"]) if (known and tot["paid"])
+            else "", money(tot["real"]),
+            money(tot["total"]) if (known) else "n/a"))
+
+      self.list.delete(*self.list.get_children())
+      for x in sorted(tr.trades + tr.pretend, key = trade_order,
+                      reverse = True):
+         real = None
+         if (x["side"] == "sell"):
+            real = sum(c["pnl"] for c in closed if (c["sell"] == x["id"]))
+         self.list.insert("", "end", iid = str(x["id"]), tags = tag(real),
+                          values = (
+            x["id"], x["time"].replace("T", " "), x["ticker"], x["side"],
+            "%g" % x["shares"], "%.2f" % x["price"],
+            format(x["shares"] * x["price"], ",.2f"),
+            "" if (real is None) else usd(real)))
+      if (problems):
+         messagebox.showwarning("Trades", "\n".join(problems),
+                                parent = self.top)
+
+   ########################################################################
+   def selected(self):
+      """
+      name: selected
+      use: the trade selected in the list, or None (after saying so)
+      """
+      sel = self.list.selection()
+      if (not sel):
+         messagebox.showinfo("Trades", "Select a trade first.",
+                             parent = self.top)
+         return(None)
+      return(self.tr.trade(int(sel[0])))
+
+   ########################################################################
+   def edit(self):
+      """
+      name: edit
+      use: corrects the shares, price or time of the selected trade
+      """
+      x = self.selected()
+      if (x is None):
+         return
+
+      def apply(t, shares, price, when):
+         self.tr.edit(x["id"], shares, price, when)
+         self.owner.status_var.set("corrected trade #%d" % x["id"])
+         self.owner.changed()
+
+      TradeDialog(self.top, "Correct trade #%d (%s)" % (x["id"],
+                                                      x["side"]),
+                  x["side"], [x["ticker"]], x["ticker"], x["shares"],
+                  x["price"], x["time"].replace("T", " "),
+                  self.owner.prices, apply, fixed = True)
+
+   ########################################################################
+   def delete(self):
+      """
+      name: delete
+      use: removes the selected trade, after asking
+      """
+      x = self.selected()
+      if (x is None):
+         return
+      if (not messagebox.askyesno(
+                 "Delete trade", "Delete trade #%d: %s %g %s @ %.2f at "
+                 "%s?" % (x["id"], x["side"], x["shares"], x["ticker"],
+                          x["price"], x["time"].replace("T", " ")),
+                 parent = self.top)):
+         return
+      try:
+         self.tr.delete(x["id"])
+      except ExceptionClass as error:
+         messagebox.showerror("Delete trade", "Not deleted: %s" %
+                              error, parent = self.top)
+         return
+      self.owner.status_var.set("deleted trade #%d" % x["id"])
+      self.owner.changed()
+
+###########################################################################
 def detach(prog, argv):
    """
    name: detach
@@ -3265,8 +4108,9 @@ class MAIN(object):
       ap.add_argument("-v", dest = "verbose", action = "count",
                       default = 0, help = "more messages")
       ap.add_argument("tickers", nargs = "*",
-                      help = "ticker symbols added to the watchlist, "
-                             "e.g. AAPL MSFT ORCL")
+                      help = "ticker symbols put first on the "
+                             "watchlist, in this order, e.g. AAPL MSFT "
+                             "ORCL")
       args = ap.parse_args(argv)
       if (args.refresh < 0):
          ap.error("-r must be 0 or more")
@@ -3284,9 +4128,12 @@ class MAIN(object):
          set_home(HOME + "-synthetic")
       tr = Tracker(args.synthetic, args.verbose)
       if (args.tickers):
-         w = tr.watch()
-         add = [t.upper() for t in args.tickers]
-         tr.save_watch(w + [t for t in add if (t not in w)])
+                                # the stocks named on the command line
+                                # come first, in that order, then the
+                                # rest of the watchlist
+         add = unique(t for a in args.tickers
+                      for t in a.upper().replace(",", " ").split())
+         tr.save_watch(add + [t for t in tr.watch() if (t not in add)])
       if (args.text):
          if (tr.tickers()):
             tr.sync(force = args.reload)

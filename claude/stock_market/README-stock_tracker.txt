@@ -26,7 +26,8 @@ only. Treat all output as an experiment, not a promise.
 Run
 ---
    python stock_tracker.py                    chart window, the watchlist
-   python stock_tracker.py AAPL MSFT ORCL     add these to the watchlist
+   python stock_tracker.py AAPL MSFT ORCL     put these first on the
+                                              watchlist, in this order
    python stock_tracker.py -c -p 5d           candles, last 5 sessions
    python stock_tracker.py -f                 keep the window in the
                                               foreground
@@ -38,7 +39,12 @@ Options: -c (start in candle mode), -f (stay in the foreground), -r N
 (auto-refresh every N seconds, 0 = off, default 60), -p 1d|2d|5d|10d|20d
 (time span shown), -t (text prompt), -s (synthetic data, kept apart in
 ~/.stock_tracker-synthetic), -d (re-download all price history), -v (more
-messages), then any ticker symbols to add to the watchlist.
+messages), then any ticker symbols to put first on the watchlist.
+
+Stocks are shown in watchlist order, not alphabetically: the ones named
+on the command line first, in the order given, then the rest of the
+watchlist, then any stock you hold that is not on it. "watch" adds new
+stocks at the end. "recommend" and "compare" still rank by signal.
 
 The window starts in the background and gives the command prompt back
 (on Windows it runs under pythonw.exe with no console). If it fails to
@@ -48,9 +54,14 @@ The chart window
 ----------------
    Ticker(s)            the watchlist; Enter or "Refresh now" saves it
    Chart                Line or Candles
-   Record buy...        record a position you opened: TICKER [price]
-                        [shares] (price defaults to the last close)
-   Record sell...       close a recorded position: TICKER [price]
+   Record buy...        record a buy: ticker, shares (default 1),
+                        price (default the current price) and time
+                        (default now); change any of them before OK
+   Record sell...       record a sale of a stock you hold, with the same
+                        fields (shares default to 1)
+   Trades / P&L...      profit and loss per stock, and every trade, which
+                        can be corrected or deleted (see "Your trades and
+                        profit / loss" below)
    Time span            sessions shown: 1d, 2d, 5d, 10d, 20d
    Bar size             5m (the signals are built on 5-minute bars)
    Auto-refresh every   5s to 15m, or off
@@ -58,7 +69,10 @@ The chart window
 Under the controls, one row per stock: price and change over the span,
 the span's low and high, today's expected range, and the signal (BUY
 breakout, BUY rebound, SELL, HOLD or no signal). The low and high are
-coloured by where the price sits between them, as in stock_ticker.
+coloured by where the price sits between them, as in stock_ticker. For a
+stock you own the row ends with "Own", the shares held and the average
+price paid for them, and the gain or loss on them at the current price
+(green for a gain, red for a loss).
 
 The dark bar shows the bar under the mouse: open, close, low, high,
 volume with its estimated share of buying, VWAP, the expected range and
@@ -93,11 +107,19 @@ The text prompt (-t)
    nextday                  same time on the next trading day
    recommend [N]            BUY signals with target and stop, then SELL /
                             HOLD for positions held ("scan" works too)
-   track [N]                record the BUY signals as open positions
-   buy TICKER [price] [shares]   record a position you opened
-   sell TICKER [price]      close a recorded position
+   track [N]                record the BUY signals as open positions,
+                            1 share each
+   buy TICKER [price] [shares]   record a buy (defaults: the current
+                            price, 1 share)
+   sell TICKER [price] [shares|all]   record a sale (defaults: the
+                            current price, 1 share)
    positions                positions held at the as-of time, with SELL /
-                            HOLD, and recent closed trades
+                            HOLD, recent sales and profit and loss
+   pnl                      profit and loss per stock ("profit" works too)
+   trades                   every buy and sell, with its #
+   edittrade # [shares=N] [price=P] [time=YYYY-MM-DD HH:MM]
+                            correct a trade after the fact
+   deltrade #               remove a trade recorded by mistake
    realpositions            the real ledger's positions, judged on the
                             latest bar (ignores asof)
    savepositions            write practice buys and sells into the ledger
@@ -124,6 +146,31 @@ The text prompt (-t)
 Buys and sells made while an as-of time is active are practice trades,
 kept apart from your real ledger until "savepositions". The prompt shows
 "practice".
+
+Your trades and profit / loss
+-----------------------------
+Every buy and sell you record is kept in a trade log, with its shares,
+price and time. What you hold, and your profit or loss, is worked out
+from it. A sale is matched to the earliest shares of that stock still
+held (first in, first out, as brokers do by default), so selling part of
+a holding is fine. A sale of more shares than you held at that time is
+refused.
+
+   unrealized   the gain or loss on the shares still held, at the
+                current price, against the average price paid for them
+   realized     the gain or loss on the shares sold
+   total        the two together
+
+In the window, "Trades / P&L..." shows a table of these per stock with a
+total, and the list of trades, newest first. Double-click a trade (or
+select it and press "Correct trade...") to change its shares, price or
+time; "Delete trade" removes one. A change that would leave a sale of
+shares not held is refused. Correcting a buy's price restarts its
+trailing stop from that price. At the prompt, "trades", "pnl",
+"edittrade" and "deltrade" do the same.
+
+Each buy keeps its own profit target and trailing stop, so two buys of
+the same stock are judged separately.
 
 The expected range
 ------------------
@@ -200,7 +247,10 @@ Files
 In ~/.stock_tracker:
 
    watchlist.json   the watched stocks
-   ledger.json      your positions
+   ledger.json      your trade log (buys and sells); a ledger written
+                    by an older version is converted the first time and
+                    the old file kept as ledger.json.v1 (a position
+                    recorded without a share count is taken as 1 share)
    settings.json    settings changed from the defaults
    intraday.pkl     cached 5-minute bars
    daily.pkl        cached daily bars (for the ATR)
