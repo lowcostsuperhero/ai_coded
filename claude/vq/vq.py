@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id: vq.py 4.main-4 01:37:08 26-Nov-2026 claude-opus-5-5 $
+# name: $Id: vq.py 5.main-5 12:50:15 26-Nov-2026 claude-opus-5-5 $
 # use: draws the structure of an Oracle SQL query (tables, referenced
 #      columns, returned columns, join and filter predicates, and the
 #      AND/OR grouping of those predicates) as an interactive HTML page
@@ -35,8 +35,18 @@ except ImportError:
          " (pip install sqlglot)", file = sys.stderr)
    sys.exit(E_FAIL)
 
-REVISION     = "$Revision: 4.main-4 $"
+REVISION     = "$Revision: 5.main-5 $"
 FORMATS      = ("html",)
+
+                               # characters outside plain ascii, built
+                               # from their code points so that none
+                               # appears in this script
+ELLIPSIS     = chr(0x2026)
+MIDDLE_DOT   = chr(0x00B7)
+EM_DASH      = chr(0x2014)
+LEFT_ARROW   = chr(0x2190)
+STAR_FULL    = chr(0x2605)
+STAR_OPEN    = chr(0x2606)
 
 CHAR_PX      = 7.9
 NAME_CHAR_PX = 8.7
@@ -579,7 +589,8 @@ def sqlplus_text(text):
 
 def shorten(text, limit = LABEL_MAX):
    text = re.sub(r"\s+", " ", text)
-   return(text if (len(text) <= limit) else text[:limit - 1] + "…")
+   return(     text if (len(text) <= limit)
+          else text[:limit - 1] + ELLIPSIS)
 
 ###########################################################################
 
@@ -940,7 +951,8 @@ class QueryModel:
       for (key, column) in table.columns.items():
          if (key == "*"):
             continue
-         leaf = Leaf(f"{table.title()}.{column.name} \u2190 {table.name}")
+         leaf = Leaf(f"{table.title()}.{column.name} {LEFT_ARROW} "
+                     f"{table.name}")
          leaf.feed = True
          for select in branches:
             inner = self.scopes[id(select)]
@@ -1646,7 +1658,7 @@ class QueryModel:
          bare  = op.replace("NOT ", "")
          label = (     f"{op.replace(bare, FLIP[bare])} "
                        f"{self.side_text(left)}" if (bare in FLIP)
-                  else f"{self.side_text(left)} {op} …")
+                  else f"{self.side_text(left)} {op} {ELLIPSIS}")
          for rend in rends:
             leaf.segments.append(Segment(rend, None, shorten(label)))
 
@@ -1986,7 +1998,8 @@ class Layout:
          if (table.beside is not None):
                                # wide enough for its title too
             scope           = table.scope
-            title           = f"{scope.label} · {scope.context}"
+            title           = (f"{scope.label} {MIDDLE_DOT} "
+                               f"{scope.context}")
             scope.box_right = max(table.right + BOX_PAD_PX,
                                   scope.left - BOX_PAD_PX + 16
                                   + text_px(title, SMALL_PX))
@@ -3263,7 +3276,7 @@ class SvgRenderer:
              'rx="4"/>'
              f'<text class="btitle" x="{num(x + 8)}" '
              f'y="{num(scope.box_top + 15)}">{esc(scope.label)} '
-             f'· {esc(text)}</text>')
+             f'{MIDDLE_DOT} {esc(text)}</text>')
 
    ########################################################################
 
@@ -4526,8 +4539,8 @@ def mark_indexes(model, connection, schema = None):
                column = table.columns[key]
                column.marker_index = holding
                (column.marker, column.marker_class) = (
-                    ("★", "lead") if (any(h[1] for h in holding))
-                  else ("☆", "part") if (holding)
+                    (STAR_FULL, "lead") if (any(h[1] for h in holding))
+                  else (STAR_OPEN, "part") if (holding)
                   else (None, ""))
    return([pair for pair in tables
            if ((pair not in found) and (pair not in views))])
@@ -4661,7 +4674,7 @@ class MAIN:
       output = (   self.output
                 or (os.path.splitext(source)[0] if (source) else base) +
                    "." + self.format)
-      page   = render_html(model, f"{base} — query structure",
+      page   = render_html(model, f"{base} {EM_DASH} query structure",
                            base, sql_text)
       with open(output, "w", encoding = "utf-8") as handle:
          handle.write(page)

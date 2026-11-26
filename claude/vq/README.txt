@@ -57,11 +57,11 @@ tuning set) decides which schema unqualified table names belong to;
 for a file it is the login's current schema.
 
 With a login, each join column is marked at its top right corner:
-   ★            a leading column of an index: every index column
+   solid star   a leading column of an index: every index column
                 before it is also used by some condition on that
                 table in the query (so (JOB, DEPTNO) serves a join on
                 DEPTNO when the query also has a condition on JOB)
-   ☆            in an index, but not among its leading columns
+   hollow star  in an index, but not among its leading columns
    (no mark)    in no index
 Hover near a mark for a popup listing each index that holds the
 column, side by side: its name (underlined), then its columns one
@@ -101,10 +101,10 @@ columns the query uses, spelled as in the query (matched without
 regard to case, as Oracle does). Columns are laid out left to right
 in the order they first appear in the SQL text.
 
-   ✓            the column is returned to the user by the whole
-                query (top left). A column a subquery, CTE or inline
-                view returns gets one only if the top level query
-                passes it on (a scalar subquery in the top level
+   check mark   (a green tick, top left) the column is returned to
+                the user by the whole query. A column a subquery, CTE
+                or inline view returns gets one only if the top level
+                query passes it on (a scalar subquery in the top level
                 select list does)
    'CURRENT'    in italics: a select list entry that is a bare value
                 (a string or number), shown quotes and all as a column
@@ -114,28 +114,28 @@ in the order they first appear in the SQL text.
                 shown as a column of the first table in FROM; a
                 condition on it gets a value arrow like any column's,
                 e.g. "<= &&ROW_NUM"
-   JOB          in italics, no ✓: a GROUP BY column that is not in the
-                select list, so not in the rows returned
+   JOB          in italics, no check mark: a GROUP BY column that is
+                not in the select list, so not in the rows returned
    1 2 3        position of the column in the ORDER BY list (before
-                the ✓, or in its place, just before the name); an
-                ORDER BY alias or position counts for the select list
-                entry it names
-   1↓           the item is sorted DESC (the arrow sits between the
-                position and the ✓)
+                the check mark, or in its place, just before the
+                name); an ORDER BY alias or position counts for the
+                select list entry it names
+   1 + arrow    the item is sorted DESC: a small downward arrow
+                sits between the position and the check mark
    AVG(SAL)     in italics: an aggregate (in the select list or
                 compared in HAVING) is a virtual column of its own,
                 just right of the column it reads, with an arrow from
-                it (running under its ✓ and ORDER BY position):
-                SAL -> AVG(SAL). Further aggregates of the same
-                column follow, each arrowed from the one before:
+                it (running under its check mark and ORDER BY
+                position): SAL -> AVG(SAL). Further aggregates of the
+                same column follow, each arrowed from the one before:
                 SAL -> AVG(SAL) -> MAX(SAL). An aggregate of several
                 columns follows the first; the others come right
                 after it, arrowed back into it:
-                QTY -> SUM(QTY * PRICE) <- PRICE. Joins, ORDER BY and the
-                ✓ go to the aggregate, not the column. COUNT(*) reads
-                no column and stands alone on the first table in FROM;
-                a HAVING condition is drawn like any other, e.g. an
-                arrow labelled "> 3"
+                QTY -> SUM(QTY * PRICE) <- PRICE. Joins, ORDER BY and
+                the check mark go to the aggregate, not the column.
+                COUNT(*) reads no column and stands alone on the first
+                table in FROM; a HAVING condition is drawn like any
+                other, e.g. an arrow labelled "> 3"
 
 Levels, stubs and joins
 -----------------------
@@ -267,7 +267,8 @@ Every query block is drawn in the same diagram:
      values, ANY / ALL is an ordinary value label
    - UNION, UNION ALL, INTERSECT and MINUS branches are drawn one
      below the other, with the operator between them. The right
-     side of a MINUS only removes rows, so its columns get no ✓.
+     side of a MINUS only removes rows, so its columns get no check
+     mark.
      An ORDER BY of the whole set operation numbers the matching
      select list entry (by position, or by the first branch's
      names) in every branch that returns rows
