@@ -38,7 +38,7 @@ Run
 Options: -c (start in candle mode), -f (stay in the foreground), -r N
 (auto-refresh every N seconds, 0 = off, default 60), -p 1d|2d|5d|10d|20d
 (time span shown), -t (text prompt), -s (synthetic data, kept apart in
-~/.stock_tracker-synthetic), -d (re-download all price history), -v (more
+.stock_tracker-synthetic), -d (re-download all price history), -v (more
 messages), then any ticker symbols to put first on the watchlist.
 
 Stocks are shown in watchlist order, not alphabetically: the ones named
@@ -244,7 +244,10 @@ watchlist before trusting an alert.
 
 Files
 -----
-In ~/.stock_tracker:
+In the folder .stock_tracker next to stock_tracker.py (versions before
+26-Nov-2026 kept it in your home directory; the first run copies it next
+to the script, and the home folder is used only when the script's folder
+cannot be written to):
 
    watchlist.json   the watched stocks
    ledger.json      your trade log (buys and sells); a ledger written

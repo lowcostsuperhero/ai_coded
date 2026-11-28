@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# name: $Id: stock_tracker.py 3.main-3 16:27:45 26-Nov-2026 claude-opus-5-5 $
+# name: $Id: stock_tracker.py 4.main-4 00:37:40 28-Nov-2026 claude-opus-5-5 $
 # use: local INTRADAY stock tracker with a live chart window in the style
 #      of stock_ticker.py. It polls 5-minute bars
 #      for the stocks on its own watchlist (plus any open positions),
@@ -14,12 +14,17 @@
 #      Everything is computed on this machine. The only network traffic
 #      is the download of PUBLIC prices from Yahoo Finance through the
 #      yfinance package (ticker symbols only). The watchlist, trade log,
-#      settings and price cache live in ~/.stock_tracker.
-# usage: stock_tracker.py [-c] [-f] [-r seconds] [-p span] [-t] [-s] [-d]
-#                         [TICKER ...]
+#      settings and price cache live in the folder .stock_tracker next to
+#      this script.
+# usage: stock_tracker.py [-c] [-f] [-r seconds] [-p span] [-t [-m]] [-s]
+#                         [-d] [TICKER ...]
 #        returns to the command prompt once the chart window is open;
 #        -f keeps it in the foreground instead; -t opens the text prompt
 #        (stock_picker style: simulate, follow, asof, practice trades)
+#        and -m starts its monitor at once; orders can go to an Alpaca
+#        PAPER account (pip install alpaca-py; keys in the environment
+#        variables APCA_API_KEY_ID and APCA_API_SECRET_KEY, or else in
+#        .stock_tracker/alpaca_keys.txt next to this script)
 #        requires: pip install numpy pandas yfinance matplotlib
 #        tkinter ships with python (on RHEL/Alma/Oracle Linux:
 #        dnf install python3-tkinter)
@@ -38,12 +43,15 @@ import json
 import math
 import os
 import pickle
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
 import time
+import urllib.parse
+import uuid
 import warnings
 
 import numpy as np
@@ -51,6 +59,7 @@ import pandas as pd
 
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from zoneinfo import ZoneInfo
 
 warnings.filterwarnings("ignore")
@@ -66,7 +75,7 @@ E_WARN     = 1
 E_FAIL     = 2
 E_USAGE    = 3
 
-REVISION   = "$Revision: 3.main-3 $"
+REVISION   = "$Revision: 4.main-4 $"
 SELF       = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 SELFPREFIX = os.path.dirname(os.path.abspath(sys.argv[0]))
 
@@ -85,12 +94,24 @@ EXIT_NAMES = dict(target  = "profit target",
                   open    = "still open")
 SYNTH      = ["SYNA", "SYNB", "SYNC", "SYND"]
 
-HOME       = os.path.join(os.path.expanduser("~"), ".stock_tracker")
+                                # the data folder sits next to this
+                                # script; OLD_HOME is where versions
+                                # before 26-Nov-2026 kept it
+HOME       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          ".stock_tracker")
+OLD_HOME   = os.path.join(os.path.expanduser("~"), ".stock_tracker")
 INTRADAY   = os.path.join(HOME, "intraday.pkl")
 DAILY      = os.path.join(HOME, "daily.pkl")
 LEDGER     = os.path.join(HOME, "ledger.json")
 WATCH      = os.path.join(HOME, "watchlist.json")
 SETTINGS   = os.path.join(HOME, "settings.json")
+NAMES      = os.path.join(HOME, "names.json")
+LOOK       = os.path.join(HOME, "window.json")
+                                # the Alpaca keys, when they are not in
+                                # the environment; never written by this
+                                # program
+KEYS       = os.path.join(HOME, "alpaca_keys.txt")
+KEY_NAMES  = ("APCA_API_KEY_ID", "APCA_API_SECRET_KEY", "APCA_API_BASE_URL")
 
                                 # every tunable of the engine; 'set'
                                 # changes them and they are kept in
@@ -115,11 +136,21 @@ DEFAULTS = dict(poll         = 300,
                 t_flat       = 1.0,
                 eod_exit     = 0,
                 slip         = 0.05,
-                bell         = 1)
+                bell         = 1,
+                auto         = 0,
+                auto_mode    = 1,
+                auto_dollars = 1000.0,
+                auto_shares  = 1,
+                auto_pct     = 5.0,
+                auto_max     = 5,
+                auto_day_loss = 2.0,
+                auto_stop    = 1,
+                auto_eod     = 10)
 
 INTEGERS = ("poll", "skip_open", "no_buy_after", "confirm_bars",
             "trend_bars", "ahead_bars", "min_hold", "plateau_bars",
-            "eod_exit", "bell")
+            "eod_exit", "bell", "auto", "auto_mode", "auto_shares",
+            "auto_max", "auto_stop", "auto_eod")
 
 SETTING_HELP = dict(
    poll         = "seconds between 'monitor' polls (60 minimum)",
@@ -149,7 +180,23 @@ SETTING_HELP = dict(
    t_flat       = "plateau: trend t-statistic must be inside +/- this",
    eod_exit     = "1 = sell at the last bar of the day",
    slip         = "backtest slippage per side, percent",
-   bell         = "1 = ring the terminal bell on 'monitor' alerts")
+   bell         = "1 = ring the terminal bell on 'monitor' alerts",
+   auto         = "1 = trade the signals automatically in the Alpaca "
+                  "PAPER account",
+   auto_mode    = "automatic trade size: 1 = auto_dollars per trade, 2 = "
+                  "auto_shares, 3 = auto_pct of the account",
+   auto_dollars = "dollars per automatic buy (auto_mode 1)",
+   auto_shares  = "shares per automatic buy (auto_mode 2)",
+   auto_pct     = "percent of the account's equity per automatic buy "
+                  "(auto_mode 3)",
+   auto_max     = "most stocks held by automatic trading at once",
+   auto_day_loss = "no automatic buys once the account is down this many "
+                   "percent today (0 = no limit)",
+   auto_stop    = "1 = protect each automatic buy with a trailing stop "
+                  "held by Alpaca (trail_atr)",
+   auto_eod     = "minutes before the close when automatic lots whose "
+                  "stop is not above the buy price are sold; the others "
+                  "are held overnight (0 = hold all)")
 
                                 # command help in the layout of
                                 # stock_picker.py: the command and its
@@ -183,6 +230,17 @@ HELP = dict(
    edittrade="edittrade # [shares=N] [price=P] [time=YYYY-MM-DD HH:MM]\n"
              "                          correct a trade after the fact",
    deltrade="deltrade #           remove a trade recorded by mistake",
+   alpaca="alpaca               the Alpaca PAPER account: equity, cash, "
+          "positions,\n                          open orders and automatic "
+          "trading settings",
+   order="order buy|sell TICKER [shares] [limit]   send an order to the "
+         "Alpaca\n                          PAPER account (1 share at the "
+         "market by default)",
+   autotrade="autotrade [on|off]   trade the signals automatically in the "
+             "Alpaca PAPER\n                          account (while "
+             "'monitor' runs or the window refreshes)",
+   sync="sync                 record the Alpaca orders filled lately in "
+        "the trade log",
    realpositions="realpositions        the real ledger's open positions and "
                  "SELL/HOLD on the\n                          latest bar "
                  "(ignores asof)",
@@ -206,6 +264,9 @@ HELP = dict(
    watch="watch TICKER ...    add stocks to the watchlist",
    unwatch="unwatch TICKER ...  remove stocks from the watchlist",
    watchlist="watchlist            price and data of the watched stocks",
+   screen="screen [N]           stocks worth watching (stock_screener.py): "
+          "the N strongest\n                          large stocks in an "
+          "up trend, and how such picks did",
    refresh="refresh              re-download price history",
    set="set NAME VALUE       change a setting ('set' alone lists them, "
        "'set NAME\n                          default' resets one)",
@@ -214,9 +275,11 @@ HELP = dict(
 
 HELP_ORDER = ("asof", "nextbar", "nextday", "recommend", "track", "buy",
               "sell", "positions", "pnl", "trades", "edittrade",
-              "deltrade", "realpositions", "savepositions",
+              "deltrade", "alpaca", "order", "autotrade", "sync",
+              "realpositions", "savepositions",
               "compare", "range", "follow", "monitor", "simulate", "watch",
-              "unwatch", "watchlist", "refresh", "set", "status", "quit")
+              "unwatch", "watchlist", "screen", "refresh", "set", "status",
+              "quit")
 
 ###########################################################################
 ###
@@ -251,13 +314,40 @@ def set_home(path):
    use: points every persistent file at another directory
    imp: used by -s so synthetic test data never mixes with real files
    """
-   global HOME, INTRADAY, DAILY, LEDGER, WATCH, SETTINGS
+   global HOME, INTRADAY, DAILY, LEDGER, WATCH, SETTINGS, NAMES, LOOK
    HOME     = path
    INTRADAY = os.path.join(HOME, "intraday.pkl")
    DAILY    = os.path.join(HOME, "daily.pkl")
    LEDGER   = os.path.join(HOME, "ledger.json")
    WATCH    = os.path.join(HOME, "watchlist.json")
    SETTINGS = os.path.join(HOME, "settings.json")
+   NAMES    = os.path.join(HOME, "names.json")
+   LOOK     = os.path.join(HOME, "window.json")
+
+###########################################################################
+def find_home():
+   """
+   name: find_home
+   use: makes sure the data folder next to this script exists
+   post: the first time, a data folder left in the home directory by an
+         older version is copied there (the old one is not touched); if
+         the script's folder cannot be written to, the data folder in
+         the home directory is used instead, with a warning
+   """
+   if (os.path.isdir(HOME)):
+      return
+   try:
+      if (os.path.isdir(OLD_HOME)):
+         shutil.copytree(OLD_HOME, HOME)
+         print("%s: copied your data from %s to %s; the old folder is no "
+               "longer used and can be deleted" % (SELF, OLD_HOME, HOME),
+               file = sys.stderr)
+      else:
+         os.makedirs(HOME)
+   except OSError as error:
+      print("%s: cannot use %s (%s); using %s instead" % (
+         SELF, HOME, error.strerror or error, OLD_HOME), file = sys.stderr)
+      set_home(OLD_HOME)
 
 ###########################################################################
 def load_json(path, default):
@@ -345,6 +435,24 @@ def hhmm(ts):
    use: the HH:MM of a timestamp
    """
    return(ts.strftime("%H:%M"))
+
+###########################################################################
+def screener():
+   """
+   name: screener
+   use: stock_screener.py, imported from this script's folder
+   post: returns the module; raises ExceptionClass when it is missing
+   imp: imported on first use only, so stock_tracker works without it
+        until a screen is asked for
+   """
+   if (SELFPREFIX not in sys.path):
+      sys.path.insert(0, SELFPREFIX)
+   try:
+      import stock_screener
+   except ImportError as error:
+      raise(ExceptionClass("stock_screener.py is needed in %s to find "
+                           "stocks (%s)" % (SELFPREFIX, error)))
+   return(stock_screener)
 
 ###########################################################################
 def market_open(now):
@@ -588,6 +696,23 @@ class Source(object):
       for df in got.values():
          df.index = df.index.normalize()
       return(got)
+
+   ########################################################################
+   def company(self, ticker):
+      """
+      name: company
+      use: the name of the company behind a ticker
+      post: returns the name, or None when Yahoo does not know it
+      imp: one request to Yahoo per ticker, so callers cache the answer
+      """
+      if (self.synthetic):
+         return("Synthetic test stock %s (made-up prices)" % ticker)
+      try:
+         import yfinance as yf
+         info = yf.Ticker(ticker).info or {}
+      except Exception:
+         return(None)
+      return(info.get("longName") or info.get("shortName"))
 
 ###########################################################################
 ###
@@ -1094,7 +1219,9 @@ def load_ledger(path):
    """
    name: load_ledger
    use: reads the trade log
-   post: returns the list of trades; a ledger written by an older
+   post: returns (trades, alpaca): the list of trades, and what is kept
+         about Alpaca orders (see sync_broker); a ledger written by an
+         older
          version (a list of positions, each sold one carrying exit_time
          and exit_price) is converted to trades, and the old file is
          kept once as <ledger>.v1
@@ -1103,7 +1230,7 @@ def load_ledger(path):
    """
    data = load_json(path, dict(version = 2, trades = []))
    if (isinstance(data, dict)):
-      return(data.get("trades", []))
+      return(data.get("trades", []), data.get("alpaca", {}))
    trades = []
    nid = max([q.get("id", 0) for q in data] + [0])
    for q in data:
@@ -1120,7 +1247,308 @@ def load_ledger(path):
    if (data and not os.path.exists(path + ".v1")):
       os.replace(path, path + ".v1")
       dump_json(path, dict(version = 2, trades = trades))
-   return(trades)
+   return(trades, {})
+
+###########################################################################
+###
+### t h e    A l p a c a    p a p e r    a c c o u n t
+###
+###########################################################################
+
+def value(x):
+   """
+   name: value
+   use: the plain value of an alpaca-py enum (e.g. "filled"), or x
+   """
+   return(getattr(x, "value", x))
+
+###########################################################################
+class Broker(object):
+   """
+   name: Broker
+   use: orders, positions and the account at Alpaca, through the
+        alpaca-py package (pip install alpaca-py); PAPER trading only
+   usage: the paper keys come from the environment variables
+          APCA_API_KEY_ID and APCA_API_SECRET_KEY, or else from the file
+          alpaca_keys.txt in the data folder (see keys);
+          APCA_API_BASE_URL may point at a test server, but never at the
+          live trading host
+   imp: every order this program places gets a client order id starting
+        "st-": st-man- (placed by you in the dialogs or with 'order'),
+        st-auto- (automatic trading) and st-stop- (trailing stops placed
+        for automatic buys); orders placed elsewhere (e.g. on Alpaca's
+        web site) are recorded too when they fill
+   """
+
+   LIVE = "api.alpaca.markets"
+
+   ########################################################################
+   def __init__(self):
+      self.client = None
+      self.error  = None
+      self.origin = None
+
+   ########################################################################
+   def keys(self):
+      """
+      name: keys
+      use: the Alpaca keys: each from the environment if it is set there,
+           otherwise from the file alpaca_keys.txt in the data folder
+      usage: the file holds lines of NAME = value, e.g.
+                APCA_API_KEY_ID     = PK...
+                APCA_API_SECRET_KEY = ...
+             blank lines and lines starting with # are ignored, and
+             quotes around a value are dropped
+      post: returns {name: value} of the names found; self.origin says
+            where they came from
+      imp: the file in the data folder next to the script is read; with
+           -s (whose data folder is .stock_tracker-synthetic) and when
+           the home-directory folder is in use, the file there is read
+           if the first one does not exist
+      """
+      found = {}
+      for n in KEY_NAMES:
+         if (os.environ.get(n)):
+            found[n] = os.environ[n]
+      where = set(["environment"] if (found) else [])
+      if (len([n for n in KEY_NAMES[:2] if (n in found)]) < 2):
+         for path in unique([KEYS, os.path.join(HOME, "alpaca_keys.txt")]):
+            if (not os.path.isfile(path)):
+               continue
+            try:
+               with open(path) as f:
+                  lines = f.read().splitlines()
+            except OSError as error:
+               self.error = "cannot read %s: %s" % (path, error)
+               break
+            for line in lines:
+               line = line.strip()
+               if (not line or line.startswith("#") or "=" not in line):
+                  continue
+               n, v = [x.strip() for x in line.split("=", 1)]
+               v = v.strip("\"'")
+               if (n in KEY_NAMES and v and n not in found):
+                  found[n] = v
+                  where.add(path)
+            break
+      self.origin = " and ".join(sorted(where)) or None
+      return(found)
+
+   ########################################################################
+   def ready(self):
+      """
+      name: ready
+      use: predicate; is the paper account reachable
+      post: False with the reason in self.error when the keys or the
+            package are missing, or the URL is a live one
+      """
+      if (self.client is not None):
+         return(True)
+      found  = self.keys()
+      key    = found.get("APCA_API_KEY_ID")
+      secret = found.get("APCA_API_SECRET_KEY")
+      url    = found.get("APCA_API_BASE_URL") or None
+      if (not key or not secret):
+         self.error = ("Alpaca keys not set: set APCA_API_KEY_ID and "
+                       "APCA_API_SECRET_KEY to your PAPER keys, in the "
+                       "environment or in %s" % KEYS)
+         return(False)
+      if (url and urllib.parse.urlparse(url).hostname == self.LIVE):
+         self.error = ("APCA_API_BASE_URL points at LIVE trading; this "
+                       "program trades on the paper account only")
+         return(False)
+      try:
+         from alpaca.trading.client import TradingClient
+      except ImportError:
+         self.error = "missing package; run: pip install alpaca-py"
+         return(False)
+      try:
+         self.client = TradingClient(key, secret, paper = True,
+                                     url_override = url)
+      except Exception as error:
+         self.error = "cannot connect to Alpaca: %s" % error
+         return(False)
+      return(True)
+
+   ########################################################################
+   def call(self, what, method, *args, **kwargs):
+      """
+      name: call
+      use: one request to Alpaca
+      post: raises ExceptionClass saying what failed
+      """
+      if (not self.ready()):
+         raise(ExceptionClass(self.error))
+      try:
+         return(getattr(self.client, method)(*args, **kwargs))
+      except Exception as error:
+         raise(ExceptionClass("Alpaca %s failed: %s" % (what, error)))
+
+   ########################################################################
+   def account(self):
+      """
+      name: account
+      use: the paper account's number, equity, equity at the last close,
+           cash and buying power
+      """
+      a = self.call("account", "get_account")
+      return(dict(number = a.account_number, equity = float(a.equity),
+                  last = float(a.last_equity or a.equity),
+                  cash = float(a.cash),
+                  power = float(a.buying_power)))
+
+   ########################################################################
+   def is_open(self):
+      """
+      name: is_open
+      use: predicate; is the market open now (Alpaca's clock)
+      """
+      return(bool(self.call("clock", "get_clock").is_open))
+
+   ########################################################################
+   def clock(self):
+      """
+      name: clock
+      use: is the market open, and minutes until it closes
+      post: returns (is_open, minutes); minutes is None while closed.
+            Alpaca's clock knows the early closes (e.g. 13:00 the day
+            after Thanksgiving)
+      """
+      c = self.call("clock", "get_clock")
+      if (not c.is_open):
+         return(False, None)
+      return(True, (c.next_close - c.timestamp).total_seconds() / 60.0)
+
+   ########################################################################
+   def stop_price(self, order_id):
+      """
+      name: stop_price
+      use: the price at which a trailing stop now sells (its highest
+           price so far less the trail)
+      post: None when the order is no longer open or has no price yet
+      """
+      o = self.call("order status", "get_order_by_id", order_id)
+      if (value(o.status) in ("filled", "canceled", "expired",
+                              "rejected", "done_for_day") or
+          o.stop_price is None):
+         return(None)
+      return(float(o.stop_price))
+
+   ########################################################################
+   def positions(self):
+      """
+      name: positions
+      use: {ticker: shares} held in the paper account
+      """
+      return(dict((p.symbol, float(p.qty))
+                  for p in self.call("positions", "get_all_positions")))
+
+   ########################################################################
+   def submit(self, side, ticker, shares, limit = None, tag = "man"):
+      """
+      name: submit
+      use: places a day order to buy or sell: at the market, or at limit
+           when one is given
+      post: returns the order
+      """
+      from alpaca.trading.enums    import OrderSide, TimeInForce
+      from alpaca.trading.requests import LimitOrderRequest
+      from alpaca.trading.requests import MarketOrderRequest
+      args = dict(symbol = ticker, qty = shares,
+                  side = OrderSide.BUY if (side == "buy")
+                         else OrderSide.SELL,
+                  time_in_force = TimeInForce.DAY,
+                  client_order_id = "st-%s-%s-%s" % (
+                     tag, side, uuid.uuid4().hex[:16]))
+      if (limit):
+         req = LimitOrderRequest(limit_price = round(limit, 2), **args)
+      else:
+         req = MarketOrderRequest(**args)
+      return(self.call("order", "submit_order", order_data = req))
+
+   ########################################################################
+   def wait(self, order, seconds = 8.0):
+      """
+      name: wait
+      use: waits for an order to be filled (or to end otherwise)
+      post: returns the order as it then stands
+      """
+      end = time.time() + seconds
+      while (True):
+         order = self.call("order status", "get_order_by_id", order.id)
+         if (value(order.status) in ("filled", "canceled", "expired",
+                                     "rejected", "done_for_day")):
+            return(order)
+         if (time.time() > end):
+            return(order)
+         time.sleep(0.5)
+
+   ########################################################################
+   def trail(self, ticker, shares, distance):
+      """
+      name: trail
+      use: places a good-till-canceled trailing stop that sells shares
+           when the price falls distance dollars below its highest
+           price since the order was placed; it is held by Alpaca, so it
+           works while this program is not running
+      post: returns the order
+      """
+      from alpaca.trading.enums    import OrderSide, TimeInForce
+      from alpaca.trading.requests import TrailingStopOrderRequest
+      req = TrailingStopOrderRequest(
+               symbol = ticker, qty = int(shares), side = OrderSide.SELL,
+               time_in_force = TimeInForce.GTC,
+               trail_price = max(round(distance, 2), 0.01),
+               client_order_id = "st-stop-sell-%s" % uuid.uuid4().hex[:16])
+      return(self.call("trailing stop", "submit_order", order_data = req))
+
+   ########################################################################
+   def open_orders(self, ticker = None):
+      """
+      name: open_orders
+      use: orders not yet filled, of one ticker or all
+      """
+      from alpaca.trading.enums    import QueryOrderStatus
+      from alpaca.trading.requests import GetOrdersRequest
+      req = GetOrdersRequest(status = QueryOrderStatus.OPEN, limit = 500,
+                             symbols = [ticker] if (ticker) else None)
+      return(self.call("open orders", "get_orders", filter = req))
+
+   ########################################################################
+   def cancel_stops(self, ticker):
+      """
+      name: cancel_stops
+      use: cancels the trailing stops this program placed for ticker, so
+           its shares can be sold
+      post: returns how many were canceled; waits (up to 5 s) until
+            Alpaca no longer lists them
+      """
+      ids = [o.id for o in self.open_orders(ticker)
+             if ((o.client_order_id or "").startswith("st-stop"))]
+      for oid in ids:
+         self.call("cancel", "cancel_order_by_id", oid)
+      end = time.time() + 5
+      while (ids and time.time() < end):
+         left = set(o.id for o in self.open_orders(ticker))
+         if (not left & set(ids)):
+            break
+         time.sleep(0.5)
+      return(len(ids))
+
+   ########################################################################
+   def filled_since(self, after):
+      """
+      name: filled_since
+      use: orders filled (in whole or in part) since the UTC datetime
+           after, oldest first
+      """
+      from alpaca.trading.enums    import QueryOrderStatus
+      from alpaca.trading.requests import GetOrdersRequest
+      req = GetOrdersRequest(status = QueryOrderStatus.CLOSED, limit = 500,
+                             after = after)
+      out = [o for o in self.call("orders", "get_orders", filter = req)
+             if (float(o.filled_qty or 0) > 0 and o.filled_at)]
+      return(sorted(out, key = lambda o: o.filled_at))
 
 ###########################################################################
 ###
@@ -1152,7 +1580,24 @@ class Tracker(object):
       self.daily        = {}
       self.dtime        = 0.0
       self.synced       = 0.0
-      self.trades       = load_ledger(LEDGER)
+      self.trades, self.alpaca = load_ledger(LEDGER)
+                                # the Alpaca paper account (orders are
+                                # never sent with -s, unless
+                                # APCA_API_BASE_URL points at a test
+                                # server)
+      self.broker       = Broker()
+      if (synthetic and not os.environ.get("APCA_API_BASE_URL")):
+         self.broker.error = "no Alpaca orders with synthetic data (-s)"
+         self.broker.ready = lambda: False
+      self.acted        = set()
+      self.pending      = set()
+      self.noted        = set()
+                                # one Alpaca action at a time (the window
+                                # sends orders from worker threads)
+      self.lock         = threading.RLock()
+                                # company names, kept between sessions
+      self.names        = load_json(NAMES, {})
+      self.tried        = set()
       self.asof         = None
       self.pretend      = []
       if (synthetic and not os.path.exists(WATCH)):
@@ -1262,7 +1707,8 @@ class Tracker(object):
       name: save_ledger
       use: writes the trade log
       """
-      dump_json(LEDGER, dict(version = 2, trades = self.trades))
+      dump_json(LEDGER, dict(version = 2, trades = self.trades,
+                             alpaca = self.alpaca))
 
    ########################################################################
    def books(self, upto = True, practice = True):
@@ -1303,6 +1749,35 @@ class Tracker(object):
       use: how many shares of ticker are held at now()
       """
       return(sum(q["shares"] for q in self.held(ticker)))
+
+   ########################################################################
+   def name(self, ticker):
+      """
+      name: name
+      use: the company name of a ticker if it is known, else None
+      """
+      return(self.names.get(ticker))
+
+   ########################################################################
+   def lookup_names(self, tickers):
+      """
+      name: lookup_names
+      use: gets the company names not known yet from Yahoo and keeps them
+           in NAMES
+      post: each ticker is asked for once per session
+      imp: slow (one request per ticker); call it on a worker thread
+      """
+      new = 0
+      for t in unique(tickers):
+         if (t in self.names or t in self.tried):
+            continue
+         self.tried.add(t)
+         n = self.source.company(t)
+         if (n):
+            self.names[t] = n
+            new += 1
+      if (new and not self.synthetic):
+         dump_json(NAMES, dict(self.names))
 
    ########################################################################
    def practice(self):
@@ -1426,6 +1901,8 @@ class Tracker(object):
       if (x is None):
          raise(ExceptionClass("there is no trade #%s" % tid))
       self.check([y for y in self.trades + self.pretend if (y is not x)])
+      if (x.get("alpaca")):
+         self.alpaca.setdefault("skip", []).append(x["alpaca"])
       if (x.get("practice")):
          self.pretend = [y for y in self.pretend if (y is not x)]
       else:
@@ -1446,6 +1923,325 @@ class Tracker(object):
       self.pretend = []
       self.save_ledger()
       return(n)
+
+   ########################################################################
+   def note(self, text, say):
+      """
+      name: note
+      use: says text once per session (repeated warnings stay quiet)
+      """
+      if (text not in self.noted):
+         self.noted.add(text)
+         say(text)
+
+   ########################################################################
+   def _sync_broker(self, days = 30):
+      """
+      name: sync_broker
+      use: records in the trade log every Alpaca order filled in the last
+           days days that is not in it yet, with the price, shares and
+           time of the fill
+      post: returns how many trades were added; a buy keeps its daily
+            ATR and trailing stop when this program placed them
+      imp: an order is known by its Alpaca id (kept on the trade as
+           "alpaca"); a trade deleted from the log is remembered so the
+           next sync does not bring it back
+      """
+      if (self.asof is not None or not self.broker.ready()):
+         return(0)
+      after  = datetime.now(timezone.utc) - timedelta(days = days)
+      orders = self.broker.filled_since(after)
+      have   = set(x.get("alpaca") for x in self.trades)
+      skip   = set(self.alpaca.get("skip", []))
+      atrs   = self.alpaca.setdefault("atr", {})
+      stops  = self.alpaca.setdefault("stops", {})
+      new    = 0
+      for o in orders:
+         oid = str(o.id)
+         if (oid in have or oid in skip):
+            continue
+         side = value(o.side)
+         ids  = [x["id"] for x in self.trades + self.pretend]
+         x = dict(id = max(ids + [0]) + 1, ticker = o.symbol, side = side,
+                  time = o.filled_at.astimezone(TZ).strftime(
+                     "%Y-%m-%dT%H:%M"),
+                  shares = float(o.filled_qty),
+                  price = float(o.filled_avg_price), alpaca = oid)
+         if ((o.client_order_id or "").startswith(("st-auto", "st-stop"))):
+            x["auto"] = True
+         if (side == "buy"):
+            x.update(atr = atrs.get(oid), high = x["price"],
+                     stop_order = stops.get(oid))
+            self.pending.discard(o.symbol)
+         self.trades.append(x)
+         new += 1
+      if (new):
+         self.save_ledger()
+      return(new)
+
+   ########################################################################
+   def auto_qty(self, price, account):
+      """
+      name: auto_qty
+      use: whole shares for one automatic buy at price, by auto_mode:
+           1 auto_dollars, 2 auto_shares, 3 auto_pct of the equity
+      """
+      c = self.cfg
+      if (c["auto_mode"] == 2):
+         return(int(c["auto_shares"]))
+      if (c["auto_mode"] == 3):
+         return(int(account["equity"] * c["auto_pct"] / 100.0 // price))
+      return(int(c["auto_dollars"] // price))
+
+   ########################################################################
+   def _broker_order(self, side, t, shares, limit = None, tag = "man",
+                    atr = None):
+      """
+      name: broker_order
+      use: sends a buy or sell to the Alpaca paper account and records
+           the fill in the trade log
+      usage: limit None = at the market; tag "man" (by hand) or "auto";
+             atr (daily ATR) is kept with a buy for its stop and target
+      post: returns the order as it stands after up to 8 s; a sale first
+            cancels this program's trailing stops on the stock (so its
+            shares are free) and puts them back on what is left after;
+            raises ExceptionClass when Alpaca refuses
+      """
+      b = self.broker
+      if (side == "sell"):
+         self.unstop(t)
+      try:
+         o = b.submit(side, t, shares, limit, tag)
+         if (atr is not None and np.isfinite(atr)):
+            self.alpaca.setdefault("atr", {})[str(o.id)] = float(atr)
+            self.save_ledger()
+         o = b.wait(o)
+         if (value(o.status) != "filled"):
+            self.pending.add(t)
+         self.sync_broker(2)
+      finally:
+         if (side == "sell"):
+            self.restop(t)
+      return(o)
+
+   ########################################################################
+   def unstop(self, t):
+      """
+      name: unstop
+      use: cancels this program's trailing stops on t at Alpaca and
+           forgets them on the trades
+      """
+      if (self.broker.cancel_stops(t)):
+         for x in self.trades:
+            if (x["ticker"] == t and x.get("stop_order")):
+               x["stop_order"] = None
+         self.save_ledger()
+
+   ########################################################################
+   def stop_for(self, lot):
+      """
+      name: stop_for
+      use: places the Alpaca trailing stop for one automatic lot:
+           trail_atr x the lot's daily ATR below the highest price
+      """
+      c = self.cfg
+      atr = lot.get("atr")
+      if (not (c["auto_stop"] and c["trail_atr"] > 0 and atr and
+               np.isfinite(atr) and int(lot["shares"]) >= 1)):
+         return
+      s = self.broker.trail(lot["ticker"], int(lot["shares"]),
+                            c["trail_atr"] * atr)
+      lot["trade"]["stop_order"] = str(s.id)
+      self.alpaca.setdefault("stops", {})[lot["trade"]["alpaca"]] = \
+         str(s.id)
+      self.save_ledger()
+
+   ########################################################################
+   def restop(self, t):
+      """
+      name: restop
+      use: puts trailing stops back on the automatic lots of t that are
+           still held and have none
+      """
+      for lot in book(self.trades)[0]:
+         if (lot["ticker"] == t and lot["trade"].get("auto") and
+             lot["trade"].get("alpaca") and
+             not lot["trade"].get("stop_order")):
+            self.stop_for(lot)
+
+   ########################################################################
+   def _auto_step(self, evals, judged, say):
+      """
+      name: auto_step
+      use: automatic trading in the Alpaca paper account, once per
+           refresh: sells automatic lots whose signal says SELL, then
+           buys watched stocks with a fresh BUY signal
+      usage: evals {ticker: evaluate()} in watchlist order; judged
+             [(lot, judge_pos())] for the lots held; say(text) reports
+      post: does nothing at an as-of time, when auto is 0, when the
+            market is closed, or without a working paper account
+      imp: only lots bought automatically are sold automatically; a
+           lot protected by an Alpaca trailing stop is left to that stop
+           for the "trailing stop" exit. a stock is bought only when no
+           lot of it is held, at most auto_max stocks at once, on a
+           signal from a bar that closed in the last 10 minutes, once
+           per bar, and not after the day's loss limit. in the last
+           auto_eod minutes of the day there are no automatic buys, and
+           a lot is held overnight only if its stop is above its buy
+           price (the stop has locked in a profit); the others are sold
+      """
+      c = self.cfg
+      if (not c["auto"] or self.asof is not None):
+         return
+      if (not self.broker.ready()):
+         self.note("auto-trade: %s" % self.broker.error, say)
+         return
+      try:
+         is_open, left = self.broker.clock()
+         if (not is_open):
+            return
+         late = (c["auto_eod"] > 0 and left <= c["auto_eod"])
+         self.sync_broker(7)
+         for q, jp in judged:
+            if (jp is None or jp["act"] != "SELL" or
+                not q["trade"].get("auto")):
+               continue
+            if (jp["code"] == "stop" and q["trade"].get("stop_order")):
+               continue
+            key = ("sell", q["id"], str(jp["r"]["time"]))
+            if (key in self.acted):
+               continue
+            self.acted.add(key)
+            o = self.broker_order("sell", q["ticker"], q["shares"],
+                                  tag = "auto")
+            say("AUTO SELL %s %g sh: %s (%s)" % (
+               q["ticker"], q["shares"], value(o.status), jp["why"]))
+         if (late):
+            self.end_of_day(judged, say)
+            return
+         account = self.broker.account()
+         day = account["equity"] / account["last"] - 1
+         if (c["auto_day_loss"] > 0 and day <= -c["auto_day_loss"] / 100):
+            self.note("auto-trade: the account is %s today; no more "
+                      "automatic buys today (auto_day_loss %g%%)" % (
+                         pct(day), c["auto_day_loss"]), say)
+            return
+         lots   = self.held()
+         owned  = set(q["ticker"] for q in lots)
+         count  = len(set(q["ticker"] for q in lots
+                          if (q["trade"].get("auto"))))
+         now    = pd.Timestamp(self.source.now())
+         for t, ev in evals.items():
+            if (count >= c["auto_max"]):
+               break
+            r = ev.get("r")
+            if (not ev.get("kind") or r is None or t in owned or
+                t in self.pending):
+               continue
+            if (now - (r["time"] + pd.Timedelta(minutes = BAR_MIN)) >
+                pd.Timedelta(minutes = 10)):
+               continue
+            key = ("buy", t, str(r["time"]))
+            if (key in self.acted):
+               continue
+            self.acted.add(key)
+            qty = self.auto_qty(r["Close"], account)
+            if (qty < 1):
+               self.note("auto-trade: %s at %.2f is more than one trade's "
+                         "size allows" % (t, r["Close"]), say)
+               continue
+            o = self.broker_order("buy", t, qty, tag = "auto",
+                                  atr = r["atr"])
+            if (value(o.status) == "filled"):
+               for lot in book(self.trades)[0]:
+                  if (lot["trade"].get("alpaca") == str(o.id)):
+                     self.stop_for(lot)
+            say("AUTO BUY %s %d sh @ %s: %s (%s %s)" % (
+               t, qty, f2(float(o.filled_avg_price))
+               if (o.filled_avg_price) else "market", value(o.status),
+               "signal", KINDS[ev["kind"]]))
+            owned.add(t)
+            count += 1
+      except ExceptionClass as error:
+         say("auto-trade: %s" % error)
+
+   ########################################################################
+   def lot_stop(self, q, jp):
+      """
+      name: lot_stop
+      use: the price at which an automatic lot's trailing stop sells
+      post: the Alpaca stop's own price when it has one; otherwise the
+            program's own trailing stop (trail_atr ATRs below the peak);
+            None when there is neither
+      """
+      c = self.cfg
+      sid = q["trade"].get("stop_order")
+      if (sid):
+         px = self.broker.stop_price(sid)
+         if (px is not None):
+            return(px)
+      if (jp is None or c["trail_atr"] <= 0):
+         return(None)
+      return(jp["st"]["peak"] - c["trail_atr"] * jp["st"]["atr"])
+
+   ########################################################################
+   def end_of_day(self, judged, say):
+      """
+      name: end_of_day
+      use: near the close, decides for each automatic lot whether it is
+           held overnight
+      post: a lot whose stop is above its buy price is kept, protected
+            by its Alpaca stop; any other lot (stop at or below the buy,
+            or no stop) is sold at the market. once per lot per day
+      """
+      jps   = dict((q["id"], jp) for q, jp in judged)
+      today = str(datetime.now(TZ).date())
+      for q in book(self.trades)[0]:
+         if (not q["trade"].get("auto") or q["ticker"] in self.pending):
+            continue
+         key = ("eod", q["id"], today)
+         if (key in self.acted):
+            continue
+         self.acted.add(key)
+         stop = self.lot_stop(q, jps.get(q["id"]))
+         if (stop is not None and stop > q["entry_price"]):
+            say("HOLD %s %g sh overnight: stop %s is above the buy %s" % (
+               q["ticker"], q["shares"], f2(stop), f2(q["entry_price"])))
+            continue
+         o = self.broker_order("sell", q["ticker"], q["shares"],
+                               tag = "auto")
+         say("AUTO SELL %s %g sh: %s (end of day; stop %s is not above "
+             "the buy %s)" % (
+                q["ticker"], q["shares"], value(o.status),
+                "none" if (stop is None) else f2(stop),
+                f2(q["entry_price"])))
+
+   ########################################################################
+   def sync_broker(self, *args, **kwargs):
+      """
+      name: sync_broker
+      use: _sync_broker, one Alpaca action at a time
+      """
+      with self.lock:
+         return(self._sync_broker(*args, **kwargs))
+
+   ########################################################################
+   def broker_order(self, *args, **kwargs):
+      """
+      name: broker_order
+      use: _broker_order, one Alpaca action at a time
+      """
+      with self.lock:
+         return(self._broker_order(*args, **kwargs))
+
+   ########################################################################
+   def auto_step(self, *args, **kwargs):
+      """
+      name: auto_step
+      use: _auto_step, one Alpaca action at a time
+      """
+      with self.lock:
+         return(self._auto_step(*args, **kwargs))
 
    ########################################################################
    def sync(self, tickers = None, force = False):
@@ -1649,7 +2445,7 @@ class Shell(cmd.Cmd):
       use: the tickers named on a command line (upper case)
       """
       return([a.upper() for a in arg.replace(",", " ").split()
-              if (a.replace("-", "").replace(".", "").isalpha())])
+              if (a.replace("-", "").replace(".", "").isalnum())])
 
    ########################################################################
    def fresh(self, tickers = None):
@@ -2489,11 +3285,16 @@ class Shell(cmd.Cmd):
             sig = "BUY %s" % KINDS[e["kind"]] if (e["kind"]) else "-"
             self.alert((e["t"], None), sig, e["t"], e["r"], e["why"],
                        last)
+      judged = []
       for q in tr.held():
          jp = tr.judge_pos(q)
+         judged.append((q, jp))
          if (jp is not None):
             self.alert((q["ticker"], q["id"]), jp["act"], q["ticker"],
                        jp["r"], jp["why"], last)
+      if (tr.cfg["auto"]):
+         tr.auto_step(dict((e["t"], e) for e in ev
+                           if (e["t"] in tr.watch())), judged, print)
 
    ########################################################################
    def alert(self, key, sig, t, r, why, last):
@@ -2662,6 +3463,127 @@ class Shell(cmd.Cmd):
       print("%s = %s" % (k, a[1]))
 
    ########################################################################
+   def do_alpaca(self, arg):
+      tr, c = self.tr, self.tr.cfg
+      b = tr.broker
+      if (not b.ready()):
+         print("Alpaca: %s" % b.error)
+         return
+      try:
+         a    = b.account()
+         pos  = b.positions()
+         orders = b.open_orders()
+         is_open = b.is_open()
+         added = tr.sync_broker()
+      except ExceptionClass as error:
+         print("Alpaca: %s" % error)
+         return
+      print("Alpaca PAPER account %s, market %s (keys from %s)" % (
+         a["number"], "open" if (is_open) else "closed", b.origin))
+      print("   equity %s (%s today), cash %s, buying power %s" % (
+         format(a["equity"], ",.2f"), pct(a["equity"] / a["last"] - 1),
+         format(a["cash"], ",.2f"), format(a["power"], ",.2f")))
+      if (added):
+         print("   %d new fill%s recorded in the trade log" % (
+            added, "" if (added == 1) else "s"))
+      logged = {}
+      for q in book(tr.trades)[0]:
+         logged[q["ticker"]] = logged.get(q["ticker"], 0) + q["shares"]
+      for t in unique(list(pos) + list(logged)):
+         note = ("" if (abs(pos.get(t, 0) - logged.get(t, 0)) < 1e-6)
+                 else "  (trade log: %g)" % logged.get(t, 0))
+         print("   %-6s %g shares at Alpaca%s" % (t, pos.get(t, 0), note))
+      for o in orders:
+         print("   open order: %s %s %s %s%s" % (
+            value(o.side), o.qty, o.symbol, value(o.type),
+            " trail %s" % o.trail_price if (o.trail_price) else ""))
+      mode = {1: "%s dollars" % format(c["auto_dollars"], ",.0f"),
+              2: "%g shares" % c["auto_shares"],
+              3: "%g%% of the account" % c["auto_pct"]}[c["auto_mode"]]
+      print(textwrap.fill(
+         "Automatic trading %s: %s per buy, at most %d stocks, no buys "
+         "after a %g%% day loss, Alpaca trailing stops %s; %s." % (
+            "ON" if (c["auto"]) else "off", mode, c["auto_max"],
+            c["auto_day_loss"], "on" if (c["auto_stop"]) else "off",
+                 "%d minutes before the close, lots whose stop is not "
+                 "above the buy are sold, the rest held overnight" %
+                 c["auto_eod"] if (c["auto_eod"])
+            else "all lots held overnight"), 78))
+
+   ########################################################################
+   def do_order(self, arg):
+      tr = self.tr
+      a = arg.split()
+      usage = "usage: order buy|sell TICKER [shares] [limit price]"
+      if (tr.asof is not None):
+         print("No Alpaca orders at an as-of time ('asof now' first).")
+         return
+      try:
+         side, t = a[0].lower(), a[1].upper()
+         shares = float(a[2]) if (len(a) > 2) else 1.0
+         limit  = float(a[3]) if (len(a) > 3) else None
+         assert (side in ("buy", "sell") and shares > 0)
+      except (IndexError, ValueError, AssertionError):
+         print(usage)
+         return
+      df = tr.frame(t) if (side == "buy") else None
+      atr = float(df["atr"].iloc[-1]) if (df is not None) else None
+      try:
+         o = tr.broker_order(side, t, shares, limit, atr = atr)
+      except ExceptionClass as error:
+         print("Not sent: %s" % error)
+         return
+      print("Alpaca %s order for %g %s: %s%s" % (
+         side, shares, t, value(o.status),
+         " at %s" % o.filled_avg_price if (o.filled_avg_price) else ""))
+
+   ########################################################################
+   def do_autotrade(self, arg):
+      tr = self.tr
+      a = arg.strip().lower()
+      if (a in ("on", "off")):
+         if (a == "on" and not tr.broker.ready()):
+            print("Cannot: %s" % tr.broker.error)
+            return
+         tr.cfg["auto"] = 1 if (a == "on") else 0
+         tr.save_settings()
+      elif (a):
+         print("usage: autotrade [on|off]")
+         return
+      print("Automatic trading in the Alpaca PAPER account is %s%s" % (
+         "ON" if (tr.cfg["auto"]) else "off",
+         "; it acts while 'monitor' runs" if (tr.cfg["auto"]) else ""))
+
+   ########################################################################
+   def do_sync(self, arg):
+      try:
+         n = self.tr.sync_broker()
+      except ExceptionClass as error:
+         print("Alpaca: %s" % error)
+         return
+      if (not self.tr.broker.ready()):
+         print("Alpaca: %s" % self.tr.broker.error)
+         return
+      print("%d new Alpaca fill%s recorded." % (n, "" if (n == 1) else "s"))
+
+   ########################################################################
+   def do_screen(self, arg):
+      tr = self.tr
+      n = int(arg) if (arg.strip().isdigit()) else 15
+      try:
+         sc  = screener()
+         res = sc.screen(top = n, fake = tr.synthetic)
+      except Exception as error:
+         print("Cannot screen: %s" % error)
+         return
+      print("")
+      print("\n".join(sc.report(res, set(tr.watch()))))
+      new = [p["ticker"] for p in res["picks"]
+             if (p["ticker"] not in tr.watch())]
+      if (new):
+         print("\nTo follow some of them: watch %s" % " ".join(new[:5]))
+
+   ########################################################################
    def do_refresh(self, arg):
       tr = self.tr
       if (not tr.tickers()):
@@ -2725,6 +3647,11 @@ QUOTE_COLUMNS = [("w", (4, 4)),
                                 # crosshair shows only when the mouse is
                                 # this many screen pixels from a bar
 NEAR      = 20
+                                # with charts side by side the price and
+                                # volume scales are drawn inside the
+                                # chart, this many points from its edge
+INSET     = 38
+VOL_INSET = 28
                                 # horizontal grid: panel split into 3, 6,
                                 # 9.. equal gaps, as many as fit with each
                                 # gap at least this many pixels tall
@@ -2739,6 +3666,14 @@ SPANS     = {"1d"  : 1,
              "5d"  : 5,
              "10d" : 10,
              "20d" : 20}
+
+                                # charts side by side (Columns: box)
+COLUMNS   = ["1", "2", "3", "4"]
+                                # automatic trade size: the choices of
+                                # the Trade size box (auto_mode 1, 2, 3)
+                                # and the setting each one uses
+SIZE_MODES = ["$ per trade", "shares per trade", "% of account"]
+SIZE_KEYS  = ["auto_dollars", "auto_shares", "auto_pct"]
 
                                 # auto-refresh choices, label => seconds
 REFRESH   = {"5s"  : 5,
@@ -2866,6 +3801,58 @@ def grid_locator():
    return(GridLocator())
 
 ###########################################################################
+class Tooltip(object):
+   """
+   name: Tooltip
+   use: a small pale box of text next to the mouse pointer
+   """
+
+   ########################################################################
+   def __init__(self, root):
+      self.root = root
+      self.win  = None
+      self.text = None
+      self.key  = None
+
+   ########################################################################
+   def show(self, text, key = None):
+      """
+      name: show
+      use: shows text just below and right of the mouse pointer
+      usage: key names what the tip is about (e.g. a ticker), see shown
+      """
+      x, y = self.root.winfo_pointerxy()
+      self.key = key
+      if (self.win is None):
+         self.win = tkinter.Toplevel(self.root)
+         self.win.overrideredirect(True)
+         self.label = tkinter.Label(self.win, justify = "left",
+                                    background = "#ffffe0",
+                                    relief = "solid", borderwidth = 1,
+                                    padx = 6, pady = 2,
+                                    font = ("TkDefaultFont", 10))
+         self.label.pack()
+      if (text != self.text):
+         self.text = text
+         self.label.configure(text = text)
+      self.win.geometry("+%d+%d" % (x + 14, y + 16))
+      self.win.lift()
+
+   ########################################################################
+   def shown(self, key = None):
+      """
+      name: shown
+      use: predicate; is a tip showing (about key, when key is given)
+      """
+      return(self.win is not None and (key is None or key == self.key))
+
+   ########################################################################
+   def hide(self):
+      if (self.win is not None):
+         self.win.destroy()
+      self.win, self.text, self.key = None, None, None
+
+###########################################################################
 class TrackerWindow(object):
    """
    name: TrackerWindow
@@ -2882,8 +3869,25 @@ class TrackerWindow(object):
    """
 
    ########################################################################
-   def __init__(self, root, tracker, refresh_seconds = 60, chart = "Line",
-                span = "1d", reload = False):
+   def __init__(self, root, tracker, refresh_seconds = None, chart = None,
+                span = None, reload = False):
+                                # how the window looked when it was last
+                                # closed; the command-line options win
+      look = load_json(LOOK, {})
+      if (chart not in CHARTS):
+         chart = look.get("chart") if (look.get("chart") in CHARTS) \
+                 else "Line"
+      if (span not in SPANS):
+         span = look.get("span") if (look.get("span") in SPANS) else "1d"
+      if (refresh_seconds is None):
+         refresh_seconds = look.get("refresh", 60)
+         if (not isinstance(refresh_seconds, int) or refresh_seconds < 0):
+            refresh_seconds = 60
+      columns = str(look.get("columns", "1"))
+      if (columns not in COLUMNS):
+         columns = "1"
+      self.list_hidden = bool(look.get("list_hidden", False))
+      self.list_height = look.get("list_height")
       self.tr        = tracker
                                 # -d: the first fetch re-downloads all
                                 # history, after the window is open
@@ -2905,9 +3909,26 @@ class TrackerWindow(object):
       self.prices    = {}
       self.atrs      = {}
       self.trades_win = None
+      self.screen_win = None
+      self.results    = None
+                                # company-name tips, and the chart being
+                                # dragged to a new place in the grid
+      self.tip        = Tooltip(root)
+      self.looking    = set()
+      self.drag       = None
+      self.cells      = []
+      self.pending    = False
+      self.typing     = None
+      self.grid       = (1, 1)
+      self.narrow     = False
 
       root.title("Stock Tracker")
-      root.geometry("1350x820")
+      root.geometry(look.get("geometry") or "1350x820")
+      if (look.get("zoomed")):
+         try:
+            root.state("zoomed")
+         except tkinter.TclError:
+            pass
 
       ###
       ### row 1: what to track
@@ -2919,14 +3940,19 @@ class TrackerWindow(object):
       self.ticker_var = tkinter.StringVar(value = " ".join(tracker.watch()))
       entry = ttk.Entry(bar, textvariable = self.ticker_var, width = 30)
       entry.pack(side = tkinter.LEFT, padx = (4, 10))
-      entry.bind("<Return>", lambda event: self.refresh())
+                                # Enter (or leaving the box) applies the
+                                # list; a stock deleted from it drops off
+                                # the chart as soon as typing pauses
+      entry.bind("<Return>", lambda event: self.apply_tickers())
+      entry.bind("<FocusOut>", lambda event: self.apply_tickers(False))
+      entry.bind("<KeyRelease>", self.typed)
 
       self.chart_var = tkinter.StringVar(value = chart)
       self.combo(bar, "Chart:", self.chart_var, CHARTS, 8,
-                 lambda event: self.refresh())
+                 lambda event: (self.save_look(), self.refresh()))
 
       ttk.Button(bar, text = "Refresh now",
-                 command = self.refresh).pack(side = tkinter.LEFT,
+                 command = self.apply_tickers).pack(side = tkinter.LEFT,
                                               padx = 4)
       ttk.Button(bar, text = "Record buy...",
                  command = self.record_buy).pack(side = tkinter.LEFT,
@@ -2936,6 +3962,9 @@ class TrackerWindow(object):
                                                   padx = 4)
       ttk.Button(bar, text = "Trades / P&L...",
                  command = self.show_trades).pack(side = tkinter.LEFT,
+                                                  padx = 4)
+      ttk.Button(bar, text = "Find stocks...",
+                 command = self.find_stocks).pack(side = tkinter.LEFT,
                                                   padx = 4)
 
       self.status_var = tkinter.StringVar(value = "")
@@ -2950,34 +3979,107 @@ class TrackerWindow(object):
 
       self.span_var = tkinter.StringVar(value = span)
       self.combo(bar, "Time span:", self.span_var, list(SPANS), 5,
-                 lambda event: self.refresh())
+                 lambda event: (self.save_look(), self.refresh()))
                                 # the signals are built on 5-minute bars,
                                 # so that is the only bar size offered
       self.interval_var = tkinter.StringVar(value = "5m")
       self.combo(bar, "Bar size:", self.interval_var, ["5m"], 5,
                  lambda event: None)
+                                # charts side by side: n columns, each
+                                # 1/n of the width, filled left to right
+                                # then down
+      self.columns_var = tkinter.StringVar(value = columns)
+      self.combo(bar, "Columns:", self.columns_var, COLUMNS, 3,
+                 lambda event: (self.save_look(), self.redraw()))
 
       self.refresh_var = tkinter.StringVar(
                             value = seconds_label(refresh_seconds))
       self.combo(bar, "Auto-refresh every:", self.refresh_var,
-                 list(REFRESH), 5, lambda event: self.schedule())
+                 list(REFRESH), 5,
+                 lambda event: (self.save_look(), self.schedule()))
+      self.list_button = ttk.Button(bar, width = 18,
+                                    command = self.toggle_list)
+      self.list_button.pack(side = tkinter.RIGHT)
 
       ###
-      ### row 3: latest quote per ticker; row 4: hover readout; row 5:
-      ### alerts
+      ### row 3: the Alpaca paper account and automatic trading
       ###
-      self.quote_frame = ttk.Frame(root, padding = (6, 0))
-      self.quote_frame.pack(side = tkinter.TOP, fill = tkinter.X)
+      bar = ttk.Frame(root, padding = (6, 0, 6, 4))
+      bar.pack(side = tkinter.TOP, fill = tkinter.X)
+      c = tracker.cfg
+      ttk.Label(bar, text = "Alpaca paper:").pack(side = tkinter.LEFT)
+      self.auto_var = tkinter.BooleanVar(value = bool(c["auto"]))
+      ttk.Checkbutton(bar, text = "Auto-trade", variable = self.auto_var,
+                      command = self.auto_changed).pack(
+                         side = tkinter.LEFT, padx = (6, 12))
+      self.mode_var = tkinter.StringVar(
+                         value = SIZE_MODES[int(c["auto_mode"]) - 1])
+      self.combo(bar, "Trade size:", self.mode_var, SIZE_MODES, 15,
+                 lambda event: self.mode_changed())
+      self.size_var = tkinter.StringVar(value = self.size_text())
+      size = ttk.Entry(bar, textvariable = self.size_var, width = 8)
+      size.pack(side = tkinter.LEFT, padx = (0, 12))
+      size.bind("<Return>", self.size_changed)
+      size.bind("<FocusOut>", self.size_changed)
+      ttk.Label(bar, text = "Max stocks:").pack(side = tkinter.LEFT)
+      self.max_var = tkinter.StringVar(value = str(c["auto_max"]))
+      most = ttk.Spinbox(bar, from_ = 1, to = 50, width = 4,
+                         textvariable = self.max_var,
+                         command = self.max_changed)
+      most.pack(side = tkinter.LEFT, padx = (4, 12))
+      most.bind("<Return>", lambda event: self.max_changed())
+      most.bind("<FocusOut>", lambda event: self.max_changed())
+      self.acct_var = tkinter.StringVar(value = "")
+      ttk.Label(bar, textvariable = self.acct_var,
+                foreground = "gray").pack(side = tkinter.LEFT)
+      self.acct_text = ""
+      self.auto_msgs = []
+
+      ###
+      ### below the controls, a pane that can be resized by dragging the
+      ### bar under it (or hidden): the latest quote per ticker, with a
+      ### scroll bar when they do not all fit; then the hover readout,
+      ### always shown, as the divider; then alerts and the charts
+      ###
+      self.panes = tkinter.PanedWindow(root, orient = tkinter.VERTICAL,
+                                       sashwidth = 6, sashrelief = "raised",
+                                       borderwidth = 0, opaqueresize = True)
+      self.panes.pack(side = tkinter.TOP, fill = tkinter.BOTH,
+                      expand = True)
+      self.panes.bind("<ButtonRelease-1>", self.list_resized)
+      back = ttk.Style().lookup("TFrame", "background") or None
+      self.list_pane = tkinter.Frame(self.panes)
+      self.list_view = tkinter.Canvas(self.list_pane, borderwidth = 0,
+                                      highlightthickness = 0,
+                                      background = back, height = 60)
+      self.list_bar  = ttk.Scrollbar(self.list_pane, orient = "vertical",
+                                     command = self.list_view.yview)
+      self.list_view.configure(yscrollcommand = self.list_bar.set)
+      self.list_view.pack(side = tkinter.LEFT, fill = tkinter.BOTH,
+                          expand = True)
+      self.quote_frame = ttk.Frame(self.list_view, padding = (6, 0))
+      self.list_view.create_window((0, 0), window = self.quote_frame,
+                                   anchor = "nw")
+      self.quote_frame.bind("<Configure>", lambda event: self.list_fit())
+      self.list_view.bind("<Configure>", lambda event: self.list_fit())
+                                # the mouse wheel scrolls the list when
+                                # the pointer is over it
+      for wheel in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+         root.bind_all(wheel, self.list_wheel, add = "+")
+      lower = tkinter.Frame(self.panes)
+      self.panes.add(self.list_pane, minsize = 20, stretch = "never")
+      self.panes.add(lower, minsize = 120, stretch = "always")
+      self.lower = lower
 
       self.hover_var = tkinter.StringVar(value = HINT)
-      self.hover     = tkinter.Label(root, textvariable = self.hover_var,
+      self.hover     = tkinter.Label(lower, textvariable = self.hover_var,
                                      anchor = "w", padx = 8, pady = 3,
                                      font = ("TkFixedFont", 11),
                                      background = "#20242c",
                                      foreground = "#e0e0e0")
       self.hover.pack(side = tkinter.TOP, fill = tkinter.X)
 
-      self.alerts = tkinter.Text(root, height = 5, wrap = "word",
+      self.alerts = tkinter.Text(lower, height = 5, wrap = "word",
                                  font = ("TkFixedFont", 10),
                                  background = "#f7f7f7",
                                  relief = "flat", padx = 8, pady = 3)
@@ -2990,13 +4092,16 @@ class TrackerWindow(object):
       self.alerts.pack(side = tkinter.TOP, fill = tkinter.X)
 
       self.figure = Figure(figsize = (10, 5), dpi = 100)
-      self.canvas = FigureCanvasTkAgg(self.figure, master = root)
-      NavigationToolbar2Tk(self.canvas, root)
+      self.canvas  = FigureCanvasTkAgg(self.figure, master = lower)
+      self.toolbar = NavigationToolbar2Tk(self.canvas, lower)
       self.canvas.get_tk_widget().pack(fill = tkinter.BOTH, expand = True)
-      self.canvas.mpl_connect("motion_notify_event", self.on_hover)
-      self.canvas.mpl_connect("axes_leave_event",    self.on_leave)
+      self.canvas.mpl_connect("motion_notify_event",  self.on_hover)
+      self.canvas.mpl_connect("axes_leave_event",     self.on_leave)
+      self.canvas.mpl_connect("button_press_event",   self.drag_start)
+      self.canvas.mpl_connect("button_release_event", self.drag_end)
 
       root.protocol("WM_DELETE_WINDOW", self.close)
+      self.show_list(not self.list_hidden)
       self.refresh()
 
    ########################################################################
@@ -3031,6 +4136,9 @@ class TrackerWindow(object):
       post: the ticker entry becomes the watchlist
       """
       if (self.busy):
+                                # run again when the fetch under way is
+                                # drawn, so a change is not lost
+         self.pending = True
          return
       symbols = self.tickers()
       if (not symbols):
@@ -3060,6 +4168,10 @@ class TrackerWindow(object):
          if (tr.synthetic and not self.first):
             tr.source.advance()
          self.first = False
+         try:
+            tr.sync_broker(7)
+         except ExceptionClass as error:
+            self.acct_text = str(error)
          held = [t for t in tr.tickers() if (t not in symbols)]
          tr.sync(symbols + held, force = self.reload)
          self.reload = False
@@ -3074,9 +4186,16 @@ class TrackerWindow(object):
                pos.append((q, tr.judge_pos(q)))
             results[t] = dict(df = df, kind = buy_signals(df, tr.cfg),
                               ev = tr.evaluate(t), pos = pos)
+         self.trade_step(results)
       except Exception as exception:
          results = dict((t, f"error: {exception}") for t in symbols)
       self.root.after(0, self.draw, results)
+                                # company names for the tips, after the
+                                # chart (one slow request per new ticker)
+      try:
+         tr.lookup_names(symbols + tr.tickers())
+      except Exception:
+         pass
 
    ########################################################################
    def draw(self, results):
@@ -3086,7 +4205,26 @@ class TrackerWindow(object):
       post: every symbol gets a panel; one with no data yet gets an empty
             panel that the next auto-refresh fills in
       """
-      self.busy = False
+      self.busy    = False
+      self.acct_var.set(self.acct_text)
+      while (self.auto_msgs):
+         text = self.auto_msgs.pop(0)
+         self.alerts.configure(state = "normal")
+         self.alerts.insert("2.0", "%s  " % time.strftime("%H:%M"), "why",
+                            text + "\n", "SELL" if ("SELL" in text)
+                            else "BUY" if ("BUY" in text) else "why")
+         self.alerts.configure(state = "disabled")
+                                # charts in the order of the Ticker(s)
+                                # box, which dragging a chart changes;
+                                # a stock taken out of the box is left
+                                # out (unless it is held)
+      keep         = set(self.tickers()) | set(q["ticker"]
+                                               for q in self.tr.held())
+      results      = dict((t, results[t])
+                          for t in unique(self.tickers() + list(results))
+                          if (t in results and t in keep))
+      self.results = results
+      self.cells   = []
       for child in self.quote_frame.winfo_children():
          child.destroy()
       self.figure.clear()
@@ -3116,18 +4254,38 @@ class TrackerWindow(object):
       for view in views.values():
          self.timeline = self.timeline.union(view.index)
 
-      top = None
+      top   = None
+      count = len(results)
+      cols  = min(int(self.columns_var.get()), max(count, 1))
+      rows  = -(-count // cols)
+      self.narrow = (cols > 1)
       for symbol, res in results.items():
          if (not isinstance(res, str)):
             self.prices[symbol] = float(res["df"]["Close"].iloc[-1])
             self.atrs[symbol]   = float(res["df"]["atr"].iloc[-1])
       for number, (symbol, res) in enumerate(results.items(), 1):
-         axes = self.figure.add_subplot(len(results), 1, number,
-                                        sharex = top)
+         axes = self.figure.add_subplot(rows, cols, number, sharex = top)
          top  = top or axes
-         axes.set_ylabel(symbol)
+                                # the symbol to the left of the chart in
+                                # one column; above it in several, to
+                                # leave the width to the chart
+         if (cols > 1):
+            label = axes.set_title(symbol, loc = "left", fontsize = 10,
+                                   fontweight = "bold", pad = 3)
+         else:
+            axes.set_ylabel(symbol)
+            label = axes.yaxis.label
+         self.cells.append((axes, symbol, label))
+         axes.tick_params(axis = "y", labelsize = 8)
+         if (self.narrow):
+                                # side by side, the price scale is drawn
+                                # inside the chart's left edge so the
+                                # charts can be wider
+            axes.tick_params(axis = "y", length = 0, pad = -INSET)
          axes.grid(True, alpha = 0.3)
-         if (number < len(results)):
+                                # time labels only under the bottom row
+                                # (every chart shares the same times)
+         if (number <= (rows - 1) * cols):
             axes.tick_params(axis = "x", labelbottom = False)
          if (isinstance(res, str)):
             self.draw_empty(axes, symbol, res)
@@ -3137,17 +4295,28 @@ class TrackerWindow(object):
 
       dates = self.timeline
 
+                                # side by side, short upright times (the
+                                # date under them only when more than one
+                                # day is shown), so they do not reach into
+                                # the next column and push the charts
+                                # apart
+      layout = (TIME_FMT if (not self.narrow) else "%H:%M" if
+                (span == "1d") else "%H:%M\n%a %d-%b")
+
       def label(position, tick_number):
          index = int(round(position))
-         return(     dates[index].strftime(TIME_FMT)
+         return(     dates[index].strftime(layout)
                 if (0 <= index < len(dates))
                 else "")
 
       for axes in list(self.hosts.values()) or self.figure.axes:
-         axes.xaxis.set_major_locator(MaxNLocator(7, integer = True))
+         axes.xaxis.set_major_locator(MaxNLocator(4 if (self.narrow)
+                                                  else 7, integer = True))
          axes.xaxis.set_major_formatter(FuncFormatter(label))
          axes.set_xlim(-1, max(len(dates), 1))
          axes.tick_params(axis = "x", labelsize = 8)
+         if (self.narrow):
+            continue
          for text in axes.get_xticklabels():
             text.set_rotation(30)
             text.set_horizontalalignment("right")
@@ -3166,9 +4335,18 @@ class TrackerWindow(object):
                   "visible"     : False}
          self.crosshair[axes] = (axes.axvline(left, **style),
                                  axes.axhline(bottom, **style),
-                                 self.scale_tag(axes, 0, "right"),
-                                 self.scale_tag(axes, 1, "left"))
-      self.figure.tight_layout()
+                                 self.scale_tag(axes, 0, "left" if
+                                                (self.narrow) else "right"),
+                                 self.scale_tag(axes, 1, "right" if
+                                                (self.narrow) else "left"))
+      self.grid = (rows, cols)
+      self.list_size()
+      if (self.narrow):
+                                # scales are inside the charts: little
+                                # room is needed between them
+         self.figure.tight_layout(pad = 0.6, w_pad = 0.6, h_pad = 0.8)
+      else:
+         self.figure.tight_layout()
       self.canvas.draw_idle()
       if (self.trades_win is not None and self.trades_win.alive()):
          self.trades_win.fill()
@@ -3178,6 +4356,9 @@ class TrackerWindow(object):
          "synthetic clock %s" % now.strftime("%H:%M") if (self.tr.synthetic)
          else "market %s" % ("open" if (market_open(now)) else "closed")))
       self.schedule()
+      if (self.pending):
+         self.pending = False
+         self.root.after(10, self.refresh)
 
    ########################################################################
    def draw_panel(self, axes, symbol, res, view, legend):
@@ -3278,7 +4459,10 @@ class TrackerWindow(object):
          self.draw_position(axes, q, jp, view, x)
       self.draw_volume(axes, x, view)
       if (legend):
-         axes.legend(loc = "upper left", fontsize = 8, ncol = 4)
+                                # narrower charts get a smaller legend
+         wide = (int(self.columns_var.get()) == 1)
+         axes.legend(loc = "upper left", fontsize = 8 if (wide) else 7,
+                     ncol = 4 if (wide) else 2)
       self.panels.append((axes, symbol, view))
 
    ########################################################################
@@ -3309,9 +4493,12 @@ class TrackerWindow(object):
             axes.text(i0, level, f" {name} {level:,.2f}", color = clr,
                       fontsize = 8, verticalalignment = "bottom")
       if (jp["act"] == "SELL"):
+                                # one SELL entry in the legend however
+                                # many lots say sell
+         seen = axes.get_legend_handles_labels()[1]
          axes.scatter([x[-1]], [view["High"].values[-1] * 1.002],
                       marker = "v", s = 60, color = SELL_CLR, zorder = 7,
-                      label = "SELL")
+                      label = None if ("SELL" in seen) else "SELL")
 
    ########################################################################
    def signal_text(self, res):
@@ -3372,19 +4559,32 @@ class TrackerWindow(object):
       TradeDialog(self.root, "Record buy", "buy", choices,
                   choices[0] if (choices) else "", 1, None,
                   tr.stamp().replace("T", " "), self.prices,
-                  self.buy_apply)
+                  self.buy_apply, broker = self.can_send())
 
    ########################################################################
-   def buy_apply(self, t, shares, price, when):
+   def buy_apply(self, t, shares, price, when, send = False,
+                 limit = False):
       """
       name: buy_apply
-      use: records a buy entered in the dialog
+      use: records a buy entered in the dialog, or sends it to Alpaca
       post: raises ExceptionClass when it cannot be recorded
       """
+      if (send):
+         self.send_order("buy", t, shares, price if (limit) else None)
+         return
       x = self.tr.record("buy", t, shares, price, when, self.atrs.get(t))
       self.status_var.set("recorded trade #%d: bought %g %s @ %.2f" % (
          x["id"], shares, x["ticker"], price))
       self.changed()
+
+   ########################################################################
+   def can_send(self):
+      """
+      name: can_send
+      use: predicate; can the dialogs send orders to Alpaca (paper keys
+           work and no as-of time is set)
+      """
+      return(self.tr.asof is None and self.tr.broker.ready())
 
    ########################################################################
    def record_sell(self):
@@ -3402,15 +4602,20 @@ class TrackerWindow(object):
          return
       TradeDialog(self.root, "Record sell", "sell", choices, choices[0], 1,
                   None, tr.stamp().replace("T", " "), self.prices,
-                  self.sell_apply, held = tr.shares)
+                  self.sell_apply, held = tr.shares,
+                  broker = self.can_send())
 
    ########################################################################
-   def sell_apply(self, t, shares, price, when):
+   def sell_apply(self, t, shares, price, when, send = False,
+                  limit = False):
       """
       name: sell_apply
-      use: records a sale entered in the dialog
+      use: records a sale entered in the dialog, or sends it to Alpaca
       post: raises ExceptionClass when it cannot be recorded
       """
+      if (send):
+         self.send_order("sell", t, shares, price if (limit) else None)
+         return
       x = self.tr.record("sell", t, shares, price, when)
       real = sum(c["pnl"] for c in self.tr.books(upto = False)[1]
                  if (c["sell"] == x["id"]))
@@ -3418,6 +4623,251 @@ class TrackerWindow(object):
                           "realized %s" % (x["id"], shares, x["ticker"],
                                            price, usd(real)))
       self.changed()
+
+   ########################################################################
+   def trade_step(self, results):
+      """
+      name: trade_step
+      use: worker thread; automatic trading on the freshly computed
+           signals, and the account line of the Alpaca row
+      post: when a trade was made, the positions in results are judged
+            again so the chart shows them
+      """
+      tr = self.tr
+      b  = tr.broker
+      if (not b.ready()):
+         self.acct_text = b.error
+         return
+      try:
+         if (tr.cfg["auto"]):
+            ok     = dict((t, r) for t, r in results.items()
+                          if (not isinstance(r, str)))
+            evals  = dict((t, r["ev"]) for t, r in ok.items()
+                          if (t in tr.watch()))
+            judged = [p for r in ok.values() for p in r["pos"]]
+            count  = len(tr.trades)
+            tr.auto_step(evals, judged, self.auto_msgs.append)
+            if (len(tr.trades) != count):
+               for t, r in ok.items():
+                  r["pos"] = [(q, tr.judge_pos(q)) for q in tr.held(t)]
+         a = b.account()
+         self.acct_text = ("equity %s (%s today), cash %s, market %s%s" % (
+                              format(a["equity"], ",.0f"),
+                              pct(a["equity"] / a["last"] - 1),
+                              format(a["cash"], ",.0f"),
+                              "open" if (b.is_open()) else "closed",
+                              " | AUTO-TRADING" if (tr.cfg["auto"])
+                              else ""))
+      except ExceptionClass as error:
+         self.acct_text = str(error)
+
+   ########################################################################
+   def size_text(self):
+      """
+      name: size_text
+      use: the trade size of the chosen auto_mode, as text
+      """
+      return("%g" % self.tr.cfg[SIZE_KEYS[int(self.tr.cfg["auto_mode"]) -
+                                         1]])
+
+   ########################################################################
+   def mode_changed(self):
+      """
+      name: mode_changed
+      use: a new choice in the Trade size box; kept until changed
+      """
+      self.tr.cfg["auto_mode"] = SIZE_MODES.index(self.mode_var.get()) + 1
+      self.tr.save_settings()
+      self.size_var.set(self.size_text())
+
+   ########################################################################
+   def size_changed(self, event = None):
+      """
+      name: size_changed
+      use: a new amount in the box after Trade size; kept until changed
+      """
+      c   = self.tr.cfg
+      key = SIZE_KEYS[int(c["auto_mode"]) - 1]
+      try:
+         v = float(self.size_var.get())
+         assert (v > 0 and (key != "auto_pct" or v <= 100))
+      except (ValueError, AssertionError):
+         self.status_var.set("trade size must be a number above 0")
+         self.size_var.set(self.size_text())
+         return
+      c[key] = int(v) if (key in INTEGERS) else v
+      self.tr.save_settings()
+      self.size_var.set(self.size_text())
+
+   ########################################################################
+   def max_changed(self):
+      """
+      name: max_changed
+      use: a new most stocks held by automatic trading
+      """
+      try:
+         v = int(float(self.max_var.get()))
+         assert (v >= 1)
+      except (ValueError, AssertionError):
+         self.max_var.set(str(self.tr.cfg["auto_max"]))
+         return
+      self.tr.cfg["auto_max"] = v
+      self.tr.save_settings()
+
+   ########################################################################
+   def auto_changed(self):
+      """
+      name: auto_changed
+      use: the Auto-trade box was ticked or cleared; kept until changed
+      """
+      tr = self.tr
+      on = bool(self.auto_var.get())
+      if (on and not tr.broker.ready()):
+         self.auto_var.set(False)
+         messagebox.showerror("Auto-trade", tr.broker.error,
+                              parent = self.root)
+         return
+      tr.cfg["auto"] = 1 if (on) else 0
+      tr.save_settings()
+      self.status_var.set("automatic trading %s" % ("ON (acts at each "
+                          "refresh)" if (on) else "off"))
+      if (on and not REFRESH[self.refresh_var.get()]):
+         messagebox.showwarning("Auto-trade", "Auto-refresh is off, so "
+                                "automatic trading only acts when you "
+                                "press Refresh now.", parent = self.root)
+
+   ########################################################################
+   def send_order(self, side, t, shares, limit):
+      """
+      name: send_order
+      use: sends an order entered in a dialog to the Alpaca paper
+           account on a worker thread; the result shows in the status
+           line and the alerts, and the fill in the trade log
+      """
+      tr  = self.tr
+      atr = self.atrs.get(t) if (side == "buy") else None
+      self.status_var.set("sending %s order for %g %s to Alpaca..." % (
+         side, shares, t))
+
+      def work():
+         try:
+            o = tr.broker_order(side, t, shares, limit, atr = atr)
+            text = "Alpaca %s %g %s: %s%s" % (
+               side.upper(), shares, t, value(o.status),
+               " @ %s" % f2(float(o.filled_avg_price))
+               if (o.filled_avg_price) else "")
+            fail = None
+         except ExceptionClass as error:
+            text, fail = "Alpaca order not sent: %s" % error, str(error)
+         self.root.after(0, self.order_done, text, fail)
+
+      threading.Thread(target = work, daemon = True).start()
+
+   ########################################################################
+   def order_done(self, text, fail):
+      """
+      name: order_done
+      use: gui thread; reports an order sent by send_order
+      """
+      self.status_var.set(text[:90])
+      self.auto_msgs.append(text)
+      if (fail):
+         messagebox.showerror("Alpaca order", fail, parent = self.root)
+      self.changed()
+
+   ########################################################################
+   def apply_tickers(self, always = True):
+      """
+      name: apply_tickers
+      use: makes the Ticker(s) box the watchlist: stocks taken out of it
+           leave the chart at once, then prices are fetched for any added
+      usage: always False (leaving the box) fetches only when a stock was
+             added
+      """
+      self.drop_removed()
+      have = set(self.results or ())
+      if (always or any(t not in have for t in self.tickers())):
+         self.refresh()
+
+   ########################################################################
+   def typed(self, event):
+      """
+      name: typed
+      use: a key was released in the Ticker(s) box: once typing pauses,
+           stocks deleted from the box leave the chart (stocks added are
+           fetched on Enter or on leaving the box)
+      """
+      if (self.typing):
+         self.root.after_cancel(self.typing)
+      self.typing = self.root.after(600, self.drop_removed)
+
+   ########################################################################
+   def drop_removed(self):
+      """
+      name: drop_removed
+      use: redraws, without downloading, leaving out the stocks no longer
+           in the Ticker(s) box (a held stock stays: it is followed while
+           held), and saves the watchlist without them
+      """
+      self.typing = None
+      want  = self.tickers()
+      known = set(self.results or ()) | set(self.tr.watch())
+      keep  = [t for t in want if (t in known)]
+      if (keep != self.tr.watch()):
+         self.tr.save_watch(keep)
+      if (not self.results):
+         return
+      held = set(q["ticker"] for q in self.tr.held())
+      gone = [t for t in self.results if (t not in want and t not in held)]
+      if (not gone):
+         return
+      self.status_var.set("removed %s" % " ".join(gone))
+      if (not self.busy):
+         self.draw(dict((t, r) for t, r in self.results.items()
+                        if (t not in gone)))
+
+   ########################################################################
+   def redraw(self):
+      """
+      name: redraw
+      use: draws the last prices again, e.g. after the number of columns
+           changed, without downloading
+      """
+      if (self.results is not None and not self.busy):
+         self.draw(self.results)
+
+   ########################################################################
+   def find_stocks(self):
+      """
+      name: find_stocks
+      use: opens (or raises) the window of stocks worth watching
+      """
+      try:
+         screener()
+      except ExceptionClass as error:
+         messagebox.showerror("Find stocks", str(error), parent = self.root)
+         return
+      if (self.screen_win is not None and self.screen_win.alive()):
+         self.screen_win.top.lift()
+         return
+      self.screen_win = ScreenWindow(self)
+
+   ########################################################################
+   def add_watch(self, tickers):
+      """
+      name: add_watch
+      use: adds tickers to the end of the watchlist (the Ticker(s) box)
+           and redraws
+      post: returns the tickers that were not already there
+      """
+      have  = self.tickers()
+      added = [t for t in tickers if (t not in have)]
+      if (added):
+         self.ticker_var.set(" ".join(have + added))
+         self.tr.save_watch(have + added)
+         self.status_var.set("watching %s" % " ".join(added))
+         self.refresh()
+      return(added)
 
    ########################################################################
    def show_trades(self):
@@ -3445,8 +4895,9 @@ class TrackerWindow(object):
    def scale_tag(self, axes, edge, side):
       """
       name: scale_tag
-      use: hidden value tag just outside the left (edge 0) or right (edge
-           1) side of axes, at a data y set later by on_hover
+      use: hidden value tag at the left (edge 0) or right (edge 1) side of
+           axes, outside it, or inside when charts are side by side, at a
+           data y set later by on_hover
       post: returns the matplotlib Text
       """
       return(axes.text(edge, axes.get_ylim()[0], "",
@@ -3475,8 +4926,10 @@ class TrackerWindow(object):
       if (not volume.any()):
          return
       twin = host.twinx()
-      twin.set_ylabel("volume", color = "gray")
       twin.tick_params(axis = "y", labelsize = 8, colors = "gray")
+      if (self.narrow):
+                                # the volume scale inside the right edge
+         twin.tick_params(axis = "y", length = 0, pad = -VOL_INSET)
       twin.yaxis.set_major_formatter(FuncFormatter(volume_label))
       twin.yaxis.set_major_locator(grid_locator())
       twin.grid(False)
@@ -3531,12 +4984,19 @@ class TrackerWindow(object):
                                                     zip((symbol,) + cells,
                                                         layout, spans), 1):
          text, shade = text if (isinstance(text, tuple)) else (text, color)
-         ttk.Label(self.quote_frame, text = text, foreground = shade,
-                   font = font).grid(row        = row,
-                                     column     = column,
-                                     columnspan = span,
-                                     sticky     = sticky,
-                                     padx       = padx)
+         label = ttk.Label(self.quote_frame, text = text,
+                           foreground = shade, font = font)
+         label.grid(row        = row,
+                    column     = column,
+                    columnspan = span,
+                    sticky     = sticky,
+                    padx       = padx)
+         if (column == 1):
+                                # the company name when the mouse is on
+                                # the symbol
+            label.bind("<Enter>",
+                       lambda event, t = symbol: self.tip_for(t))
+            label.bind("<Leave>", lambda event: self.tip.hide())
 
    ########################################################################
    def draw_empty(self, axes, symbol, reason):
@@ -3583,8 +5043,19 @@ class TrackerWindow(object):
            with the bar under it, its VWAP, expected range and signal
       imp: the volume axes sits on top of the price axes, so matplotlib
            reports the volume axes; map back to the price axes. distances
-           are in screen pixels so NEAR means the same at any zoom
+           are in screen pixels so NEAR means the same at any zoom. while
+           a chart is dragged, only the drop place is shown; over a
+           chart's symbol (its y-axis label) the company name is shown
       """
+      if (self.drag is not None):
+         self.drag_move(event)
+         return
+      for axes, symbol, label in self.cells:
+         if (label.contains(event)[0]):
+            self.tip_for(symbol, "chart")
+            return
+      if (self.tip.shown("chart")):
+         self.tip.hide()
       host = self.hosts.get(event.inaxes)
       if (host is None or host not in self.crosshair):
          self.on_leave(event)
@@ -3644,6 +5115,155 @@ class TrackerWindow(object):
       self.canvas.draw_idle()
 
    ########################################################################
+   def tip_for(self, symbol, where = "quote"):
+      """
+      name: tip_for
+      use: shows the company name of symbol next to the mouse
+      usage: where says which part of the window the tip belongs to
+             ("chart" tips are hidden by the chart's own mouse moves)
+      imp: an unknown name is looked up on a worker thread; the tip says
+           so and is filled in when the answer comes back
+      """
+      name = self.tr.name(symbol)
+      if (name):
+         text = "%s: %s" % (symbol, name)
+      elif (symbol in self.looking):
+         text = "%s: looking up the company name..." % symbol
+      elif (symbol in self.tr.tried):
+         text = "%s: company name not available" % symbol
+      else:
+         text = "%s: looking up the company name..." % symbol
+         self.looking.add(symbol)
+
+         def work():
+            try:
+               self.tr.lookup_names([symbol])
+            finally:
+               self.looking.discard(symbol)
+               self.root.after(0, self.tip_done, symbol, where)
+
+         threading.Thread(target = work, daemon = True).start()
+      self.tip.show(text, where)
+      self.tip_symbol = symbol
+
+   ########################################################################
+   def tip_done(self, symbol, where):
+      """
+      name: tip_done
+      use: gui thread; refreshes a tip still waiting for a company name
+      """
+      if (self.tip.shown(where) and
+          getattr(self, "tip_symbol", None) == symbol):
+         self.tip_for(symbol, where)
+
+   ########################################################################
+   def tree_tips(self, tree, column = "Ticker"):
+      """
+      name: tree_tips
+      use: shows the company name when the mouse is on a ticker in the
+           given column of a Treeview
+      """
+      cols = list(tree["columns"])
+      want = "#%d" % (cols.index(column) + 1)
+
+      def motion(event):
+         row = tree.identify_row(event.y)
+         if (row and tree.identify_column(event.x) == want):
+            t = tree.set(row, column)
+            if (t and t != "TOTAL"):
+               self.tip_for(t, "tree")
+               return
+         if (self.tip.shown("tree")):
+            self.tip.hide()
+
+      tree.bind("<Motion>", motion)
+      tree.bind("<Leave>", lambda event: self.tip.hide())
+
+   ########################################################################
+   def drag_start(self, event):
+      """
+      name: drag_start
+      use: a left-button press on a chart may start moving it
+      imp: not while the toolbar's pan or zoom is on, which use the same
+           button
+      """
+      if (event.button != 1 or self.toolbar.mode or
+          event.inaxes is None):
+         return
+      axes = self.hosts.get(event.inaxes, event.inaxes)
+      for cell, symbol, label in self.cells:
+         if (cell is axes):
+            self.drag = dict(symbol = symbol, x = event.x, y = event.y,
+                             moved = False, to = None)
+            return
+
+   ########################################################################
+   def drag_move(self, event):
+      """
+      name: drag_move
+      use: notes that the mouse has moved far enough for a drag (not a
+           click); the pointer changes to the move shape
+      """
+      d = self.drag
+      if (not d["moved"] and
+          np.hypot(event.x - d["x"], event.y - d["y"]) >= 8):
+         d["moved"] = True
+         self.canvas.get_tk_widget().configure(cursor = "fleur")
+         self.tip.hide()
+
+   ########################################################################
+   def drag_end(self, event):
+      """
+      name: drag_end
+      use: drops a dragged chart: it is inserted at the place under the
+           mouse and the charts between move along one place (charts are
+           NOT swapped)
+      """
+      d, self.drag = self.drag, None
+      if (d is None or not d["moved"]):
+         return
+      self.canvas.get_tk_widget().configure(cursor = "")
+      to    = self.drop_index(event.x, event.y)
+      order = [cell[1] for cell in self.cells]
+      order.remove(d["symbol"])
+      order.insert(to, d["symbol"])
+      self.ticker_var.set(" ".join(order))
+      self.tr.save_watch(order)
+      self.status_var.set("moved %s to place %d" % (d["symbol"], to + 1))
+      if (self.busy):
+                                # a refresh is under way; it draws in the
+                                # new order
+         self.canvas.draw_idle()
+      else:
+         self.draw(self.results)
+
+   ########################################################################
+   def drop_index(self, x, y):
+      """
+      name: drop_index
+      use: the place in the grid nearest the mouse (screen pixels)
+      post: returns a chart number from 0; an empty place after the last
+            chart counts as the last place
+      """
+      rows, cols = self.grid
+      boxes = [cell[0].get_window_extent() for cell in self.cells]
+      count = len(boxes)
+      best  = (None, 0)
+      for k in range(rows * cols):
+         r, c = divmod(k, cols)
+                                # an empty place lines up with the
+                                # charts in its row and column
+         bx = boxes[k] if (k < count) else None
+         cx = ((bx.x0 + bx.x1) / 2 if (bx) else
+               (boxes[c].x0 + boxes[c].x1) / 2)
+         cy = ((bx.y0 + bx.y1) / 2 if (bx) else
+               (boxes[r * cols].y0 + boxes[r * cols].y1) / 2)
+         gap = np.hypot(cx - x, cy - y)
+         if (best[0] is None or gap < best[0]):
+            best = (gap, k)
+      return(min(best[1], count - 1))
+
+   ########################################################################
    def on_leave(self, event):
       self.hover_var.set(HINT)
       for guides in self.crosshair.values():
@@ -3665,10 +5285,333 @@ class TrackerWindow(object):
          self.after_id = self.root.after(seconds * 1000, self.refresh)
 
    ########################################################################
+   def toggle_list(self):
+      """
+      name: toggle_list
+      use: hides or shows the list of stocks above the charts
+      """
+      self.show_list(self.list_hidden)
+      self.save_look()
+
+   ########################################################################
+   def show_list(self, show):
+      """
+      name: show_list
+      use: shows (True) or hides (False) the list of stocks; the hover
+           readout bar stays, right under the controls when it is hidden
+      """
+      shown = (str(self.list_pane) in [str(p) for p in
+                                       self.panes.panes()])
+      if (show and not shown):
+         self.panes.add(self.list_pane, before = self.lower,
+                        minsize = 20, stretch = "never")
+      elif (not show and shown):
+         self.panes.forget(self.list_pane)
+      self.list_hidden = (not show)
+      self.list_button.configure(text = "Show stock list \u25bc"
+                                 if (self.list_hidden)
+                                 else "Hide stock list \u25b2")
+      if (show):
+         self.list_size()
+
+   ########################################################################
+   def list_size(self):
+      """
+      name: list_size
+      use: sets the height of the list of stocks: the height it was
+           dragged to, or else just tall enough for every stock (up to
+           40% of the window)
+      """
+      if (self.list_hidden):
+         return
+      if (self.list_height):
+         height = int(self.list_height)
+      else:
+         self.quote_frame.update_idletasks()
+         height = min(self.quote_frame.winfo_reqheight() + 4,
+                      int(self.root.winfo_height() * 0.4) or 200)
+      self.panes.paneconfigure(self.list_pane, height = max(height, 20))
+
+   ########################################################################
+   def list_resized(self, event):
+      """
+      name: list_resized
+      use: the bar under the list of stocks was dragged: keeps the new
+           height
+      """
+      if (not self.list_hidden):
+         self.root.update_idletasks()
+         self.list_height = self.list_pane.winfo_height()
+         self.save_look()
+
+   ########################################################################
+   def list_fit(self):
+      """
+      name: list_fit
+      use: shows the scroll bar of the list of stocks only when they do
+           not all fit
+      """
+      view = self.list_view
+      view.configure(scrollregion = view.bbox("all"))
+      need = (self.quote_frame.winfo_reqheight() >
+              view.winfo_height() + 1)
+      if (need and not self.list_bar.winfo_ismapped()):
+         self.list_bar.pack(side = tkinter.RIGHT, fill = tkinter.Y,
+                            before = view)
+      elif (not need and self.list_bar.winfo_ismapped()):
+         self.list_bar.pack_forget()
+         view.yview_moveto(0)
+
+   ########################################################################
+   def list_wheel(self, event):
+      """
+      name: list_wheel
+      use: scrolls the list of stocks with the mouse wheel when the
+           pointer is over it and it does not all fit
+      """
+      w = self.root.winfo_containing(event.x_root, event.y_root)
+      while (w is not None and w is not self.list_pane):
+         w = w.master
+      if (w is None or not self.list_bar.winfo_ismapped()):
+         return
+      if (event.num == 4 or getattr(event, "delta", 0) > 0):
+         self.list_view.yview_scroll(-1, "units")
+      else:
+         self.list_view.yview_scroll(1, "units")
+
+   ########################################################################
+   def save_look(self):
+      """
+      name: save_look
+      use: keeps everything that can be changed in the window (chart
+           type, time span, bar size, columns, auto-refresh, the list of
+           stocks shown or hidden and its height, the window size and
+           place) so the next start looks the same; the order of the
+           charts is the watchlist's
+      """
+      root = self.root
+      try:
+         zoomed = (root.state() == "zoomed")
+      except tkinter.TclError:
+         zoomed = False
+      try:
+         dump_json(LOOK, dict(chart       = self.chart_var.get(),
+                              span        = self.span_var.get(),
+                              interval    = self.interval_var.get(),
+                              columns     = self.columns_var.get(),
+                              refresh     = REFRESH[self.refresh_var.get()],
+                              list_hidden = self.list_hidden,
+                              list_height = self.list_height,
+                              geometry    = None if (zoomed)
+                                            else root.geometry(),
+                              zoomed      = zoomed))
+      except Exception as error:
+         print("%s: cannot save the window layout: %s" % (SELF, error),
+               file = sys.stderr)
+
+   ########################################################################
    def close(self):
       if (self.after_id):
          self.root.after_cancel(self.after_id)
+      self.save_look()
       self.root.destroy()
+
+###########################################################################
+class ScreenWindow(object):
+   """
+   name: ScreenWindow
+   use: window listing the stocks stock_screener.py suggests watching,
+        with the reasons for each and how its picks did in the past;
+        selected stocks can be added to the watchlist
+   imp: the screen (which may download prices) runs on a worker thread;
+        results come back to the gui thread via root.after()
+   """
+
+   COLUMNS = (("#", 36, "e"), ("Ticker", 70, "w"), ("Price", 80, "e"),
+              ("Score", 56, "e"), ("3m vs SPY", 80, "e"),
+              ("12-1m", 76, "e"), ("Off high", 76, "e"),
+              ("Volume", 64, "e"), ("Range", 60, "e"), ("", 90, "w"))
+                                # suggestions listed
+   TOP     = 20
+
+   ########################################################################
+   def __init__(self, owner):
+      self.owner = owner
+      self.tr    = owner.tr
+      self.res   = None
+      self.busy  = False
+      self.top   = top = tkinter.Toplevel(owner.root)
+      top.title("Find stocks to watch")
+      top.geometry("860x600")
+      frame = ttk.Frame(top, padding = 8)
+      frame.pack(fill = tkinter.BOTH, expand = True)
+
+      self.head_var = tkinter.StringVar(value = "")
+      ttk.Label(frame, textvariable = self.head_var, wraplength = 830,
+                font = ("TkDefaultFont", 11, "bold")).pack(anchor = "w")
+      ttk.Label(frame, foreground = "gray", wraplength = 830,
+                text = "Large US stocks in an up trend, strong against "
+                       "the market, near their highs, with rising volume "
+                       "and a daily range wide enough to trade intraday, "
+                       "ranked by strength. A ranking, not a forecast. "
+                       "Select one or more (Ctrl or Shift + click) and "
+                       "add them to the watchlist.").pack(anchor = "w")
+
+      box = ttk.Frame(frame)
+      box.pack(fill = tkinter.BOTH, expand = True, pady = (6, 0))
+      self.list = ttk.Treeview(box, columns = [c[0] or "note"
+                                               for c in self.COLUMNS],
+                               show = "headings", height = 14,
+                               selectmode = "extended")
+      for name, width, anchor in self.COLUMNS:
+         self.list.heading(name or "note", text = name, anchor = anchor)
+         self.list.column(name or "note", width = width, anchor = anchor,
+                          stretch = (not name))
+      bar = ttk.Scrollbar(box, orient = "vertical",
+                          command = self.list.yview)
+      self.list.configure(yscrollcommand = bar.set)
+      self.list.pack(side = tkinter.LEFT, fill = tkinter.BOTH,
+                     expand = True)
+      bar.pack(side = tkinter.RIGHT, fill = tkinter.Y)
+      self.list.tag_configure("watching", foreground = "gray")
+      self.list.bind("<<TreeviewSelect>>", self.selected)
+      owner.tree_tips(self.list)
+      self.list.bind("<Double-1>", lambda event: self.add())
+
+      self.why_var  = tkinter.StringVar(value = "")
+      ttk.Label(frame, textvariable = self.why_var, wraplength = 830,
+                foreground = "#20242c").pack(anchor = "w", pady = (6, 0))
+      self.test_var = tkinter.StringVar(value = "")
+      ttk.Label(frame, textvariable = self.test_var, wraplength = 830,
+                font = ("TkFixedFont", 9)).pack(anchor = "w",
+                                                pady = (6, 0))
+
+      buttons = ttk.Frame(frame)
+      buttons.pack(fill = tkinter.X, pady = (8, 0))
+      ttk.Button(buttons, text = "Add selected to watchlist",
+                 command = self.add).pack(side = tkinter.LEFT)
+      ttk.Button(buttons, text = "Screen again (new prices)",
+                 command = lambda: self.run(True)).pack(
+                    side = tkinter.LEFT, padx = 4)
+      ttk.Button(buttons, text = "Close",
+                 command = top.destroy).pack(side = tkinter.RIGHT)
+      self.run(False)
+
+   ########################################################################
+   def alive(self):
+      """
+      name: alive
+      use: predicate; is the window still open
+      """
+      try:
+         return(bool(self.top.winfo_exists()))
+      except tkinter.TclError:
+         return(False)
+
+   ########################################################################
+   def run(self, reload):
+      """
+      name: run
+      use: starts the screen on a worker thread
+      usage: reload True downloads fresh prices
+      """
+      if (self.busy):
+         return
+      self.busy = True
+      self.head_var.set("Screening about %d stocks..." %
+                        len(screener().UNIVERSE))
+      root = self.owner.root
+
+      def say(text):
+         root.after(0, lambda: self.alive() and self.head_var.set(text))
+
+      def work():
+         try:
+            res = screener().screen(top = self.TOP, reload = reload,
+                                    fake = self.tr.synthetic, say = say)
+         except Exception as error:
+            res = "screen failed: %s" % error
+         root.after(0, self.show, res)
+
+      threading.Thread(target = work, daemon = True).start()
+
+   ########################################################################
+   def show(self, res):
+      """
+      name: show
+      use: gui thread; fills the list from a screen result (or shows why
+           there is none)
+      """
+      self.busy = False
+      if (not self.alive()):
+         return
+      if (isinstance(res, str)):
+         self.head_var.set(res)
+         return
+      self.res = res
+      sc = screener()
+                                # company names for the tips, looked up
+                                # in the background
+      threading.Thread(target = self.tr.lookup_names,
+                       args = ([p["ticker"] for p in res["picks"]],),
+                       daemon = True).start()
+      self.head_var.set("As of the %s close, %d of %d stocks pass the "
+                        "trend, liquidity and range tests%s" % (
+                           res["date"], res["passed"], res["looked"],
+                           "; the strongest:" if (res["picks"])
+                           else "."))
+      self.fill()
+      lines = sc.test_lines(res)
+      if (res["missing"]):
+         lines.append("No prices for: %s" % " ".join(res["missing"]))
+      self.test_var.set("\n".join(lines))
+
+   ########################################################################
+   def fill(self):
+      """
+      name: fill
+      use: one row per suggestion; stocks already watched are gray
+      """
+      sc = screener()
+      watched = set(self.owner.tickers()) | set(self.tr.watch())
+      self.list.delete(*self.list.get_children())
+      for n, p in enumerate(self.res["picks"], 1):
+         on = (p["ticker"] in watched)
+         self.list.insert("", "end", iid = p["ticker"],
+                          tags = ("watching",) if (on) else (),
+                          values = (
+            n, p["ticker"], "%.2f" % p["price"], "%.2f" % p["score"],
+            sc.pct(p["rel63"]), sc.pct(p["mom"]), sc.pct(p["off"]),
+            "%.1fx" % p["volr"], "%.1f%%" % (100 * p["atr"]),
+            "watching" if (on) else ""))
+
+   ########################################################################
+   def selected(self, event):
+      """
+      name: selected
+      use: shows the reasons for the (first) selected suggestion
+      """
+      sel = self.list.selection()
+      if (not sel or self.res is None):
+         return
+      p = [x for x in self.res["picks"] if (x["ticker"] == sel[0])][0]
+      self.why_var.set("%s: %s" % (p["ticker"], screener().why(p)))
+
+   ########################################################################
+   def add(self):
+      """
+      name: add
+      use: adds the selected suggestions to the watchlist
+      """
+      sel = list(self.list.selection())
+      if (not sel):
+         messagebox.showinfo("Find stocks", "Select one or more stocks "
+                             "first.", parent = self.top)
+         return
+      added = self.owner.add_watch(sel)
+      self.fill()
+      self.why_var.set("Added to the watchlist: %s" % (
+         " ".join(added) or "none (already watched)"))
 
 ###########################################################################
 class TradeDialog(object):
@@ -3690,7 +5633,9 @@ class TradeDialog(object):
 
    ########################################################################
    def __init__(self, parent, title, side, choices, ticker, shares, price,
-                when, prices, apply, held = None, fixed = False):
+                when, prices, apply, held = None, fixed = False,
+                broker = False):
+      self.broker = broker
       self.prices = prices
       self.apply  = apply
       self.held   = held
@@ -3737,12 +5682,30 @@ class TradeDialog(object):
             row = n, column = 2, sticky = "w", padx = (8, 0))
          if (n == 1):
             first = entry
+      self.send_var  = tkinter.BooleanVar(value = broker)
+      self.limit_var = tkinter.StringVar(value = "market")
+      if (broker):
+                                # send it to the Alpaca paper account:
+                                # at the market or at the price; the
+                                # time is then the fill's
+         ttk.Checkbutton(frame, text = "Send to Alpaca (paper account)",
+                         variable = self.send_var).grid(
+                            row = 4, column = 0, columnspan = 3,
+                            sticky = "w", pady = (6, 0))
+         kind = ttk.Frame(frame)
+         kind.grid(row = 5, column = 0, columnspan = 3, sticky = "w")
+         ttk.Radiobutton(kind, text = "at the market", value = "market",
+                         variable = self.limit_var).pack(
+                            side = tkinter.LEFT, padx = (18, 8))
+         ttk.Radiobutton(kind, text = "limit at the price",
+                         value = "limit", variable = self.limit_var).pack(
+                            side = tkinter.LEFT)
       ttk.Label(frame, textvariable = self.error_var, foreground = "red",
-                wraplength = 380).grid(row = 4, column = 0,
+                wraplength = 380).grid(row = 6, column = 0,
                                        columnspan = 3, sticky = "w",
                                        pady = (6, 0))
       buttons = ttk.Frame(frame)
-      buttons.grid(row = 5, column = 0, columnspan = 3, sticky = "e",
+      buttons.grid(row = 7, column = 0, columnspan = 3, sticky = "e",
                    pady = (8, 0))
       ttk.Button(buttons, text = "OK",
                  command = self.ok).pack(side = tkinter.LEFT, padx = 4)
@@ -3803,6 +5766,8 @@ class TradeDialog(object):
          if (got[-1] is None):
             self.error_var.set(text)
             return
+      if (self.broker):
+         got += [self.send_var.get(), self.limit_var.get() == "limit"]
       try:
          self.apply(*got)
       except ExceptionClass as error:
@@ -3851,6 +5816,8 @@ class TradesWindow(object):
                    anchor = "w", pady = (10, 0))
       self.list = self.table(frame, self.TRADE_COLUMNS, 12, True)
       self.list.bind("<Double-1>", lambda event: self.edit())
+      owner.tree_tips(self.pnl)
+      owner.tree_tips(self.list)
       for tree in (self.pnl, self.list):
          tree.tag_configure("gain", foreground = BRK_CLR)
          tree.tag_configure("loss", foreground = SELL_CLR)
@@ -4089,15 +6056,19 @@ class MAIN(object):
       ap = argparse.ArgumentParser(prog        = SELF,
                                    description = "intraday stock tracker "
                                                  "with BUY / SELL signals")
-      ap.add_argument("-c", dest = "candles", action = "store_true",
-                      help = "start in candlestick mode")
+      ap.add_argument("-c", dest = "chart", action = "store_const",
+                      const = "Candles",
+                      help = "start in candlestick mode (default: as "
+                             "last used)")
       ap.add_argument("-f", dest = "foreground", action = "store_true",
                       help = "stay in the foreground (keeps the prompt)")
-      ap.add_argument("-r", dest = "refresh", type = int, default = 60,
-                      help = "auto-refresh seconds, 0 = off (default 60)")
-      ap.add_argument("-p", dest = "span", default = "1d",
+      ap.add_argument("-r", dest = "refresh", type = int, default = None,
+                      help = "auto-refresh seconds, 0 = off (default: as "
+                             "last used, else 60)")
+      ap.add_argument("-p", dest = "span", default = None,
                       choices = list(SPANS),
-                      help = "time span shown (default 1d)")
+                      help = "time span shown (default: as last used, "
+                             "else 1d)")
       ap.add_argument("-t", dest = "text", action = "store_true",
                       help = "interactive text prompt instead of the "
                              "window (simulate, follow, asof ...)")
@@ -4105,6 +6076,9 @@ class MAIN(object):
                       help = "offline fake data for testing the program")
       ap.add_argument("-d", dest = "reload", action = "store_true",
                       help = "re-download all price history at start-up")
+      ap.add_argument("-m", dest = "monitor", action = "store_true",
+                      help = "with -t: start 'monitor' at once (for "
+                             "unattended automatic trading)")
       ap.add_argument("-v", dest = "verbose", action = "count",
                       default = 0, help = "more messages")
       ap.add_argument("tickers", nargs = "*",
@@ -4112,10 +6086,14 @@ class MAIN(object):
                              "watchlist, in this order, e.g. AAPL MSFT "
                              "ORCL")
       args = ap.parse_args(argv)
-      if (args.refresh < 0):
+      if (args.refresh is not None and args.refresh < 0):
          ap.error("-r must be 0 or more")
 
       child = (os.environ.get(CHILD) == "1")
+      if (not args.synthetic):
+                                # before the window goes to the
+                                # background, so a message is seen
+         find_home()
                                 # the console copy starts the window in
                                 # the background before loading tkinter
                                 # and matplotlib, so the prompt comes
@@ -4139,7 +6117,10 @@ class MAIN(object):
             tr.sync(force = args.reload)
          else:
             print("The watchlist is empty. Start with 'watch TICKER ...'.")
-         Shell(tr).cmdloop()
+         shell = Shell(tr)
+         if (args.monitor):
+            shell.cmdqueue.append("monitor")
+         shell.cmdloop()
          return(E_SUCCESS)
 
       if (not tr.watch()):
@@ -4150,8 +6131,7 @@ class MAIN(object):
          print(f"{SELF}: cannot open display: {exception}",
                file = sys.stderr)
          return(E_FAIL)
-      TrackerWindow(root, tr, args.refresh,
-                    "Candles" if (args.candles) else "Line", args.span,
+      TrackerWindow(root, tr, args.refresh, args.chart, args.span,
                     args.reload)
       if (child):
                                 # window is on screen: tell the waiting

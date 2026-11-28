@@ -6,7 +6,8 @@ Everything (features, genetic algorithm, simulation) runs on this machine.
 The only network traffic is the download of PUBLIC price history from
 Yahoo Finance through the yfinance package (ticker symbols only; your
 positions, results and models never leave the machine). Prices are cached
-under ~/.stock_picker. Use --synthetic for a fully offline demo.
+in the folder .stock_picker next to this script. Use --synthetic for a
+fully offline demo.
 
 Setup:  pip install numpy pandas yfinance
 Run:    python stock_picker.py
@@ -21,10 +22,10 @@ the GA never saw measures real predictive skill, and that skill shrinks
 the expected gain and drives the confidence figure. Walk-forward only:
 a model used on date X is trained solely on data that was known by X.
 
-Learning over time (files live in ~/.stock_picker): every 'recommend'
-on the latest date is journaled and later scored against what really
-happened ('scorecard'). 'calibrate' / 'learn' replay history walk-forward
-to turn raw scores into honest numbers: expected gain is rescaled by how
+Learning over time (files live in .stock_picker next to this script):
+every 'recommend' on the latest date is journaled and later scored
+against what really happened ('scorecard'). 'calibrate' / 'learn' replay
+history walk-forward to turn raw scores into honest numbers: expected gain is rescaled by how
 much of it really materialized, confidence becomes the observed chance of
 a gain, and BUY calls are suppressed when the picks show no edge. Evolved
 weights are saved and seed the next run's genetic search (warm start), and
@@ -53,6 +54,7 @@ import json
 import math
 import os
 import pickle
+import shutil
 import sys
 import time
 import warnings
@@ -62,7 +64,12 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-HOME = os.path.join(os.path.expanduser("~"), ".stock_picker")
+                                # the data folder sits next to this
+                                # script; OLD_HOME is where versions
+                                # before 27-Nov-2026 kept it
+HOME = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                    ".stock_picker")
+OLD_HOME = os.path.join(os.path.expanduser("~"), ".stock_picker")
 CACHE = os.path.join(HOME, "prices.pkl")
 LEDGER = os.path.join(HOME, "ledger.json")
 STATE = os.path.join(HOME, "state.json")
@@ -2058,6 +2065,31 @@ def set_home(path):
    PREDS = os.path.join(HOME, "predictions.json")
 
 
+def find_home():
+   """
+   name: find_home
+   use: makes sure the data folder next to this script exists
+   post: the first time, a data folder left in the home directory by an
+         older version is copied there (the old one is not touched); if
+         the script's folder cannot be written to, the data folder in
+         the home directory is used instead, with a warning
+   """
+   if os.path.isdir(HOME):
+      return
+   try:
+      if os.path.isdir(OLD_HOME):
+         shutil.copytree(OLD_HOME, HOME)
+         print("stock_picker: copied your data from %s to %s; the old "
+               "folder is no longer used and can be deleted" % (
+                  OLD_HOME, HOME), file=sys.stderr)
+      else:
+         os.makedirs(HOME)
+   except OSError as error:
+      print("stock_picker: cannot use %s (%s); using %s instead" % (
+         HOME, error.strerror or error, OLD_HOME), file=sys.stderr)
+      set_home(OLD_HOME)
+
+
 def main():
    global ARGS
    ap = argparse.ArgumentParser(description="Local stock picker lab")
@@ -2078,6 +2110,8 @@ def main():
    ARGS = ap.parse_args()
    if ARGS.synthetic:
       set_home(HOME + "-synthetic")
+   else:
+      find_home()
    tickers = LARGE_UNIVERSE if ARGS.universe == "large" \
       else SMALL_UNIVERSE
    if ARGS.tickers:

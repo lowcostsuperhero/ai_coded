@@ -36,8 +36,12 @@ low|normal|high (how hard the genetic search works), --refresh
 (re-download), --learn (run "learn" at start-up), --synthetic.
 --tickers and --universe-file override the built-in lists. Symbols Yahoo
 no longer serves are skipped with a message.
-Prices are cached in ~/.stock_picker so later starts are quick; a fresh
-cache only downloads the symbols it does not have yet.
+Prices are cached in the folder .stock_picker next to stock_picker.py,
+so later starts are quick; a fresh cache only downloads the symbols it
+does not have yet. Versions before 27-Nov-2026 kept this folder in your
+home directory; the first run copies it next to the script (the old one
+can then be deleted), and the home folder is used only when the script's
+folder cannot be written to.
 
 Modes
 -----
@@ -106,7 +110,7 @@ New listings (IPOs)
 -------------------
 A newly listed stock fails the history test for about 15 months. To
 follow one anyway, "watch TICKER" adds it to a watchlist kept in
-~/.stock_picker/watchlist.json. Its prices are downloaded however short
+.stock_picker/watchlist.json. Its prices are downloaded however short
 the history, and "watchlist" shows its first trade date, trading days,
 price, return since the IPO-day open, 5- and 21-day moves, and why it is
 watch-only (with about how many trading days of history remain). It is
@@ -140,7 +144,7 @@ shown the same way.
 
 Learning over time
 ------------------
-The first answer is honest, not flattering. Files live in ~/.stock_picker:
+The first answer is honest, not flattering. Files live in .stock_picker:
 
    predictions.json   journal of every prediction and, later, its outcome
    state.json         evolved weights that seed the next search
